@@ -19,6 +19,12 @@ An autonomous, 24/7 intelligent WeChat group chat bot built on **official native
   Directly perceives the chat window using multimodal vision LLMs. Automatically parses sender nicknames, speech bubbles, incoming vs. outgoing messages, and `@` mentions.
 - 📌 **WeChat Quote & Image OCR Recognition**  
   Understands native WeChat quotations (`「User: ...」`) and extracts referenced search results, code errors, charts, and photos using AI vision OCR.
+- 🔗 **Automatic Web Link Fetching & Text Parsing (Link Reader)**  
+  Automatically extracts HTTP/HTTPS URLs from messages or quotes, strips HTML noise/scripts, and parses article titles and full text (up to 3,500 characters) directly into the LLM context for in-depth analysis and summarization.
+- 📰 **WeChat Article Card Resolution (Full-Text Retrieval)**  
+  Vision model detects WeChat rich card shares, article headlines, and news sources (e.g., Dahe Daily, The Paper, Zhihu). When asked to evaluate or summarize, the bot automatically searches and retrieves the complete news reporting and legal facts instead of speculating from a truncated title.
+- ⏱️ **30-Second Follow-Up Window & Anti-Spam Gate**  
+  Supports natural multi-turn conversations without repeatedly typing `@bot` (e.g. "look up X again", "why is that?"). Features strict anti-spam filtering: trivial reactions (👍, ?, "ok", "got it") and 3rd-person chatter ("no need to add bot") are silently memorized without spamming replies; batching guarantees at most one single reply per frame update.
 - 🌐 **Real-time Web Search**  
   Integrated with Moonshot Kimi native `$web_search` engine to fetch live stock prices, news, facts, and public data on the fly.
 - 🧹 **Plain-Text & LaTeX Sanitizer**  

@@ -200,6 +200,64 @@ def extract_urls(text):
     return re.findall(r'https?://[^\s<>"\')]+', text)
 
 
+def find_article_link_in_memory(keyword=""):
+    try:
+        out = subprocess.check_output(["pgrep", "-x", "wechat"]).decode().split()
+        if not out:
+            return None
+        pid = int(out[0])
+    except Exception:
+        return None
+
+    kw = (keyword or "").strip()
+    kw_clean = re.sub(r'^[“"\'「\s\U0001f517]+|[”"\'」\s]+$', '', kw)
+    if len(kw_clean) > 8:
+        search_kw = kw_clean[:6]
+    else:
+        search_kw = kw_clean
+
+    kw_bytes = search_kw.encode("utf-8") if search_kw else b"mp.weixin.qq.com"
+
+    try:
+        with open(f"/proc/{pid}/maps") as f:
+            lines = f.readlines()
+    except Exception:
+        return None
+
+    maps = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) >= 2 and "rw-p" in parts[1] and (len(parts) <= 5 or not parts[5].startswith("/usr")):
+            start, end = [int(x, 16) for x in parts[0].split("-")]
+            size = end - start
+            if 512 * 1024 <= size <= 100 * 1024 * 1024:
+                maps.append((start, end))
+
+    maps.reverse()
+
+    try:
+        with open(f"/proc/{pid}/mem", "rb", 0) as mem:
+            for start, end in maps:
+                try:
+                    mem.seek(start)
+                    chunk = mem.read(end - start)
+                    if kw_bytes in chunk:
+                        m = re.search(rb'"link"\s*:\s*"(https://mp\.weixin\.qq\.com/s[^"]+)"', chunk)
+                        if m:
+                            raw_link = m.group(1).decode("utf-8", errors="ignore").replace("&amp;", "&")
+                            return raw_link
+                        m2 = re.search(rb'https://mp\.weixin\.qq\.com/s[a-zA-Z0-9_\-\.\/\?\=\&\%]+', chunk)
+                        if m2:
+                            raw_link = m2.group(0).decode("utf-8", errors="ignore").replace("&amp;", "&").rstrip("\\;&<>'\"")
+                            return raw_link
+                except Exception:
+                    continue
+    except Exception as e:
+        log_msg(f"内存扫描链接异常: {e}")
+
+    return None
+
+
 def fetch_url_content(url, timeout=10, max_chars=3500):
     try:
         headers = {
@@ -216,16 +274,26 @@ def fetch_url_content(url, timeout=10, max_chars=3500):
             if "charset=" in content_type.lower():
                 charset = content_type.lower().split("charset=")[-1].split(";")[0].strip()
             try:
-                html = raw.decode(charset, errors="replace")
+                html_str = raw.decode(charset, errors="replace")
             except Exception:
-                html = raw.decode("utf-8", errors="replace")
+                html_str = raw.decode("utf-8", errors="replace")
 
         import html as html_lib
-        title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
-        title = title_match.group(1).strip() if title_match else ""
+        title_m = re.search(r'<meta property="og:title" content="(.*?)"', html_str) or re.search(r'<title[^>]*>(.*?)</title>', html_str, re.IGNORECASE | re.DOTALL)
+        title = title_m.group(1).strip() if title_m else ""
         title = re.sub(r'\s+', ' ', title)
 
-        text = re.sub(r'<!--[\s\S]*?-->', '', html)
+        author_m = re.search(r'<meta property="og:article:author" content="(.*?)"', html_str) or re.search(r'var nickname = "(.*?)"', html_str)
+        author = author_m.group(1).strip() if author_m else ""
+
+        # WeChat specific article body container
+        if "id=\"js_content\"" in html_str:
+            content_m = re.search(r'id="js_content"[^>]*>([\s\S]*?)</div>\s*<script', html_str)
+            raw_content = content_m.group(1) if content_m else html_str
+        else:
+            raw_content = html_str
+
+        text = re.sub(r'<!--[\s\S]*?-->', '', raw_content)
         text = re.sub(r'<(script|style|svg|noscript|header|footer|nav)[\s\S]*?</\1>', '', text, flags=re.IGNORECASE)
         text = re.sub(r'</?(?:p|div|h[1-6]|li|blockquote|tr|section|article)[^>]*>', '\n', text, flags=re.IGNORECASE)
         text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
@@ -238,11 +306,12 @@ def fetch_url_content(url, timeout=10, max_chars=3500):
         if len(cleaned_body) > max_chars:
             cleaned_body = cleaned_body[:max_chars] + "\n...(正文较长，已截取前 3500 字)..."
 
-        log_msg(f"抓取网页链接正文成功 ({url}): 标题='{title}', 正文长度={len(cleaned_body)}")
+        log_msg(f"抓取网页链接正文成功 ({url}): 标题='{title}', 作者='{author}', 正文长度={len(cleaned_body)}")
         return {
             "success": True,
             "url": url,
             "title": title,
+            "author": author,
             "body": cleaned_body
         }
     except Exception as e:
@@ -753,7 +822,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     if quote_info and quote_info.get("has_quote"):
         candidate_texts.append(str(quote_info.get("quoted_content", "")))
     if recent_history:
-        for h in reversed(recent_history[-4:]):
+        for h in reversed(recent_history[-5:]):
             candidate_texts.append(h.get("content", ""))
 
     found_urls = []
@@ -762,33 +831,68 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             if u not in found_urls:
                 found_urls.append(u)
 
+    # 2. If no explicit HTTP link found in text, check for WeChat Article Card or quote with 🔗
+    # Scan WeChat process memory to convert the card into the real mp.weixin.qq.com URL!
+    if not found_urls:
+        card_kw = ""
+        for ct in candidate_texts:
+            if "🔗" in ct or "http" in ct:
+                card_kw = re.sub(r'.*?🔗\s*', '', ct)
+                break
+            m = re.search(r'\[分享文章卡片:\s*《(.*?)》', ct)
+            if m:
+                card_kw = m.group(1).strip()
+                break
+            if "“" in ct and "”" in ct and len(ct) >= 10:
+                card_kw = ct
+                break
+
+        if not card_kw and any(k in content for k in ["链接", "文章", "卡片", "新闻", "内容", "评价", "看下", "怎么看"]):
+            for ct in candidate_texts:
+                if len(ct) >= 10 and not any(bn in ct for bn in ["bot", "albot"]):
+                    card_kw = ct
+                    break
+
+        mem_url = find_article_link_in_memory(card_kw)
+        if mem_url:
+            log_msg(f"微信内存成功解析出真实链接: {mem_url}")
+            found_urls.append(mem_url)
+
+    fetched_any_article = False
     for u in found_urls[:2]:
         fetch_res = fetch_url_content(u)
         if fetch_res.get("success"):
-            user_query += f"\n【检测到群聊关联链接网页详情】（URL: {u}）：\n- 网页标题：{fetch_res['title']}\n- 网页正文内容：\n{fetch_res['body']}\n"
+            fetched_any_article = True
+            user_query += (
+                f"\n【系统已成功将该分享卡片/链接解析还原为真实链接并抓取了完整正文】（真实链接: {u}）：\n"
+                f"- 文章完整标题：《{fetch_res['title']}》\n"
+                f"- 作者/媒体来源：{fetch_res.get('author') or '媒体专栏'}\n"
+                f"- 网页报道全文正文内容：\n{fetch_res['body']}\n"
+                f"【极其重要的回答铁律】：你现在已经 100% 拿到了该链接/卡片文章的真实报道全文！\n"
+                f"当群友询问‘能看到里面的内容了吗’、‘评价一下’或询问文章讲了什么时，你必须明确回答【能看到完整内容】，并紧密围绕上面抓取到的真实正文细节（案情细节、来龙去脉、双方说法、法院裁判逻辑等）进行全面透彻的解答与评价！绝对严禁再说‘看不到完整内容’或‘只带了标题片段’！\n"
+            )
 
-    # 2. Automatic WeChat Article Card / News headline resolution
-    card_title = ""
-    card_source = ""
-    for ct in candidate_texts:
-        m = re.search(r'\[分享文章卡片:\s*《(.*?)》(?:[ \t]*来源:[ \t]*([^\]]+))?', ct)
-        if m:
-            card_title = m.group(1).strip()
-            card_source = (m.group(2) or "").strip()
-            break
-        # Heuristic for news headlines with quotes like “出钱雇你也好，麻烦出席一下”，广东一新娘...
-        if "“" in ct and "”" in ct and len(ct) >= 15:
-            if not card_title and any(k in content for k in ["评价", "看下", "怎么看", "分析", "总结", "讲了什么", "读下", "怎么样"]):
+    # 3. Fallback: If memory URL search failed, but title is present, trigger $web_search
+    if not fetched_any_article:
+        card_title = ""
+        card_source = ""
+        for ct in candidate_texts:
+            m = re.search(r'\[分享文章卡片:\s*《(.*?)》(?:[ \t]*来源:[ \t]*([^\]]+))?', ct)
+            if m:
+                card_title = m.group(1).strip()
+                card_source = (m.group(2) or "").strip()
+                break
+            if "“" in ct and "”" in ct and len(ct) >= 12:
                 card_title = ct.strip()
                 break
 
-    if card_title:
-        user_query += (
-            f"\n【重要任务：群友正在要求阅读与评价/分析分享的文章】：\n"
-            f"- 分享文章标题：《{card_title}》\n"
-            f"- 媒体/发布来源：{card_source or '权威新闻媒体'}\n"
-            f"- 核心要求：群友正在要求你阅读并评价/分析这篇分享的文章！由于微信卡片只展示了部分标题，你【必须立即使用 $web_search 联网搜索工具】检索该文章的完整报道正文与真实事件细节！在完整阅读了真实正文后，再进行全面、客观、深入有依据的分析评价！绝对严禁仅凭标题凭空推测或说‘光从标题看’！\n"
-        )
+        if card_title:
+            user_query += (
+                f"\n【重要任务：群友正在要求阅读与评价/分析分享的文章】：\n"
+                f"- 分享文章标题：《{card_title}》\n"
+                f"- 媒体/发布来源：{card_source or '权威新闻媒体'}\n"
+                f"- 核心要求：群友正在要求你阅读并评价/分析这篇分享的文章！由于微信卡片只展示了部分标题，你【必须立即使用 $web_search 联网搜索工具】检索该文章的完整报道正文与真实事件细节！在完整阅读了真实正文后，再进行全面、客观、深入有依据的分析评价！绝对严禁仅凭标题凭空推测或说‘光从标题看’！\n"
+            )
 
     messages = [
         {"role": "system", "content": system_instruction},
