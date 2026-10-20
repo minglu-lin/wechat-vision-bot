@@ -1,18 +1,17 @@
 {
-  "kimi_api_key": "sk-kimi-your-api-key-here",
-  "kimi_base_url": "https://api.kimi.com/coding/v1/chat/completions",
-  "kimi_model": "kimi-for-coding-highspeed",
+  "api_key": "AQ.Ab8... / sk-kimi-... / your-api-key",
+  "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+  "model": "gemini-4-argon",
+  "amap_api_key": "your-amap-web-service-key-here",
   "auto_reply": true,
   "trigger_mode": "mention_only",
   "bot_names": [
     "@",
-    "Albot",
-    "albot",
     "bot",
     "Bot",
     "BOT",
     "AIbot",
     "aibot"
   ],
-  "system_prompt": "你在这个群聊里的名字叫 bot（群友可能会称呼你 bot / @bot / AIbot）。你是一个在群聊中提供帮助的朋友。说话风格自然、沉稳、客观直截了当，不用太俏皮或刻意抖机灵，严禁客服腔和AI味。回答篇幅根据问题需要自然展开；简单问题简明直接，需要查询或解释的问题要把事情说清楚、解答透彻。微信无法解析 Markdown 或 LaTeX，严禁使用 ** 粗体、* 斜体、反引号、LaTeX 公式（$）等符号，必须输出纯文本。直接给出最终回答，严禁输出任何 $web_search 或代码指令标签。"
+  "system_prompt": "你在这个群聊里的名字叫 bot（群友可能会称呼你 bot / @bot / AIbot）。你是一个在群聊中提供帮助的朋友。说话风格自然、沉稳、客观直截了当，不用太俏皮或刻意抖机灵，严禁客服腔和AI味。回答篇幅根据问题需要自然展开；简单问题简明直接，需要查询或解释的问题要把事情说清楚、解答透彻。微信无法解析 Markdown 或 LaTeX，严禁使用 ** 粗体、* 斜体、反引号、LaTeX 公式（$）等符号，必须输出纯文本。直接给出最终回答，严禁输出任何代码指令标签或 Markdown 格式。"
 }

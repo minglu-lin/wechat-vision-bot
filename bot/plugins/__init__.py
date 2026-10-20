@@ -18,6 +18,7 @@ from .network import NetworkPlugin
 from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
 from .map_service import FoodSearchPlugin, TransitRoutePlugin
+from .image_tools import GenerateImagePlugin, SearchImagePlugin, register_image_sender
 
 
 class PluginManager:
@@ -40,6 +41,9 @@ class PluginManager:
         self.register(UtilitiesPlugin())
         self.register(FoodSearchPlugin())
         self.register(TransitRoutePlugin())
+        self.register(GenerateImagePlugin())
+        self.register(SearchImagePlugin())
+
 
     def get_openai_tools(self) -> List[dict]:
         """Export all registered plugins as OpenAI-compatible function tools."""

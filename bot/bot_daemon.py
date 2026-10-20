@@ -24,9 +24,10 @@ except ImportError:
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    from plugins import plugin_manager
+    from plugins import plugin_manager, register_image_sender
 except Exception as _pie:
     plugin_manager = None
+    register_image_sender = None
 
 os.environ["DISPLAY"] = ":99"
 BASE_DIR = os.environ.get("BOT_BASE_DIR", "/home/opc/wechat_bot" if os.path.exists("/home/opc/wechat_bot") else os.path.dirname(os.path.abspath(__file__)))
@@ -568,11 +569,96 @@ def x11_send_text(text):
     return True, "OK"
 
 
-def call_kimi_chat(messages, tools=None, timeout=35):
+def x11_send_image(image_path_or_url):
+    """Send an image to WeChat chat via X11 clipboard."""
+    global last_send_ts
+    if not image_path_or_url:
+        return False, "Empty image path"
+
+    local_path = image_path_or_url
+    if image_path_or_url.startswith("http://") or image_path_or_url.startswith("https://"):
+        try:
+            req = urllib.request.Request(image_path_or_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as r:
+                data = r.read()
+            local_raw = "/tmp/wechat_dl_raw"
+            local_path = "/tmp/wechat_dl.png"
+            with open(local_raw, "wb") as f:
+                f.write(data)
+            Image.open(local_raw).convert("RGB").save(local_path, "PNG")
+        except Exception as e:
+            log_msg(f"下载待发送图片失败: {e}")
+            return False, str(e)
+
+    if not os.path.exists(local_path):
+        log_msg(f"待发送图片文件不存在: {local_path}")
+        return False, "File not found"
+
+    _, wins = capture_screen_pil()
+    if not wins:
+        log_msg("发送图片失败: 未找到微信窗口")
+        return False, "WeChat window not found"
+    main_w = wins[0]
+    if main_w["width"] < 500:
+        log_msg("发送图片失败: 微信未登录")
+        return False, "WeChat not logged in yet"
+
+    env = os.environ.copy()
+    env["DISPLAY"] = ":99"
+    xclip_bin = "/usr/local/bin/xclip" if os.path.exists("/usr/local/bin/xclip") else "xclip"
+    try:
+        subprocess.Popen(
+            [xclip_bin, "-selection", "clipboard", "-t", "image/png", "-i", local_path],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.2)
+    except Exception as e:
+        log_msg(f"xclip 加载图片到剪贴板失败: {e}")
+        return False, str(e)
+
+    click_x = main_w["x"] + int(main_w["width"] * 0.65)
+    click_y = main_w["y"] + main_w["height"] - 75
+    x11_click(click_x, click_y)
+    time.sleep(0.2)
+
+    d = display.Display(":99")
+    try:
+        ctrl_kc = d.keysym_to_keycode(XK.XK_Control_L)
+        v_kc = d.keysym_to_keycode(XK.XK_v)
+        ret_kc = d.keysym_to_keycode(XK.XK_Return)
+
+        xtest.fake_input(d, X.KeyPress, ctrl_kc)
+        xtest.fake_input(d, X.KeyPress, v_kc)
+        xtest.fake_input(d, X.KeyRelease, v_kc)
+        xtest.fake_input(d, X.KeyRelease, ctrl_kc)
+        d.sync()
+        time.sleep(0.6)
+
+        xtest.fake_input(d, X.KeyPress, ret_kc)
+        xtest.fake_input(d, X.KeyRelease, ret_kc)
+        d.sync()
+        time.sleep(0.4)
+    finally:
+        d.close()
+
+    last_send_ts = time.time()
+    log_msg(f"已向微信发送图片: {local_path}")
+    return True, "OK"
+
+
+# Register image sender hook for plugins
+if register_image_sender:
+    register_image_sender(x11_send_image)
+
+
+def call_llm_chat(messages, tools=None, timeout=35):
     cfg = load_config()
-    api_key = cfg.get("kimi_api_key", "")
-    base_url = cfg.get("kimi_base_url", "https://api.kimi.com/coding/v1/chat/completions")
-    model = cfg.get("kimi_model", "kimi-for-coding-highspeed")
+    api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or cfg.get("kimi_api_key", "")
+    base_url = cfg.get("base_url") or cfg.get("gemini_base_url") or cfg.get("kimi_base_url", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+    model = cfg.get("model") or cfg.get("gemini_model") or cfg.get("kimi_model", "gemini-4-argon")
 
     payload = {
         "model": model,
@@ -581,17 +667,22 @@ def call_kimi_chat(messages, tools=None, timeout=35):
     if tools:
         payload["tools"] = tools
 
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    if "kimi" in base_url or "kimi" in model:
+        headers["User-Agent"] = "KimiCLI/0.77"
+
     req = urllib.request.Request(
         base_url,
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-            "User-Agent": "KimiCLI/0.77",
-        },
+        headers=headers,
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+call_kimi_chat = call_llm_chat
 
 
 def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="", session_active=False):
@@ -806,8 +897,16 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             return fast_reply
 
     sys_prompt = cfg.get("system_prompt", "")
+    cfg_model = cfg.get("model") or cfg.get("kimi_model", "")
+    cfg_url = cfg.get("base_url") or cfg.get("kimi_base_url", "")
+    is_kimi = "kimi" in cfg_model.lower() or "kimi" in cfg_url.lower()
+
     plugin_tools = plugin_manager.get_openai_tools() if plugin_manager else []
-    tools = plugin_tools + [{"type": "builtin_function", "function": {"name": "$web_search"}}]
+    if is_kimi:
+        tools = plugin_tools + [{"type": "builtin_function", "function": {"name": "$web_search"}}]
+    else:
+        tools = plugin_tools
+
     now_str = datetime.now(TZ_BJ).strftime("%Y年%m月%d日 %H:%M")
 
     history_str = ""
@@ -828,7 +927,11 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"  • 查IP归属地 (lookup_ip)：公网IP与域名物理位置、ISP运营商\n"
         f"  • 科学计算 (calculate)：数学公式、求幂、函数计算\n"
         f"  • 随机决策与掷骰子 (decision_and_roll)：多选项决策、掷骰子、抛硬币\n"
+        f"  • AI 绘画生图 (generate_ai_image)：根据自然语言描述生成并直接向群聊发送高清图片（风景、动物、插画、壁纸等）\n"
+        f"  • 全网搜图与表情包 (search_image)：搜索真实高清照片、壁纸、萌宠摄影或指定主题表情包并直接发送到群聊\n"
         f"- 当群友提出上述相关诉求时，请优先调用对应的 API 工具获取准确真实数据后再作答！\n"
+        f"- 当群友要求画画、作图、生图时，优先调用 generate_ai_image；当群友要求找照片、看图、要某类表情包或壁纸时，优先调用 search_image。\n"
+        f"- 调用生图或搜图工具后，系统已自动把图片发送到群聊中，你只需自然亲切地告知群友图片已发送，并用一两句生动的话介绍画面内容即可！\n"
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
@@ -951,7 +1054,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             msg = choice["message"]
 
             if choice.get("finish_reason") == "tool_calls" and msg.get("tool_calls"):
-                log_msg(f"Kimi 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
+                log_msg(f"模型触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
                 messages.append(msg)
                 for tc in msg["tool_calls"]:
                     fn_name = tc["function"]["name"]
@@ -993,7 +1096,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             final_reply = clean_bot_reply(content_text)
             break
         except Exception as e:
-            log_msg(f"Kimi API 调用异常 (第 {loop_idx+1} 轮): {e}")
+            log_msg(f"LLM API 调用异常 (第 {loop_idx+1} 轮): {e}")
             break
 
     return final_reply or clean_bot_reply(msg.get("content", "").strip())
@@ -1423,6 +1526,10 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/send":
             text = body.get("text", "")
             ok, msg = x11_send_text(text)
+            self._send_json({"ok": ok, "message": msg})
+        elif parsed.path == "/api/send_image":
+            img_path = body.get("path") or body.get("url") or ""
+            ok, msg = x11_send_image(img_path)
             self._send_json({"ok": ok, "message": msg})
         elif parsed.path == "/api/config":
             cfg = load_config()
