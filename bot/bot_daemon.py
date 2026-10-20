@@ -118,11 +118,6 @@ def is_genuine_mention(content, bot_names=None):
     c = content.strip()
     if re.fullmatch(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', c):
         return False
-    if re.search(r'@(?:Albot|albot|bot|Bot|BOT|AIbot|aibot|微信小号|\S+bot|\S+机器人)', c):
-        return True
-    if re.search(r'(?:^|\s)@(?:\S+)?', c):
-        if not re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', c):
-            return True
 
     third_person_patterns = [
         r'不用加\s*bot',
@@ -142,22 +137,37 @@ def is_genuine_mention(content, bot_names=None):
         r'给\s*bot',
         r'有\s*bot',
         r'测试\s*bot',
-        r'bot\s*(也是|也会|真|太|好|不行|坏了|挂了|死了|怎么|啥时候|是谁|是什么|别|不用)',
+        r'艾特\s*bot',
+        r'谁加的\s*bot',
+        r'bot\s*(也是|也会|真|太|好|不行|坏了|挂了|死了|怎么|啥时候|是谁|是什么|别|不用|好玩|牛逼|厉害|傻)',
     ]
     for pat in third_person_patterns:
         if re.search(pat, c, re.IGNORECASE):
             return False
 
+    if re.search(r'@(?:Albot|albot|bot|Bot|BOT|AIbot|aibot|微信小号|\S+bot|\S+机器人)', c):
+        return True
+    if re.search(r'(?:^|\s)@(?:\S+)?', c):
+        if not re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', c):
+            return True
+
     c_lower = c.lower()
-    for name in ["albot", "aibot", "bot"]:
+    candidate_names = ["albot", "aibot", "bot", "小号", "机器人"]
+    if bot_names:
+        for bn in bot_names:
+            bn_clean = bn.strip().lower().lstrip("@")
+            if bn_clean and bn_clean not in candidate_names:
+                candidate_names.append(bn_clean)
+
+    for name in candidate_names:
         if c_lower.startswith(name):
-            rest = c[len(name):].strip()
-            if not rest:
+            rem = c[len(name):]
+            if not rem:
                 return True
-            if rest[0] in [",", "，", ":", "：", " ", "、", "?", "？", "！", "!"]:
+            if rem[0] in [",", "，", ":", "：", " ", "、", "?", "？", "！", "!", "\t"] or ord(rem[0]) > 127:
                 return True
-            if any(rest.startswith(w) for w in ["查", "搜", "帮", "请", "看", "说", "讲", "解", "写", "算", "你"]):
-                return True
+        if c_lower.endswith(name):
+            return True
     return False
 
 
