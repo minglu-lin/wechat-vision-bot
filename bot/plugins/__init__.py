@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from .base import BasePlugin
 from .weather import WeatherPlugin
 from .finance import ExchangeRatePlugin, CryptoPlugin
-from .network import NetworkPlugin
+from .network import NetworkPlugin, WebSearchPlugin
 from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
 from .map_service import FoodSearchPlugin, TransitRoutePlugin
@@ -37,6 +37,7 @@ class PluginManager:
         self.register(ExchangeRatePlugin())
         self.register(CryptoPlugin())
         self.register(NetworkPlugin())
+        self.register(WebSearchPlugin())
         self.register(CalculatorPlugin())
         self.register(UtilitiesPlugin())
         self.register(FoodSearchPlugin())

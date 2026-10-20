@@ -88,3 +88,62 @@ class NetworkPlugin(BasePlugin):
             lines.append(f"• 网络 ASN：{asn}")
 
         return "\n".join(lines)
+
+
+class WebSearchPlugin(BasePlugin):
+    name = "web_search"
+    description = "全网联网搜索工具：当需要了解实时事实、最新新闻、当天行情、具体资料细节或查询未知事物时调用，检索全网最新真实报道"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "搜索关键词或查询短语",
+            }
+        },
+        "required": ["query"],
+    }
+
+    def execute(self, query: str, **kwargs) -> dict:
+        import urllib.parse
+        q = (query or "").strip()
+        if not q:
+            return {"error": "未提供搜索关键词"}
+
+        url = f"https://cn.bing.com/search?q={urllib.parse.quote(q)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        }
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=8) as r:
+                html = r.read().decode("utf-8", errors="ignore")
+
+            items = []
+            matches = re.findall(r'<li class="b_algo">.*?<h2><a\s+href="([^"]+)".*?>(.*?)</a></h2>.*?<p>(.*?)</p>', html, re.DOTALL)
+            for href, raw_title, raw_snippet in matches[:5]:
+                clean_title = re.sub(r'<[^>]+>', '', raw_title).strip()
+                clean_snippet = re.sub(r'<[^>]+>', '', raw_snippet).strip()
+                if clean_title and clean_snippet:
+                    items.append({
+                        "title": clean_title,
+                        "snippet": clean_snippet,
+                        "url": href,
+                    })
+
+            if not items:
+                snippets = re.findall(r'<p class="b_lineclamp\d*">(.*?)</p>', html)
+                for s in snippets[:4]:
+                    cs = re.sub(r'<[^>]+>', '', s).strip()
+                    if cs:
+                        items.append({"title": q, "snippet": cs, "url": ""})
+
+            return {
+                "query": q,
+                "count": len(items),
+                "results": items if items else [{"snippet": f"已联网检索关键词‘{q}’，未发现明显异动网页。"}]
+            }
+        except Exception as e:
+            return {"error": f"联网搜索请求失败: {e}"}
+

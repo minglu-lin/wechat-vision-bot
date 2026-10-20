@@ -874,40 +874,105 @@ def extract_image_via_clipboard(px, py):
                 pass
 
 
-def call_llm_chat(messages, tools=None, timeout=75, override_model=None):
+def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65):
+    """
+    通用多模型分流调用引擎，统一调度 Kimi 与 Gemini 两大服务商。
+    """
     cfg = load_config()
-    api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or cfg.get("kimi_api_key", "")
-    base_url = cfg.get("base_url") or cfg.get("gemini_base_url") or cfg.get("kimi_base_url", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-    model = override_model or cfg.get("model") or cfg.get("gemini_model") or cfg.get("kimi_model", "gemini-3.8-flash")
+    if provider == "kimi":
+        api_key = cfg.get("kimi_api_key") or cfg.get("api_key", "")
+        base_url = cfg.get("kimi_base_url", "https://api.kimi.com/coding/v1/chat/completions")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+            "User-Agent": "KimiCLI/0.77",
+        }
+    else:  # gemini
+        api_key = cfg.get("gemini_api_key") or cfg.get("api_key", "")
+        base_url = cfg.get("gemini_base_url") or cfg.get("base_url", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
 
     payload = {
-        "model": model,
+        "model": model_name,
         "messages": messages,
     }
     if tools:
         payload["tools"] = tools
-
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    if "kimi" in base_url or "kimi" in model:
-        headers["User-Agent"] = "KimiCLI/0.77"
 
     req = urllib.request.Request(
         base_url,
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
     )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
-    except Exception as e:
-        # 如果主力模型超时或报错，且未指定 fallback，自动降级至 gemini-2.5-flash 重试
-        if not override_model and "3.8" in model:
-            log_msg(f"模型 {model} 请求异常 ({e})，自动切换备用模型 gemini-2.5-flash 进行快速容灾重试...")
-            return call_llm_chat(messages, tools=tools, timeout=40, override_model="gemini-2.5-flash")
-        raise e
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+class TaskModelRouter:
+    """
+    智能多模型分流路由引擎
+    用户配额特征：Kimi 额度充裕，Gemini 额度珍贵。
+    1. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
+    2. Kimi (kimi-for-coding-highspeed): 主力文本对话、长文/文章卡片深度阅读总结、日常问答、生活工具查询 (承担 70%+ 主力日常流量，保护 Gemini 额度)
+    3. Gemini 4 Argon (gemini-4-argon): 深度推理、复杂编程、算法设计、数理推导与形式化证明 (高难度任务专精)
+    4. Gemini 3.8 Flash (gemini-3.8-flash): X11 屏幕后台视觉检测、群聊附图/截图等多模态读图、Kimi/Argon 的快速容灾降级
+    """
+
+    DEEP_REASONING_PATTERNS = [
+        r'(?:写一段?|编写|实现|手写|设计)(?:个|一个)?(?:代码|程序|脚本|算法|函数|类|模块)',
+        r'(?:代码|程序|算法)(?:重构|优化|调试|排查|分析|实现)',
+        r'(?:leetcode|动态规划|二叉树|红黑树|快速排序|递归|贪心|图论)',
+        r'(?:数学证明|公式推导|求导|微积分|拉格朗日|矩阵|线性代数|特征值|傅里叶|偏微分)',
+        r'(?:深度思考|深度分析|底层原理|架构设计|形式化验证|博弈论)',
+        r'(?:gemini\s*4|argon|4-argon)',
+    ]
+
+    MULTIMODAL_IMAGE_PATTERNS = [
+        r'(?:看下?|看一看|识别|分析|提取)(?:这张?|这个?|上面这个?|附件)?(?:图|照片|图片|截图)',
+        r'(?:图里|照片里|截图里)(?:写了什么|有什么|是啥|报错|文字)',
+        r'(?:gemini\s*3\.?8|flash)',
+    ]
+
+    @classmethod
+    def route(cls, content: str, quote_info: dict = None, image_info: dict = None) -> dict:
+        c = (content or "").strip().lower()
+        has_img = bool(image_info and image_info.get("has_image"))
+
+        # 1. 多模态/附图解析诉求 -> 分流给 Gemini 3.8 Flash (Kimi 纯文本 API 无法接收图片数据)
+        if has_img or any(re.search(p, c) for p in cls.MULTIMODAL_IMAGE_PATTERNS):
+            log_msg(f"【模型分流路由】多模态视觉图文理解 -> 分流至 Gemini 3.8 Flash")
+            return {
+                "provider": "gemini",
+                "model": "gemini-3.8-flash",
+                "reason": "多模态视觉图文解析",
+            }
+
+        # 2. 复杂编程/算法/数学证明/深度推理 -> 分流给 Gemini 4 Argon
+        if any(re.search(p, c) for p in cls.DEEP_REASONING_PATTERNS):
+            log_msg(f"【模型分流路由】高难度编程/数理推导/深度逻辑推理 -> 分流至 Gemini 4 Argon")
+            return {
+                "provider": "gemini",
+                "model": "gemini-4-argon",
+                "reason": "深度代码与数理逻辑推理",
+            }
+
+        # 3. 主力日常对话、微信文章卡片阅读、长文本阅读、日常查询、生活工具调用 -> 分流给 Kimi
+        # （充分消耗充裕的 Kimi 额度，最大限度节约宝贵的 Gemini 额度）
+        log_msg(f"【模型分流路由】常规群聊文本问答/长文阅读/工具调用 -> 分流至 Kimi (充裕额度主力)")
+        return {
+            "provider": "kimi",
+            "model": "kimi-for-coding-highspeed",
+            "reason": "主力日常问答与长文阅读 (Kimi 充裕额度)",
+        }
+
+
+def call_llm_chat(messages, tools=None, timeout=75, override_model=None):
+    model = override_model or "gemini-3.8-flash"
+    provider = "kimi" if "kimi" in model.lower() else "gemini"
+    return call_routed_llm(provider, model, messages, tools=tools, timeout=timeout)
 
 
 call_kimi_chat = call_llm_chat
@@ -978,7 +1043,7 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             ],
         }
     ]
-    res = call_kimi_chat(messages, timeout=60)
+    res = call_routed_llm("gemini", "gemini-3.8-flash", messages, timeout=45)
     text = res["choices"][0]["message"]["content"].strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -1153,15 +1218,13 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             return fast_reply
 
     sys_prompt = cfg.get("system_prompt", "")
-    cfg_model = cfg.get("model") or cfg.get("kimi_model", "")
-    cfg_url = cfg.get("base_url") or cfg.get("kimi_base_url", "")
-    is_kimi = "kimi" in cfg_model.lower() or "kimi" in cfg_url.lower()
+    route_info = TaskModelRouter.route(content, quote_info=quote_info, image_info=image_info)
+    provider = route_info["provider"]
+    target_model = route_info["model"]
+    route_reason = route_info["reason"]
 
     plugin_tools = plugin_manager.get_openai_tools() if plugin_manager else []
-    if is_kimi:
-        tools = plugin_tools + [{"type": "builtin_function", "function": {"name": "$web_search"}}]
-    else:
-        tools = plugin_tools
+    tools = plugin_tools
 
     now_str = datetime.now(TZ_BJ).strftime("%Y年%m月%d日 %H:%M")
 
@@ -1307,54 +1370,50 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     msg = {}
     for loop_idx in range(3):
         try:
-            res = call_kimi_chat(messages, tools=tools, timeout=75)
+            log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮...")
+            res = call_routed_llm(provider, target_model, messages, tools=tools, timeout=65)
             choice = res["choices"][0]
             msg = choice["message"]
 
             if choice.get("finish_reason") == "tool_calls" and msg.get("tool_calls"):
-                log_msg(f"模型触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
+                log_msg(f"模型 ({target_model}) 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
                 messages.append(msg)
                 for tc in msg["tool_calls"]:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"].get("arguments", "{}")
-                    if fn_name == "$web_search":
-                        log_msg(f"触发内置联网搜索: {content}")
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "name": fn_name,
-                            "content": fn_args,
-                        })
+                    log_msg(f"执行 API 插件: {fn_name}({fn_args})")
+                    if plugin_manager:
+                        tool_res = plugin_manager.execute_tool(fn_name, fn_args)
                     else:
-                        log_msg(f"执行 API 插件: {fn_name}({fn_args})")
-                        if plugin_manager:
-                            tool_res = plugin_manager.execute_tool(fn_name, fn_args)
-                        else:
-                            tool_res = {"error": "Plugin manager not loaded"}
-                        res_str = json.dumps(tool_res, ensure_ascii=False) if isinstance(tool_res, (dict, list)) else str(tool_res)
-                        log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:120]}")
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "name": fn_name,
-                            "content": res_str,
-                        })
+                        tool_res = {"error": "Plugin manager not loaded"}
+                    res_str = json.dumps(tool_res, ensure_ascii=False) if isinstance(tool_res, (dict, list)) else str(tool_res)
+                    log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:120]}")
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": fn_name,
+                        "content": res_str,
+                    })
                 continue
 
             content_text = msg.get("content", "").strip()
-            if "$web_search" in content_text and loop_idx < 2:
-                log_msg("检测到回答中包含原始 $web_search 标签，要求模型输出最终纯净回答...")
-                messages.append(msg)
-                messages.append({
-                    "role": "user",
-                    "content": "请根据搜索结果直接给出面向用户的最终回答，绝对不要输出任何 $web_search 或代码指令标签。",
-                })
-                continue
-
             final_reply = clean_bot_reply(content_text)
             break
         except Exception as e:
-            log_msg(f"LLM API 调用异常 (第 {loop_idx+1} 轮): {e}")
+            log_msg(f"模型 [{provider}/{target_model}] 请求异常 (第 {loop_idx+1} 轮): {e}")
+            # 容灾自动分流降级：如果 Kimi 超时或出错，无缝切换 Gemini 3.8 Flash 兜底
+            if provider == "kimi":
+                log_msg("Kimi 服务调用异常，自动切换备用 Gemini 3.8 Flash 进行快速容灾重试...")
+                provider = "gemini"
+                target_model = "gemini-3.8-flash"
+                route_reason = "Kimi 异常容灾降级"
+                continue
+            # 如果 Gemini 4 Argon 异常，降级至 Gemini 3.8 Flash
+            elif target_model == "gemini-4-argon":
+                log_msg("Gemini 4 Argon 异常，降级至 Gemini 3.8 Flash 继续重试...")
+                target_model = "gemini-3.8-flash"
+                route_reason = "Argon 异常容灾降级"
+                continue
             break
 
     return final_reply or clean_bot_reply(msg.get("content", "").strip())
@@ -1883,7 +1942,7 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
                 ],
             }]
-            res = call_kimi_chat(messages, timeout=35)
+            res = call_routed_llm("gemini", "gemini-3.8-flash", messages, timeout=35)
             summary = res["choices"][0]["message"]["content"].strip()
             self._send_json({"ok": True, "summary": summary})
         else:
