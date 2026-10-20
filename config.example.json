@@ -2,6 +2,7 @@
   "api_key": "AQ.Ab8... / sk-kimi-... / your-api-key",
   "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
   "model": "gemini-4-argon",
+  "image_model": "gemini-3-pro-image",
   "amap_api_key": "your-amap-web-service-key-here",
   "auto_reply": true,
   "trigger_mode": "mention_only",

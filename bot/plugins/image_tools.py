@@ -18,6 +18,7 @@ import re
 import os
 import random
 import base64
+import io
 from PIL import Image
 from .base import BasePlugin
 
@@ -29,16 +30,16 @@ def register_image_sender(sender_fn):
     _IMAGE_SENDER = sender_fn
 
 
-def _get_api_key():
+def _get_config():
     for p in ["/home/opc/wechat_bot/config.json", os.path.join(os.path.dirname(__file__), "..", "..", "config.json")]:
         if os.path.exists(p):
             try:
                 with open(p, "r", encoding="utf-8") as f:
-                    cfg = json.load(f)
-                    return cfg.get("api_key") or cfg.get("gemini_api_key") or ""
+                    return json.load(f)
             except Exception:
                 pass
-    return os.environ.get("GEMINI_API_KEY", "")
+    return {}
+
 
 
 class GenerateImagePlugin(BasePlugin):
@@ -94,39 +95,49 @@ class GenerateImagePlugin(BasePlugin):
                     ref_path = candidate
                     break
 
-        api_key = _get_api_key()
+        cfg = _get_config()
+        api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", "")
+        img_model = cfg.get("image_model") or "gemini-3-pro-image"
         gemini_success = False
 
-        # 1. Primary Engine: Google Gemini 2.5 Flash Image (photorealistic, supports img2img, zero watermark)
+        # 1. Primary Engine: Nano Banana Pro (Gemini 3 Pro Image / gemini-3-pro-image)
         if api_key and (api_key.startswith("AQ.") or api_key.startswith("AIza")):
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-image:generateContent?key={api_key}"
-                parts = [{"text": p}]
+            models_to_try = [img_model]
+            if "gemini-3-pro-image" not in models_to_try:
+                models_to_try.append("gemini-3-pro-image")
+            if "gemini-2.5-flash-image" not in models_to_try:
+                models_to_try.append("gemini-2.5-flash-image")
 
-                if is_remix and ref_path and os.path.exists(ref_path):
-                    with open(ref_path, "rb") as rf:
-                        b64_data = base64.b64encode(rf.read()).decode("utf-8")
-                    parts.append({"inlineData": {"mimeType": "image/png", "data": b64_data}})
+            for target_model in models_to_try:
+                if gemini_success:
+                    break
+                try:
+                    url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
+                    parts = [{"text": p}]
 
-                payload = {"contents": [{"parts": parts}]}
-                req = urllib.request.Request(
-                    url,
-                    data=json.dumps(payload).encode("utf-8"),
-                    headers={"Content-Type": "application/json"}
-                )
-                with urllib.request.urlopen(req, timeout=35) as r:
-                    res = json.loads(r.read().decode("utf-8"))
+                    if is_remix and ref_path and os.path.exists(ref_path):
+                        with open(ref_path, "rb") as rf:
+                            b64_data = base64.b64encode(rf.read()).decode("utf-8")
+                        parts.append({"inlineData": {"mimeType": "image/png", "data": b64_data}})
 
-                cand = res.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-                for part in cand:
-                    if "inlineData" in part:
-                        raw = base64.b64decode(part["inlineData"]["data"])
-                        with open(local_png, "wb") as f:
-                            f.write(raw)
-                        gemini_success = True
-                        break
-            except Exception as ge:
-                pass
+                    payload = {"contents": [{"parts": parts}]}
+                    req = urllib.request.Request(
+                        url,
+                        data=json.dumps(payload).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}
+                    )
+                    with urllib.request.urlopen(req, timeout=40) as r:
+                        res = json.loads(r.read().decode("utf-8"))
+
+                    cand = res.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+                    for part in cand:
+                        if "inlineData" in part:
+                            raw = base64.b64decode(part["inlineData"]["data"])
+                            Image.open(io.BytesIO(raw)).convert("RGB").save(local_png, "PNG")
+                            gemini_success = True
+                            break
+                except Exception:
+                    continue
 
         # 2. Fallback Engine: Pollinations.ai (Flux.1 / SDXL, free fallback)
         if not gemini_success:
