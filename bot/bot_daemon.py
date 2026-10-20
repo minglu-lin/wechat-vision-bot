@@ -119,6 +119,32 @@ def is_genuine_mention(content, bot_names=None):
     if re.fullmatch(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', c):
         return False
 
+    c_lower = c.lower()
+    candidate_names = ["albot", "aibot", "bot", "小号", "机器人"]
+    if bot_names:
+        for bn in bot_names:
+            bn_clean = bn.strip().lower().lstrip("@")
+            if bn_clean and bn_clean not in candidate_names:
+                candidate_names.append(bn_clean)
+
+    # 1. 【用户铁律】：bot / @bot 开头直接绝对白名单放行！
+    # 只要句子开头是呼叫 bot，绝不进入任何第三人称过滤，直接放行触发回复
+    c_no_at = c_lower.lstrip("@").strip()
+    for name in candidate_names:
+        if c_lower.startswith(name) or c_no_at.startswith(name):
+            name_len = len(name)
+            rem = c_no_at[name_len:]
+            if not rem or rem[0] in [",", "，", ":", "：", " ", "、", "?", "？", "！", "!", "\t"] or ord(rem[0]) > 127:
+                return True
+
+    # 2. 显式 @bot 放行
+    if re.search(r'@(?:Albot|albot|bot|Bot|BOT|AIbot|aibot|微信小号|\S+bot|\S+机器人)', c):
+        return True
+    if re.search(r'(?:^|\s)@(?:\S+)?', c):
+        if not re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', c):
+            return True
+
+    # 3. 只有非 bot 开头时，才过滤群友闲聊第三人称随口提及（如“不用加bot”、“这个bot好逗”）
     third_person_patterns = [
         r'不用加\s*bot',
         r'不用艾特\s*bot',
@@ -139,35 +165,14 @@ def is_genuine_mention(content, bot_names=None):
         r'测试\s*bot',
         r'艾特\s*bot',
         r'谁加的\s*bot',
-        r'bot\s*(也是|也会|真|太|好|不行|坏了|挂了|死了|怎么|啥时候|是谁|是什么|别|不用|好玩|牛逼|厉害|傻)',
     ]
     for pat in third_person_patterns:
         if re.search(pat, c, re.IGNORECASE):
             return False
 
-    if re.search(r'@(?:Albot|albot|bot|Bot|BOT|AIbot|aibot|微信小号|\S+bot|\S+机器人)', c):
+    if any(c_lower.endswith(name) for name in candidate_names):
         return True
-    if re.search(r'(?:^|\s)@(?:\S+)?', c):
-        if not re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', c):
-            return True
 
-    c_lower = c.lower()
-    candidate_names = ["albot", "aibot", "bot", "小号", "机器人"]
-    if bot_names:
-        for bn in bot_names:
-            bn_clean = bn.strip().lower().lstrip("@")
-            if bn_clean and bn_clean not in candidate_names:
-                candidate_names.append(bn_clean)
-
-    for name in candidate_names:
-        if c_lower.startswith(name):
-            rem = c[len(name):]
-            if not rem:
-                return True
-            if rem[0] in [",", "，", ":", "：", " ", "、", "?", "？", "！", "!", "\t"] or ord(rem[0]) > 127:
-                return True
-        if c_lower.endswith(name):
-            return True
     return False
 
 
