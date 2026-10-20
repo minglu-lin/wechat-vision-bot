@@ -68,12 +68,8 @@ class GenerateImagePlugin(BasePlugin):
     }
 
     fast_patterns = [
-        # 1. 传统文生图
+        # 仅针对明确独立的自然语言文生图走 Fast-Path 直通
         r'^(?:帮我)?(?:画一张|画一个|画一只|画张|画个|画只|画|生成一张|生成一个|生成图片|生成图|生成|来一张|来个|来只|画画|画图)\s*[:：]?\s*(?P<prompt>.+)$',
-        # 2. 图片重制 / 改图 / 换人 / 风格转换（垫图图生图）
-        r'^(?:帮我)?(?:重制一下|重制|重绘一下|重绘|改一下|修改一下|改改|重做一下|重做)\s*(?:这个|这张|此)?\s*(?:照片|图|图片)?\s*[,，:：]?\s*(?P<prompt>.+)$',
-        r'^(?:帮我)?(?:把|将)\s*(?:这个|这张|图里|照片里)?\s*(?:照片|图|图片|里面)?\s*(?:的?人|的?内容|中的)?\s*(?:变|改|换)成\s*(?P<prompt>.+)$',
-        r'^(?:帮我)?(?:参考|仿照|根据)\s*(?:这个|这张)?\s*(?:照片|图|图片)?\s*(?:画|生成|做)?\s*[:：]?\s*(?P<prompt>.+)$',
     ]
 
     def execute(self, prompt: str, aspect_ratio: str = "1:1", use_ref_image: bool = False, ref_image_path: str = None, **kwargs) -> dict:
@@ -84,13 +80,13 @@ class GenerateImagePlugin(BasePlugin):
         seed = random.randint(1000, 9999999)
         local_png = f"/tmp/wechat_ai_gen_{seed}.png"
 
-        # Check if user intent is image remixing
+        # Check if user intent is image remixing (图生图)
         is_remix = use_ref_image or any(k in p for k in ["重制", "改图", "修改", "换成", "变成", "参考", "仿照", "垫图", "照片里", "图里", "里面的人"])
 
-        # Determine reference image
+        # Determine reference image (ONLY use clean cropped photos, NEVER whole UI screenshots!)
         ref_path = ref_image_path
         if not ref_path or not os.path.exists(ref_path):
-            for candidate in ["/tmp/wechat_last_chat_img.png", "/tmp/wechat_win.png", "/home/opc/user_lake_photo.png"]:
+            for candidate in ["/tmp/wechat_last_photo.png", "/home/opc/user_lake_photo.png"]:
                 if os.path.exists(candidate):
                     ref_path = candidate
                     break

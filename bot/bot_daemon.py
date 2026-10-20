@@ -236,13 +236,17 @@ def find_article_link_in_memory(keyword=""):
         return None
 
     kw = (keyword or "").strip()
+    if not kw:
+        return None
     kw_clean = re.sub(r'^[“"\'「\s\U0001f517]+|[”"\'」\s]+$', '', kw)
+    if not kw_clean or len(kw_clean) < 2:
+        return None
     if len(kw_clean) > 8:
         search_kw = kw_clean[:6]
     else:
         search_kw = kw_clean
 
-    kw_bytes = search_kw.encode("utf-8") if search_kw else b"mp.weixin.qq.com"
+    kw_bytes = search_kw.encode("utf-8")
 
     try:
         with open(f"/proc/{pid}/maps") as f:
@@ -654,7 +658,7 @@ if register_image_sender:
     register_image_sender(x11_send_image)
 
 
-def call_llm_chat(messages, tools=None, timeout=35):
+def call_llm_chat(messages, tools=None, timeout=75):
     cfg = load_config()
     api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or cfg.get("kimi_api_key", "")
     base_url = cfg.get("base_url") or cfg.get("gemini_base_url") or cfg.get("kimi_base_url", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
@@ -721,7 +725,7 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         f"   - 【严格禁忌】：群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊，绝对不是在呼叫 bot！is_mentioned 必须为 false！\n"
         f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
         f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
-        f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字、标题或搜索词）\n"
+        f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
         f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
         f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
         f"   - 若不是卡片：is_card=false\n\n"
@@ -736,7 +740,7 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         f'      "is_mentioned": true,\n'
         f'      "is_followup": false,\n'
         f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
-        f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": ""}},\n'
+        f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
         f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}}\n'
         f'    }}\n'
         f'  ]\n'
@@ -752,7 +756,7 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             ],
         }
     ]
-    res = call_kimi_chat(messages, timeout=50)
+    res = call_kimi_chat(messages, timeout=60)
     text = res["choices"][0]["message"]["content"].strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -765,8 +769,28 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             data = json.loads(text)
 
         if isinstance(data, dict):
-            if "messages" in data and isinstance(data["messages"], list):
-                return data["messages"]
+            msgs = data.get("messages", [])
+            for m in msgs:
+                ref_img = m.get("referenced_image")
+                if ref_img and ref_img.get("has_image") and ref_img.get("box_2d"):
+                    box = ref_img["box_2d"]
+                    if isinstance(box, list) and len(box) == 4:
+                        try:
+                            ymin, xmin, ymax, xmax = box
+                            cw, ch = chat_img.size
+                            crop_box = (
+                                max(0, int(xmin * cw / 1000)),
+                                max(0, int(ymin * ch / 1000)),
+                                min(cw, int(xmax * cw / 1000)),
+                                min(ch, int(ymax * ch / 1000))
+                            )
+                            if crop_box[2] - crop_box[0] > 20 and crop_box[3] - crop_box[1] > 20:
+                                chat_img.crop(crop_box).save("/tmp/wechat_last_photo.png")
+                                log_msg(f"成功定位并裁剪群聊中的真实图片: {crop_box} -> /tmp/wechat_last_photo.png")
+                        except Exception as ce:
+                            log_msg(f"裁剪图片失败: {ce}")
+            if isinstance(msgs, list):
+                return msgs
             elif "content" in data:
                 return [data]
         elif isinstance(data, list):
@@ -1004,10 +1028,11 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     card_kw = ct
                     break
 
-        mem_url = find_article_link_in_memory(card_kw)
-        if mem_url:
-            log_msg(f"微信内存成功解析出真实链接: {mem_url}")
-            found_urls.append(mem_url)
+        if card_kw:
+            mem_url = find_article_link_in_memory(card_kw)
+            if mem_url:
+                log_msg(f"微信内存成功解析出真实链接: {mem_url}")
+                found_urls.append(mem_url)
 
     fetched_any_article = False
     for u in found_urls[:2]:
@@ -1054,7 +1079,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     msg = {}
     for loop_idx in range(3):
         try:
-            res = call_kimi_chat(messages, tools=tools, timeout=35)
+            res = call_kimi_chat(messages, tools=tools, timeout=75)
             choice = res["choices"][0]
             msg = choice["message"]
 
