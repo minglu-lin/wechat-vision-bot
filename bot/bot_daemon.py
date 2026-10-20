@@ -32,25 +32,166 @@ last_recorded_text = ""
 last_bot_reply_ts = 0.0
 last_replied_user = ""
 seen_msg_timestamps = {}
+seen_content_timestamps = {}
 
 
 def is_recent_duplicate(sender, content, window=180):
     now = time.time()
-    key = f"{sender.strip()}:::{content.strip()}"
-    last_t = seen_msg_timestamps.get(key, 0)
-    if now - last_t < window:
+    c_clean = content.strip()
+    s_clean = sender.strip()
+    key_full = f"{s_clean}:::{c_clean}"
+    if now - seen_msg_timestamps.get(key_full, 0) < window:
+        return True
+    if len(c_clean) > 3 and now - seen_content_timestamps.get(c_clean, 0) < 60:
         return True
     return False
 
 
 def mark_seen(sender, content):
-    key = f"{sender.strip()}:::{content.strip()}"
-    seen_msg_timestamps[key] = time.time()
+    now = time.time()
+    c_clean = content.strip()
+    s_clean = sender.strip()
+    key_full = f"{s_clean}:::{c_clean}"
+    seen_msg_timestamps[key_full] = now
+    if c_clean:
+        seen_content_timestamps[c_clean] = now
     if len(seen_msg_timestamps) > 300:
-        cutoff = time.time() - 600
-        keys_to_del = [k for k, t in seen_msg_timestamps.items() if t < cutoff]
-        for k in keys_to_del:
+        cutoff = now - 600
+        for k in [k for k, t in seen_msg_timestamps.items() if t < cutoff]:
             del seen_msg_timestamps[k]
+        for k in [k for k, t in seen_content_timestamps.items() if t < cutoff]:
+            del seen_content_timestamps[k]
+
+
+def is_trivial_or_reaction(content):
+    if not content:
+        return True
+    s = content.strip()
+    if re.fullmatch(r'(?:\[[a-zA-Z0-9_\u4e00-\u9fa5]+\]|\s)+', s):
+        return True
+    s_clean = re.sub(r'^[\[\(\"\'\“\‘\s]+|[\]\)\"\'\”\’\s]+$', '', s).strip()
+    if not s_clean:
+        return True
+    if re.fullmatch(r'[\s\?\？\!\！\.\。\…\,\，\-\_\=\+\~\`\^\;\；\:\：\/\、\d]+', s_clean):
+        return True
+    stripped = re.sub(r'\[[a-zA-Z0-9_\u4e00-\u9fa5]+\]', '', s_clean).strip()
+    if not stripped:
+        return True
+    emoji_pattern = re.compile(
+        r'[\U00010000-\U0010ffff\u2600-\u27bf\u2300-\u23ff\u2b50-\u2b55\ufe00-\ufe0f\u200d]+',
+        flags=re.UNICODE
+    )
+    without_emojis = emoji_pattern.sub('', s_clean).strip()
+    without_emojis_or_punct = re.sub(r'[\s\?\？\!\！\.\。\…\,\，\-\_\=\+\~\`\^\;\；\:\：\/\、\d]+', '', without_emojis).strip()
+    if not without_emojis_or_punct:
+        return True
+    trivial_words = {
+        '好的', '收到', '嗯', '嗯嗯', '哦', '哦哦', 'ok', 'OK', 'Ok', 'oK',
+        '好', '行的', '行', '对', '对的', '确实', '赞', '牛逼', '牛', 'nb',
+        'tql', '哈哈', '哈哈哈', '呵呵', '原来如此', '懂了', '明白了', '了解',
+        '谢了', '谢谢', 'thx', 'thanks', '好嘞', '妥了', '收到收到', '有道理',
+        '还行', '不错', '是啊', '就是', '没有', '不是', '不清楚', '不知道', '强',
+        '厉害', '666', '6', '？', '?', '！', '!', '...', '。。。', '有意思'
+    }
+    if without_emojis_or_punct.lower() in trivial_words:
+        return True
+    return False
+
+
+def is_stop_command(content):
+    if not content:
+        return False
+    c = content.strip().lower()
+    stop_phrases = [
+        "闭嘴", "别说了", "别说话", "别接话", "停一下", "停止", "安静", "消停",
+        "别吵", "退下", "不用回了", "不用回答", "别回复", "暂停", "打住"
+    ]
+    for p in stop_phrases:
+        if p in c:
+            return True
+    return False
+
+
+def is_genuine_mention(content, bot_names=None):
+    if not content:
+        return False
+    c = content.strip()
+    if re.fullmatch(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', c):
+        return False
+    if re.search(r'@(?:Albot|albot|bot|Bot|BOT|AIbot|aibot|微信小号|\S+bot|\S+机器人)', c):
+        return True
+    if re.search(r'(?:^|\s)@(?:\S+)?', c):
+        if not re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', c):
+            return True
+
+    third_person_patterns = [
+        r'不用加\s*bot',
+        r'不用艾特\s*bot',
+        r'不用@',
+        r'加\s*bot',
+        r'这个\s*bot',
+        r'那个\s*bot',
+        r'把\s*bot',
+        r'看\s*bot',
+        r'找\s*bot',
+        r'让\s*bot',
+        r'问\s*bot',
+        r'跟\s*bot',
+        r'和\s*bot',
+        r'群里的?\s*bot',
+        r'给\s*bot',
+        r'有\s*bot',
+        r'测试\s*bot',
+        r'bot\s*(也是|也会|真|太|好|不行|坏了|挂了|死了|怎么|啥时候|是谁|是什么|别|不用)',
+    ]
+    for pat in third_person_patterns:
+        if re.search(pat, c, re.IGNORECASE):
+            return False
+
+    c_lower = c.lower()
+    for name in ["albot", "aibot", "bot"]:
+        if c_lower.startswith(name):
+            rest = c[len(name):].strip()
+            if not rest:
+                return True
+            if rest[0] in [",", "，", ":", "：", " ", "、", "?", "？", "！", "!"]:
+                return True
+            if any(rest.startswith(w) for w in ["查", "搜", "帮", "请", "看", "说", "讲", "解", "写", "算", "你"]):
+                return True
+    return False
+
+
+def has_followup_intent(content):
+    if is_trivial_or_reaction(content):
+        return False
+    c = content.strip()
+
+    strong_followup_markers = [
+        "那你", "那为什么", "那怎么", "那如果", "那要是", "那这个", "那那个", "那他",
+        "为什么呢", "为什么会", "为什么啊", "为啥", "凭啥", "怎讲",
+        "真的吗", "真的假的", "真假", "后来呢", "然后呢", "接着呢",
+        "再查一下", "再查下", "重新查", "再搜一下", "再搜下",
+        "详细说说", "详细讲讲", "展开说说", "展开讲讲", "具体说说", "具体讲讲", "具体是指",
+        "再解释一下", "再对比一下", "有什么区别", "哪个更好", "怎么理解",
+    ]
+    for m in strong_followup_markers:
+        if m in c:
+            return True
+
+    question_keywords = ["为什么", "怎么会", "如何理", "到底是", "具体是", "是否属实"]
+    for kw in question_keywords:
+        if kw in c:
+            return True
+
+    imperative_keywords = ["查一下", "搜一下", "帮我查", "帮我搜", "列出来", "总结一下", "对比一下"]
+    for kw in imperative_keywords:
+        if kw in c:
+            return True
+
+    if c.startswith("那") and (c.endswith("呢") or c.endswith("？") or c.endswith("?")):
+        return True
+
+    return False
 
 
 def init_db():
@@ -311,9 +452,14 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
     session_instruction = ""
     if session_active and last_replied_user:
         session_instruction = (
-            f"6. 【连续追问会话判断（重要，30秒窗口）】：bot 刚在 30 秒内回答了群友【{last_replied_user}】。\n"
-            f"   - 如果列表中有【{last_replied_user}】发送的新消息，判断它是否是在对 bot 的上一轮回答进行继续追问、要求重查、评价或多轮对话（例如‘那你再查一下’、‘为什么’、‘然后呢’、‘真的吗’等省略主语的追问）？\n"
-            f"   - 若是【{last_replied_user}】的连续追问，请在该消息项中将 is_followup 设为 true；如果是群友之间闲聊或与 bot 无关，则设为 false。\n"
+            f"【30秒连续追问判断准则（非常重要，严禁滥答）】：bot 刚在 30 秒内回答了群友【{last_replied_user}】。\n"
+            f"- 只有当【{last_replied_user}】发送的新消息是【明确针对 bot 上一轮回答的有实质提问内容的追问或明确操作指令】时，才将 is_followup 设为 true！例如：“那你再查一下...”、“为什么会这样呢”、“真的吗”、“后来怎么样了”、“详细讲讲”。\n"
+            f"- 【下列情况必须设 is_followup 为 false，绝不可设为 true】：\n"
+            f"  1. 单纯表情符号或表情包（如 👍、😂、[强]、[表情] 等）\n"
+            f"  2. 单纯标点符号（如 ?、？、!、... 等）\n"
+            f"  3. 敷衍附和、感谢或确认（如：好的、收到、明白、对、嗯、ok、谢谢、确实）\n"
+            f"  4. 闲聊感叹或向其他人发表评论（如：“原来是这样啊”、“不用加bot也会回”、“哈哈好玩”、“太强了”）\n"
+            f"  5. 没有明确提问意图或指令诉求的普通陈述句。\n\n"
         )
 
     prompt = (
@@ -323,8 +469,12 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         f"1. sender: 发送者群昵称（若是右侧绿色气泡，则为我们自己/bot）\n"
         f"2. content: 消息主体文本内容（若是图片，简要描述图片类型与核心画面）\n"
         f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
-        f"4. is_mentioned: 该消息是否显式呼叫了以下名字之一：{bot_names}，或者包含'@'？\n"
-        f"5. is_followup: 是否是对上一轮回答的连续追问（结合以下连续追问规则判断）\n"
+        f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
+        f"   - 必须满足以下条件之一：\n"
+        f"     * 包含对 bot 的艾特，如 @bot、@AIbot、@Albot、@微信小号 等\n"
+        f"     * 句子开头就是直接呼唤 bot 提出要求，如：“bot 查一下...”、“AIbot 帮我看下...”\n"
+        f"   - 【严格禁忌】：群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊，绝对不是在呼叫 bot！is_mentioned 必须为 false！\n"
+        f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
         f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
         f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字、标题或搜索词）\n\n"
         f"{session_instruction}"
@@ -518,7 +668,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"【回答规范与要求】：\n"
         f"1. 回答篇幅根据问题需要自然展开即可，不需要死板限制在 1~3 句以内。简单问题简明直接，需要查询或解释的问题要把事情说清楚、回答透彻、内容充实有用。\n"
         f"2. 结合上面的最近聊天记录，准确理解群友话语中的代词（如‘这句话’、‘刚才说的’、‘他’、‘那个’等）以及话题脉络，保持连贯记忆。\n"
-        f"3. 保持沉稳、自然、客观的真实朋友口吻，不用太俏皮或刻意调侃，严禁客服腔和AI味。\n"
+        f"3. 保持沉稳、自然、客观的朋友口吻，分寸感要好，不用太俏皮，严禁客服腔和AI味。严禁与群友抬杠、辩解或刻意戏谑调侃。\n"
         f"4. 直接输出面向群友的最终纯文本回答，严禁输出任何‘我查一下’、‘稍等’等过渡性碎碎念，绝对严禁输出任何代码、JSON、搜索函数名或 `$web_search` 等内部指令标签！"
     )
 
@@ -598,7 +748,7 @@ def find_unread_badge_in_sidebar(img, w):
 def monitor_loop():
     prev_crop = None
     last_check_reply_ts = 0.0
-    global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text
+    global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text, last_send_ts
     log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + Web Search + Local Memory)")
 
     while True:
@@ -662,6 +812,8 @@ def monitor_loop():
                                         chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active
                                     )
 
+                                    reply_candidates = []
+
                                     for msg_item in raw_msgs:
                                         is_in = msg_item.get("is_incoming", True)
                                         s = msg_item.get("sender", "群友")
@@ -679,55 +831,102 @@ def monitor_loop():
                                             continue
                                         mark_seen(s, c)
 
-                                        quotes_bot = False
-                                        if q_info and q_info.get("has_quote"):
-                                            q_s = q_info.get("quoted_sender", "")
-                                            if any(bn.lower() in str(q_s).lower() for bn in ["bot", "albot", "aibot", "微信小号"]) or q_s == "":
-                                                quotes_bot = True
-
-                                        is_valid_followup = (session_active and s == last_replied_user and is_f) or quotes_bot
-                                        should_reply = (trigger_mode == "all") or is_m or is_valid_followup
-
+                                        # Format recorded text with quote and image tags
                                         has_q = q_info.get("has_quote", False) if isinstance(q_info, dict) else False
                                         has_img = img_info.get("has_image", False) if isinstance(img_info, dict) else False
-                                        log_msg(f"消息队列提取: is_in={is_in}, sender={s}, content={c[:30]}, is_m={is_m}, is_f={is_f}, should_reply={should_reply}")
-
                                         rec_c = c
                                         if has_q and q_info.get("quoted_content"):
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
                                         if has_img and img_info.get("image_type"):
                                             rec_c = f"[附图: {img_info.get('image_type')}] " + rec_c
 
+                                        # Always save every message to local DB memory for continuity
                                         save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m)
 
-                                        if is_in:
-                                            if should_reply:
-                                                recent_history = get_recent(limit=15)
-                                                reply_content = generate_reply_with_search(
-                                                    s,
-                                                    c,
-                                                    cfg,
-                                                    recent_history=recent_history,
-                                                    quote_info=q_info,
-                                                    image_info=img_info,
-                                                )
-                                                log_msg(f"生成回复: {reply_content}")
-                                                if reply_content and reply_content != last_reply_text:
-                                                    x11_send_text(reply_content)
-                                                    save_msg("bot", reply_content, is_bot=True)
-                                                    mark_seen("bot", reply_content)
-                                                    last_recorded_text = reply_content
-                                                    last_reply_text = reply_content
-                                                    last_bot_reply_ts = time.time()
-                                                    last_replied_user = s
-                                                    log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
-                                                    time.sleep(1.0)
-                                                    img3, _ = capture_screen_pil()
-                                                    prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                        if not is_in:
+                                            log_msg(f"提取自身发送消息: {c[:25]}，已记入本地历史")
+                                            continue
+
+                                        # 1. Stop command detection (e.g. "bot 别接话", "闭嘴")
+                                        if is_stop_command(c):
+                                            log_msg(f"检测到停用/闭嘴指令: '{c}'，立即清空连续追问会话")
+                                            last_replied_user = ""
+                                            last_bot_reply_ts = 0.0
+                                            continue
+
+                                        # 2. Trivial message / emoji reaction filter
+                                        if is_trivial_or_reaction(c):
+                                            log_msg(f"过滤非实质提问消息 (表情/标点/附和): '{c}'，不触发回复")
+                                            continue
+
+                                        # 3. Third-person mention correction (e.g. "不用加bot你也会回复")
+                                        if is_m and not is_genuine_mention(c, bot_names):
+                                            log_msg(f"更正误报呼叫 (第三人称提及而非召唤): '{c}' -> is_m设为False")
+                                            is_m = False
+
+                                        # 4. Follow-up intent verification
+                                        valid_followup = False
+                                        if session_active and (s == last_replied_user or last_replied_user in s or s in last_replied_user) and is_f:
+                                            if has_followup_intent(c):
+                                                valid_followup = True
+                                                log_msg(f"有效连续追问命中 (用户={s}, 30秒窗口内): '{c}'")
                                             else:
-                                                log_msg("判定结果: 未被呼叫且非追问，已记入本地历史，跳过回复")
-                                        else:
-                                            log_msg("判定结果: 自身发送消息，已记入本地历史，跳过回复")
+                                                log_msg(f"追问窗口内但缺少明确追问疑问/指令意图: '{c}' -> 跳过回复")
+
+                                        # 5. Quote bot verification
+                                        valid_quote_reply = False
+                                        if has_q:
+                                            q_s = str(q_info.get("quoted_sender", "")).lower()
+                                            if any(bn in q_s for bn in ["bot", "albot", "aibot", "微信小号"]) or q_s == "":
+                                                if has_followup_intent(c) or (len(c) >= 6 and not is_trivial_or_reaction(c)):
+                                                    valid_quote_reply = True
+                                                    log_msg(f"用户引用 bot 消息并提出实质内容: '{c}' -> 触发回复")
+                                                else:
+                                                    log_msg(f"用户引用 bot 消息但仅为简短附和/闲聊: '{c}' -> 跳过回复")
+
+                                        should_reply = (trigger_mode == "all") or is_m or valid_followup or valid_quote_reply
+                                        log_msg(f"消息队列提取: sender={s}, content={c[:30]}, is_m={is_m}, valid_f={valid_followup}, valid_q={valid_quote_reply}, should_reply={should_reply}")
+
+                                        if should_reply:
+                                            reply_candidates.append({
+                                                "sender": s,
+                                                "content": c,
+                                                "quote": q_info,
+                                                "image": img_info,
+                                            })
+
+                                    # Pick at most ONE latest actionable incoming message from the batch
+                                    if reply_candidates:
+                                        target = reply_candidates[-1]
+                                        s = target["sender"]
+                                        c = target["content"]
+                                        q_info = target["quote"]
+                                        img_info = target["image"]
+
+                                        log_msg(f"处理最新待回复消息 (共 {len(reply_candidates)} 条待回复，取最新一条): {s}: {c[:30]}")
+                                        recent_history = get_recent(limit=15)
+                                        reply_content = generate_reply_with_search(
+                                            s,
+                                            c,
+                                            cfg,
+                                            recent_history=recent_history,
+                                            quote_info=q_info,
+                                            image_info=img_info,
+                                        )
+                                        log_msg(f"生成回复: {reply_content}")
+                                        if reply_content and reply_content != last_reply_text:
+                                            x11_send_text(reply_content)
+                                            save_msg("bot", reply_content, is_bot=True)
+                                            mark_seen("bot", reply_content)
+                                            last_recorded_text = reply_content
+                                            last_reply_text = reply_content
+                                            last_bot_reply_ts = time.time()
+                                            last_replied_user = s
+                                            log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
+                                            time.sleep(1.5)
+                                            img3, _ = capture_screen_pil()
+                                            prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                            last_send_ts = time.time()
                                 except Exception as ke:
                                     log_msg(f"消息处理异常: {ke}")
                         else:

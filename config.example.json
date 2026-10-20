@@ -6,6 +6,8 @@
   "trigger_mode": "mention_only",
   "bot_names": [
     "@",
+    "Albot",
+    "albot",
     "bot",
     "Bot",
     "BOT",
