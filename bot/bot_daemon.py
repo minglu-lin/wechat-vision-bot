@@ -686,6 +686,10 @@ call_kimi_chat = call_llm_chat
 
 
 def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="", session_active=False):
+    try:
+        chat_img.save("/tmp/wechat_last_chat_img.png")
+    except Exception:
+        pass
     buf = io.BytesIO()
     chat_img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
@@ -927,10 +931,11 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"  • 查IP归属地 (lookup_ip)：公网IP与域名物理位置、ISP运营商\n"
         f"  • 科学计算 (calculate)：数学公式、求幂、函数计算\n"
         f"  • 随机决策与掷骰子 (decision_and_roll)：多选项决策、掷骰子、抛硬币\n"
-        f"  • AI 绘画生图 (generate_ai_image)：根据自然语言描述生成并直接向群聊发送高清图片（风景、动物、插画、壁纸等）\n"
+        f"  • AI 绘画与图片重制 (generate_ai_image)：\n"
+        f"    - 支持从零文生图（风景、人物、插画、动物、壁纸等）。\n"
+        f"    - 特别支持【垫图重制与照片修改（图生图）】：当群友要求'重制一下这个照片'、'改一下这个图'、'把照片里的人变成...'、'仿照这张图'、'换成...'时，必须立即调用 generate_ai_image，并设置 use_ref_image=true！系统已将群聊中的照片作为高精度垫图，能保真重制背景与构图！\n"
         f"  • 全网搜图与表情包 (search_image)：搜索真实高清照片、壁纸、萌宠摄影或指定主题表情包并直接发送到群聊\n"
-        f"- 当群友提出上述相关诉求时，请优先调用对应的 API 工具获取准确真实数据后再作答！\n"
-        f"- 当群友要求画画、作图、生图时，优先调用 generate_ai_image；当群友要求找照片、看图、要某类表情包或壁纸时，优先调用 search_image。\n"
+        f"- 当群友提出绘画、作图、生图、重制照片、改图等诉求时，请优先调用 generate_ai_image；当群友要求找真实照片、看图、要某类表情包或壁纸时，调用 search_image。\n"
         f"- 调用生图或搜图工具后，系统已自动把图片发送到群聊中，你只需自然亲切地告知群友图片已发送，并用一两句生动的话介绍画面内容即可！\n"
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
