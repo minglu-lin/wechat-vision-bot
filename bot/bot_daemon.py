@@ -450,6 +450,8 @@ def ensure_processes():
         log_msg("Starting WeChat 4.1...")
         env = os.environ.copy()
         env["DISPLAY"] = ":99"
+        env["LANG"] = "zh_CN.UTF-8"
+        env["LC_ALL"] = "zh_CN.UTF-8"
         subprocess.Popen(
             ["dbus-run-session", "/usr/bin/wechat"],
             env=env,
