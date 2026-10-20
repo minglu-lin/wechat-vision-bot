@@ -1,0 +1,18 @@
+[Unit]
+Description=WeChat 4.x Native Linux + Multimodal Vision AI Bot Service
+After=network.target
+
+[Service]
+Type=simple
+User=opc
+Environment="DISPLAY=:99"
+Environment="PYTHONUNBUFFERED=1"
+WorkingDirectory=/home/opc/wechat_bot
+ExecStart=/usr/bin/python3 /home/opc/wechat_bot/bot_daemon.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
