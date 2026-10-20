@@ -572,7 +572,7 @@ def find_unread_badge_in_sidebar(img, w):
 def monitor_loop():
     prev_crop = None
     last_check_reply_ts = 0.0
-    global last_recorded_text
+    global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text
     log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + Web Search + Local Memory)")
 
     while True:
