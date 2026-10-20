@@ -29,6 +29,8 @@ recent_logs = []
 last_send_ts = 0.0
 last_reply_text = ""
 last_recorded_text = ""
+last_bot_reply_ts = 0.0
+last_replied_user = ""
 
 
 def init_db():
@@ -281,10 +283,18 @@ def call_kimi_chat(messages, tools=None, timeout=35):
         return json.loads(r.read().decode("utf-8"))
 
 
-def parse_latest_message_with_vision(chat_img, bot_names):
+def parse_latest_message_with_vision(chat_img, bot_names, last_replied_user="", session_active=False):
     buf = io.BytesIO()
     chat_img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+    session_instruction = ""
+    if session_active and last_replied_user:
+        session_instruction = (
+            f"6. 【连续追问会话判断（重要）】：bot 刚在 90 秒内回答了群友【{last_replied_user}】。\n"
+            f"   - 如果最底部消息是【{last_replied_user}】发送的，判断它是否是在对 bot 的回答进行继续追问、要求重查、评价或多轮对话（例如‘那你再查一下’、‘为什么’、‘然后呢’、‘真的吗’、或者省略主语的追问）？\n"
+            f"   - 如果是【{last_replied_user}】的连续追问，请将 is_followup 设为 true；如果是跟群里其他人闲聊或与 bot 无关，则为 false。\n"
+        )
 
     prompt = (
         f"这是一张微信群聊窗口最新截图。\n"
@@ -296,13 +306,15 @@ def parse_latest_message_with_vision(chat_img, bot_names):
         f"   - 如果有引用：请在 quote 字段中记录被引用的发送者(quoted_sender)及被引用的具体文字或图片描述(quoted_content)。\n"
         f"5. 【关联图片/截图OCR识别（重要）】：\n"
         f"   - 检查最新消息本身是否是一张图片，或者最新消息紧邻的上一条消息是否是群友刚刚发送的图片/截图，或者消息是否引用了图片，或者提问语义是否指向图片（如‘看图’、‘为什么搜到’等）？\n"
-        f"   - 如果存在相关图片/截图：请尽可能详细地提取并描述该图片！包括：图片类型（如谷歌搜索结果截图/报错截图/图表/照片）、图片中所有可见文字/标题/搜索关键词（OCR提取）、搜索结果或画面展示的核心信息。\n\n"
+        f"   - 如果存在相关图片/截图：请尽可能详细地提取并描述该图片！包括：图片类型（如谷歌搜索结果截图/报错截图/图表/照片）、图片中所有可见文字/标题/搜索关键词（OCR提取）、搜索结果或画面展示的核心信息。\n"
+        f"{session_instruction}\n"
         f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
         f'{{\n'
         f'  "is_incoming": true,\n'
         f'  "sender": "昵称",\n'
         f'  "content": "最新消息正文",\n'
         f'  "is_mentioned": true,\n'
+        f'  "is_followup": false,\n'
         f'  "quote": {{\n'
         f'    "has_quote": false,\n'
         f'    "quoted_sender": "",\n'
@@ -344,6 +356,7 @@ def parse_latest_message_with_vision(chat_img, bot_names):
             "sender": "群友",
             "content": text,
             "is_mentioned": is_mentioned,
+            "is_followup": False,
             "quote": {"has_quote": False, "quoted_sender": "", "quoted_content": ""},
             "referenced_image": {"has_image": False, "image_type": "", "ocr_and_detail": ""},
         }
@@ -618,17 +631,30 @@ def monitor_loop():
                                 trigger_mode = cfg.get("trigger_mode", "mention_only")
 
                                 try:
-                                    parsed = parse_latest_message_with_vision(chat_img, bot_names)
+                                    session_active = (time.time() - last_bot_reply_ts < 90) and bool(last_replied_user)
+                                    parsed = parse_latest_message_with_vision(
+                                        chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active
+                                    )
                                     is_in = parsed.get("is_incoming")
                                     s = parsed.get("sender", "群友")
                                     c = parsed.get("content", "").strip()
                                     is_m = parsed.get("is_mentioned")
+                                    is_f = parsed.get("is_followup", False)
                                     q_info = parsed.get("quote", {})
                                     img_info = parsed.get("referenced_image", {})
 
+                                    quotes_bot = False
+                                    if q_info and q_info.get("has_quote"):
+                                        q_s = q_info.get("quoted_sender", "")
+                                        if any(bn.lower() in str(q_s).lower() for bn in ["bot", "albot", "aibot", "微信小号"]) or q_s == "":
+                                            quotes_bot = True
+
+                                    is_valid_followup = (session_active and s == last_replied_user and is_f) or quotes_bot
+                                    should_reply = (trigger_mode == "all") or is_m or is_valid_followup
+
                                     has_q = q_info.get("has_quote", False) if isinstance(q_info, dict) else False
                                     has_img = img_info.get("has_image", False) if isinstance(img_info, dict) else False
-                                    log_msg(f"消息解析: is_incoming={is_in}, sender={s}, content={c}, is_mentioned={is_m}, has_quote={has_q}, has_img={has_img}")
+                                    log_msg(f"消息解析: is_incoming={is_in}, sender={s}, content={c}, is_mentioned={is_m}, is_followup={is_f}, should_reply={should_reply}")
 
                                     rec_c = c
                                     if has_q and q_info.get("quoted_content"):
@@ -641,7 +667,6 @@ def monitor_loop():
                                         last_recorded_text = rec_c
 
                                     if is_in:
-                                        should_reply = (trigger_mode == "all") or is_m
                                         if should_reply:
                                             recent_history = get_recent(limit=15)
                                             reply_content = generate_reply_with_search(
@@ -657,11 +682,15 @@ def monitor_loop():
                                                 x11_send_text(reply_content)
                                                 save_msg("bot", reply_content, is_bot=True)
                                                 last_recorded_text = reply_content
+                                                last_reply_text = reply_content
+                                                last_bot_reply_ts = time.time()
+                                                last_replied_user = s
+                                                log_msg(f"更新追问会话状态: 用户={last_replied_user}, 90秒追问窗口开启中")
                                                 time.sleep(1.0)
                                                 img3, _ = capture_screen_pil()
                                                 prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
                                         else:
-                                            log_msg("判定结果: 未被呼叫，已记入本地历史，跳过回复")
+                                            log_msg("判定结果: 未被呼叫且非追问，已记入本地历史，跳过回复")
                                     else:
                                         log_msg("判定结果: 自身发送消息，已记入本地历史，跳过回复")
                                 except Exception as ke:
