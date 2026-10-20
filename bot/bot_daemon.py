@@ -123,6 +123,28 @@ def is_stop_command(content):
     return False
 
 
+def is_explicit_bot_invocation(content):
+    """
+    检查消息是否以 @AIbot 或 bot 开头。
+    【用户最高铁律】：@AIbot 或者 bot 开头的句子都必须回应，禁止任何拦截、降级或过滤。
+    """
+    if not content:
+        return False
+    c = content.strip().lower()
+    if re.fullmatch(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', c):
+        return False
+
+    # 1. 以 @ 呼叫 bot: @aibot, @albot, @bot, @微信小号 等，兼容各类 unicode 空格 (\u2005, \u00a0, \u3000)
+    if re.match(r'^@\s*(?:aibot|albot|bot|微信小号)', c):
+        return True
+
+    # 2. 句首以 bot, aibot, albot 开头 (支持后接空格、标点、全角符号、中文或直接字符)
+    if re.match(r'^(?:bot|aibot|albot)(?:[\s\u2005\u00a0\u3000,，:：、?!？！]|$|[\u4e00-\u9fa5])', c):
+        return True
+
+    return False
+
+
 def is_genuine_mention(content, bot_names=None):
     if not content:
         return False
@@ -472,13 +494,28 @@ def find_wechat_windows(d):
             if attrs.map_state == X.IsViewable:
                 cls = w.get_wm_class()
                 geom = w.get_geometry()
-                if cls and ("wechat" in cls[0].lower() or "wechat" in cls[1].lower()):
+                if cls:
+                    cls_lowers = [c.lower() for c in cls]
+                    # 自动关闭 WeChatAppEx 网页/小程序弹窗，防止遮挡主聊天窗口
+                    if any("wechatappex" in c for c in cls_lowers) and geom.width > 200:
+                        try:
+                            name = w.get_wm_name() or ""
+                            log_msg(f"自动关闭微信网页/小程序弹窗: {name} (id={hex(w.id)})")
+                            w.destroy()
+                            d.sync()
+                            return
+                        except Exception:
+                            pass
+
+                    if any("wechat" in c for c in cls_lowers):
+                        name = w.get_wm_name() or ""
+
                     if geom.width >= 150 and geom.height >= 150:
                         coords = root.translate_coords(w, 0, 0)
                         wins.append({
                             "win": w,
                             "id": hex(w.id),
-                            "name": w.get_wm_name() or "",
+                            "name": name,
                             "width": geom.width,
                             "height": geom.height,
                             "x": coords.x,
@@ -522,6 +559,69 @@ def x11_click(x, y):
         d.close()
 
 
+def recover_wechat_ui_state():
+    """
+    微信 UI 排错与防卡顿自愈机制：
+    1. 关闭所有残留的非主窗口（如 WeChatAppEx 网页、弹窗、图片浏览）
+    2. 发送 Escape 键关闭可能残留的右键上下文菜单、弹层
+    3. 点击主聊天窗口输入框以重新获取焦点
+    4. 清空输入框内残留的异常或半截输入 (Ctrl+A -> Backspace)
+    """
+    try:
+        d = display.Display(":99")
+        try:
+            root = d.screen().root
+            # 1. 查找并销毁所有可能遮挡的 WeChatAppEx / 辅助窗口
+            for c in root.query_tree().children:
+                try:
+                    cls = c.get_wm_class()
+                    if cls:
+                        cls_str = " ".join(cls).lower()
+                        if "wechatappex" in cls_str:
+                            log_msg(f"排错自愈: 关闭残留 WeChatAppEx 窗口 {hex(c.id)}")
+                            c.destroy()
+                            d.sync()
+                except Exception:
+                    pass
+
+            # 2. 发送 Escape 键关闭任何可能悬挂的右键菜单或模态
+            esc_kc = d.keysym_to_keycode(XK.XK_Escape)
+            xtest.fake_input(d, X.KeyPress, esc_kc)
+            xtest.fake_input(d, X.KeyRelease, esc_kc)
+            d.sync()
+            time.sleep(0.05)
+
+            # 3. 聚焦输入框并清理输入内容
+            wins = find_wechat_windows(d)
+            if wins:
+                main_w = wins[0]
+                click_x = main_w["x"] + int(main_w["width"] * 0.65)
+                click_y = main_w["y"] + main_w["height"] - 75
+                xtest.fake_input(d, X.MotionNotify, x=click_x, y=click_y)
+                xtest.fake_input(d, X.ButtonPress, 1)
+                xtest.fake_input(d, X.ButtonRelease, 1)
+                d.sync()
+                time.sleep(0.05)
+
+                ctrl_kc = d.keysym_to_keycode(XK.XK_Control_L)
+                a_kc = d.keysym_to_keycode(XK.XK_a)
+                bs_kc = d.keysym_to_keycode(XK.XK_BackSpace)
+                xtest.fake_input(d, X.KeyPress, ctrl_kc)
+                xtest.fake_input(d, X.KeyPress, a_kc)
+                xtest.fake_input(d, X.KeyRelease, a_kc)
+                xtest.fake_input(d, X.KeyRelease, ctrl_kc)
+                d.sync()
+                time.sleep(0.03)
+                xtest.fake_input(d, X.KeyPress, bs_kc)
+                xtest.fake_input(d, X.KeyRelease, bs_kc)
+                d.sync()
+        finally:
+            d.close()
+        log_msg("已完成微信 UI 状态排错与自愈重置")
+    except Exception as e:
+        log_msg(f"微信 UI 自愈重置异常: {e}")
+
+
 def x11_send_text(text):
     global last_send_ts, last_reply_text
     text = clean_bot_reply(text).strip()
@@ -537,13 +637,17 @@ def x11_send_text(text):
 
     env = os.environ.copy()
     env["DISPLAY"] = ":99"
-    for sel in ("clipboard", "primary"):
+    try:
         p = subprocess.Popen(
-            ["/usr/local/bin/xclip", "-selection", sel, "-i"],
+            ["/usr/local/bin/xclip", "-selection", "clipboard", "-i"],
             stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             env=env,
         )
-        p.communicate(input=text.encode("utf-8"), timeout=3)
+        p.communicate(input=text.encode("utf-8"), timeout=2)
+    except Exception as ce:
+        log_msg(f"xclip 加载文本到剪贴板异常: {ce}")
 
     click_x = main_w["x"] + int(main_w["width"] * 0.65)
     click_y = main_w["y"] + main_w["height"] - 75
@@ -553,9 +657,24 @@ def x11_send_text(text):
     d = display.Display(":99")
     try:
         ctrl_kc = d.keysym_to_keycode(XK.XK_Control_L)
+        a_kc = d.keysym_to_keycode(XK.XK_a)
+        bs_kc = d.keysym_to_keycode(XK.XK_BackSpace)
         v_kc = d.keysym_to_keycode(XK.XK_v)
         ret_kc = d.keysym_to_keycode(XK.XK_Return)
 
+        # 清理输入框可能残留的历史输入
+        xtest.fake_input(d, X.KeyPress, ctrl_kc)
+        xtest.fake_input(d, X.KeyPress, a_kc)
+        xtest.fake_input(d, X.KeyRelease, a_kc)
+        xtest.fake_input(d, X.KeyRelease, ctrl_kc)
+        d.sync()
+        time.sleep(0.05)
+        xtest.fake_input(d, X.KeyPress, bs_kc)
+        xtest.fake_input(d, X.KeyRelease, bs_kc)
+        d.sync()
+        time.sleep(0.08)
+
+        # 粘贴并回车发送
         xtest.fake_input(d, X.KeyPress, ctrl_kc)
         xtest.fake_input(d, X.KeyPress, v_kc)
         xtest.fake_input(d, X.KeyRelease, v_kc)
@@ -662,95 +781,104 @@ if register_image_sender:
 
 def extract_image_via_clipboard(px, py):
     """
-    方案B: 模拟定位到图片 -> 触发复制/双击复制 -> 从 X11 剪贴板提取原始解密图片
+    通过右键点击图片气泡 -> 触发菜单第一项‘复制’ -> 从 X11 剪贴板提取原始图片。
+    【用户明确要求】：直接右键第一个选项就是复制，严禁双击展开大图！无需点开再去关闭。
     """
     if not display or not xtest:
         return False
     d = None
     try:
         d = display.Display(":99")
-        
-        # 1. 鼠标移动到图片中心，右击弹出菜单
+
+        # 1. 鼠标移动到图片气泡中心，右键点击弹出菜单
         xtest.fake_input(d, X.MotionNotify, x=int(px), y=int(py))
         d.sync()
-        time.sleep(0.06)
+        time.sleep(0.08)
         xtest.fake_input(d, X.ButtonPress, 3)
         xtest.fake_input(d, X.ButtonRelease, 3)
         d.sync()
         time.sleep(0.18)
 
-        # 2. 点击右键菜单中的第一项“复制”（通常在右键点击点偏右下约 30px, 18px）
-        xtest.fake_input(d, X.MotionNotify, x=int(px + 30), y=int(py + 18))
+        # 2. 点击右键菜单中的第一项“复制”（位于右键点偏右下约 35px, 16px）
+        xtest.fake_input(d, X.MotionNotify, x=int(px + 35), y=int(py + 16))
         d.sync()
         time.sleep(0.06)
         xtest.fake_input(d, X.ButtonPress, 1)
         xtest.fake_input(d, X.ButtonRelease, 1)
-        
-        # 发送 'c' 键作为菜单项选择或 Ctrl+C 兜底
-        c_kc = d.keysym_to_keycode(XK.XK_c)
-        xtest.fake_input(d, X.KeyPress, c_kc)
-        xtest.fake_input(d, X.KeyRelease, c_kc)
         d.sync()
-        time.sleep(0.3)
+        time.sleep(0.2)
 
-        # 3. 检查剪贴板是否成功提取到 image/png
+        # 3. 检查剪贴板是否成功提取到图片数据
         env = os.environ.copy()
         env["DISPLAY"] = ":99"
         xclip_bin = "/usr/local/bin/xclip" if os.path.exists("/usr/local/bin/xclip") else "xclip"
-        res = subprocess.run([xclip_bin, "-selection", "clipboard", "-t", "image/png", "-o"], env=env, capture_output=True, timeout=2)
-        if len(res.stdout) > 2000:
-            with open("/tmp/wechat_last_photo.png", "wb") as f:
-                f.write(res.stdout)
-            log_msg(f"【方案B】成功通过右键复制从剪贴板提取原始图片: {len(res.stdout)} 字节 -> /tmp/wechat_last_photo.png")
-            return True
 
-        # 4. 兜底方案: 双击展开大图 + Ctrl+C
-        xtest.fake_input(d, X.MotionNotify, x=int(px), y=int(py))
-        xtest.fake_input(d, X.ButtonPress, 1)
-        xtest.fake_input(d, X.ButtonRelease, 1)
-        time.sleep(0.08)
-        xtest.fake_input(d, X.ButtonPress, 1)
-        xtest.fake_input(d, X.ButtonRelease, 1)
-        d.sync()
-        time.sleep(0.4)
+        img_bytes = None
+        for target_fmt in ["image/png", "image/jpeg", "image/bmp", "image/x-MS-bmp"]:
+            res = subprocess.run(
+                [xclip_bin, "-selection", "clipboard", "-t", target_fmt, "-o"],
+                env=env,
+                capture_output=True,
+                timeout=2,
+            )
+            if len(res.stdout) > 2000:
+                img_bytes = res.stdout
+                break
 
-        ctrl_kc = d.keysym_to_keycode(XK.XK_Control_L)
-        xtest.fake_input(d, X.KeyPress, ctrl_kc)
-        xtest.fake_input(d, X.KeyPress, c_kc)
-        xtest.fake_input(d, X.KeyRelease, c_kc)
-        xtest.fake_input(d, X.KeyRelease, ctrl_kc)
-        d.sync()
-        time.sleep(0.25)
+        # 如果直接读取为文件路径/URI
+        if not img_bytes:
+            res_uri = subprocess.run(
+                [xclip_bin, "-selection", "clipboard", "-o"],
+                env=env,
+                capture_output=True,
+                timeout=2,
+            )
+            uri_text = res_uri.stdout.decode("utf-8", errors="ignore").strip()
+            if uri_text.startswith("file://"):
+                local_file = uri_text.replace("file://", "").strip()
+                if os.path.exists(local_file):
+                    try:
+                        with open(local_file, "rb") as lf:
+                            img_bytes = lf.read()
+                    except Exception:
+                        pass
+            elif os.path.exists(uri_text) and (uri_text.endswith(".png") or uri_text.endswith(".jpg") or uri_text.endswith(".dat")):
+                try:
+                    with open(uri_text, "rb") as lf:
+                        img_bytes = lf.read()
+                except Exception:
+                    pass
 
-        # 发送 Esc 关闭可能打开的大图窗口
+        # 4. 按 Esc 键关闭可能残留的右键上下文菜单，确保无遮挡
         esc_kc = d.keysym_to_keycode(XK.XK_Escape)
         xtest.fake_input(d, X.KeyPress, esc_kc)
         xtest.fake_input(d, X.KeyRelease, esc_kc)
         d.sync()
-        time.sleep(0.1)
 
-        res = subprocess.run([xclip_bin, "-selection", "clipboard", "-t", "image/png", "-o"], env=env, capture_output=True, timeout=2)
-        if len(res.stdout) > 2000:
+        if img_bytes and len(img_bytes) > 2000:
             with open("/tmp/wechat_last_photo.png", "wb") as f:
-                f.write(res.stdout)
-            log_msg(f"【方案B】成功通过双击大图从剪贴板提取原始图片: {len(res.stdout)} 字节 -> /tmp/wechat_last_photo.png")
+                f.write(img_bytes)
+            log_msg(f"成功通过右键菜单直接复制提取图片 ({len(img_bytes)} 字节) -> /tmp/wechat_last_photo.png")
             return True
+        else:
+            log_msg("右键未获取到剪贴板图片，保留聊天窗口高保真切图兜底")
+            return False
     except Exception as e:
-        log_msg(f"【方案B】剪贴板提取图片失败: {e}")
+        log_msg(f"右键复制图片异常: {e}")
+        return False
     finally:
         if d:
             try:
                 d.close()
             except Exception:
                 pass
-    return False
 
 
-def call_llm_chat(messages, tools=None, timeout=75):
+def call_llm_chat(messages, tools=None, timeout=75, override_model=None):
     cfg = load_config()
     api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or cfg.get("kimi_api_key", "")
     base_url = cfg.get("base_url") or cfg.get("gemini_base_url") or cfg.get("kimi_base_url", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions")
-    model = cfg.get("model") or cfg.get("gemini_model") or cfg.get("kimi_model", "gemini-4-argon")
+    model = override_model or cfg.get("model") or cfg.get("gemini_model") or cfg.get("kimi_model", "gemini-3.8-flash")
 
     payload = {
         "model": model,
@@ -771,8 +899,16 @@ def call_llm_chat(messages, tools=None, timeout=75):
         data=json.dumps(payload).encode("utf-8"),
         headers=headers,
     )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except Exception as e:
+        # 如果主力模型超时或报错，且未指定 fallback，自动降级至 gemini-2.5-flash 重试
+        if not override_model and "3.8" in model:
+            log_msg(f"模型 {model} 请求异常 ({e})，自动切换备用模型 gemini-2.5-flash 进行快速容灾重试...")
+            return call_llm_chat(messages, tools=tools, timeout=40, override_model="gemini-2.5-flash")
+        raise e
+
 
 call_kimi_chat = call_llm_chat
 
@@ -807,10 +943,8 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         f"2. content: 消息主体文本内容（若是图片，简要描述图片类型与核心画面）\n"
         f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
         f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
-        f"   - 必须满足以下条件之一：\n"
-        f"     * 包含对 bot 的艾特，如 @bot、@AIbot、@Albot、@微信小号 等\n"
-        f"     * 句子开头就是直接呼唤 bot 提出要求，如：“bot 查一下...”、“AIbot 帮我看下...”\n"
-        f"   - 【严格禁忌】：群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊，绝对不是在呼叫 bot！is_mentioned 必须为 false！\n"
+        f"   - 【用户最高铁律】：只要消息开头包含 @AIbot、@Albot、@bot、@微信小号，或者以 bot、aibot 开头（如 'bot ...'、'@AIbot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
+        f"   - 【严格禁忌】：只有当群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊而非指令时，is_mentioned 才为 false！\n"
         f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
         f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
         f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
@@ -1226,6 +1360,68 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     return final_reply or clean_bot_reply(msg.get("content", "").strip())
 
 
+def safe_generate_and_reply(target, cfg, recent_history):
+    """
+    执行带有自动排错、多级兜底与防丢单重试机制的回复生成与发送。
+    确保 @AIbot / bot 消息绝不漏回。
+    """
+    s = target["sender"]
+    c = target["content"]
+    q_info = target.get("quote")
+    img_info = target.get("image")
+    is_explicit = target.get("is_explicit", False)
+
+    max_attempts = 3 if is_explicit else 2
+    reply_content = ""
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            log_msg(f"尝试生成回复 [第 {attempt}/{max_attempts} 次] (sender={s}, is_explicit={is_explicit}): {c[:30]}")
+            reply_content = generate_reply_with_search(
+                s,
+                c,
+                cfg,
+                recent_history=recent_history,
+                quote_info=q_info,
+                image_info=img_info,
+            )
+            if reply_content and reply_content.strip():
+                ok, send_res = x11_send_text(reply_content)
+                if ok:
+                    save_msg("bot", reply_content, is_bot=True)
+                    mark_seen("bot", reply_content)
+                    mark_seen(s, c)
+                    return True, reply_content
+                else:
+                    log_msg(f"x11 发送文本失败: {send_res}，尝试 UI 自愈排错...")
+                    recover_wechat_ui_state()
+            else:
+                log_msg(f"回复内容为空 (第 {attempt} 次)，触发 UI 排错自愈与重试...")
+                recover_wechat_ui_state()
+                time.sleep(1.0)
+        except Exception as err:
+            log_msg(f"回复流程异常 (第 {attempt} 次): {err}")
+            recover_wechat_ui_state()
+            time.sleep(1.0)
+
+    # 必须回应的显式指令 (is_explicit)：若多次重试仍未成功，启动最终兜底回复，严防卡顿沉默
+    if is_explicit:
+        try:
+            log_msg(f"触发必须回应紧急保底回复机制 (sender={s}, query={c[:25]})")
+            recover_wechat_ui_state()
+            emergency_reply = f"收到你的提问：\"{c[:35]}\"。刚才网络或接口处理稍有波动，请稍后再试或换个问法，我随时在！"
+            ok, _ = x11_send_text(emergency_reply)
+            if ok:
+                save_msg("bot", emergency_reply, is_bot=True)
+                mark_seen("bot", emergency_reply)
+                mark_seen(s, c)
+                return True, emergency_reply
+        except Exception as ee:
+            log_msg(f"紧急保底回复发送失败: {ee}")
+
+    return False, ""
+
+
 def find_unread_badge_in_sidebar(img, w):
     """Scan the left conversation list for a red unread notification badge (R>215, G<85, B<85)."""
     sx1 = w["x"] + 10
@@ -1327,7 +1523,12 @@ def monitor_loop():
                                         # Deduplicate against recent seen messages
                                         if is_recent_duplicate(s, c):
                                             continue
-                                        mark_seen(s, c)
+
+                                        # 检查是否为最高优先级强行召唤指令 (@AIbot 或 bot 开头)
+                                        is_explicit = is_explicit_bot_invocation(c)
+                                        if is_explicit:
+                                            is_in = True
+                                            is_m = True
 
                                         # Format recorded text with card, quote and image tags
                                         card_info = msg_item.get("article_card", {})
@@ -1351,22 +1552,25 @@ def monitor_loop():
 
                                         if not is_in:
                                             log_msg(f"提取自身发送消息: {c[:25]}，已记入本地历史")
+                                            mark_seen(s, c)
                                             continue
 
                                         # 1. Stop command detection (e.g. "bot 别接话", "闭嘴")
                                         if is_stop_command(c):
                                             log_msg(f"检测到停用/闭嘴指令: '{c}'，立即清空连续追问会话")
+                                            mark_seen(s, c)
                                             last_replied_user = ""
                                             last_bot_reply_ts = 0.0
                                             continue
 
-                                        # 2. Trivial message / emoji reaction filter
-                                        if is_trivial_or_reaction(c):
+                                        # 2. Trivial message / emoji reaction filter (显式呼叫指令绝对不拦截)
+                                        if is_trivial_or_reaction(c) and not is_explicit:
                                             log_msg(f"过滤非实质提问消息 (表情/标点/附和): '{c}'，不触发回复")
+                                            mark_seen(s, c)
                                             continue
 
-                                        # 3. Third-person mention correction (e.g. "不用加bot你也会回复")
-                                        if is_m and not is_genuine_mention(c, bot_names):
+                                        # 3. Third-person mention correction (显式呼叫指令绝对不降级)
+                                        if is_m and not is_explicit and not is_genuine_mention(c, bot_names):
                                             log_msg(f"更正误报呼叫 (第三人称提及而非召唤): '{c}' -> is_m设为False")
                                             is_m = False
 
@@ -1390,8 +1594,8 @@ def monitor_loop():
                                                 else:
                                                     log_msg(f"用户引用 bot 消息但仅为简短附和/闲聊: '{c}' -> 跳过回复")
 
-                                        should_reply = (trigger_mode == "all") or is_m or valid_followup or valid_quote_reply
-                                        log_msg(f"消息队列提取: sender={s}, content={c[:30]}, is_m={is_m}, valid_f={valid_followup}, valid_q={valid_quote_reply}, should_reply={should_reply}")
+                                        should_reply = is_explicit or (trigger_mode == "all") or is_m or valid_followup or valid_quote_reply
+                                        log_msg(f"消息队列提取: sender={s}, content={c[:30]}, is_explicit={is_explicit}, is_m={is_m}, valid_f={valid_followup}, valid_q={valid_quote_reply}, should_reply={should_reply}")
 
                                         if should_reply:
                                             reply_candidates.append({
@@ -1399,40 +1603,38 @@ def monitor_loop():
                                                 "content": c,
                                                 "quote": q_info,
                                                 "image": img_info,
+                                                "is_explicit": is_explicit,
                                             })
+                                        else:
+                                            # 不需要回复的消息，直接标记为已处理
+                                            mark_seen(s, c)
 
-                                    # Pick at most ONE latest actionable incoming message from the batch
                                     if reply_candidates:
-                                        target = reply_candidates[-1]
+                                        # 优先挑出带有显式呼叫 (is_explicit) 的消息，如果有多条取最新一条
+                                        explicit_targets = [t for t in reply_candidates if t.get("is_explicit")]
+                                        target = explicit_targets[-1] if explicit_targets else reply_candidates[-1]
                                         s = target["sender"]
                                         c = target["content"]
-                                        q_info = target["quote"]
-                                        img_info = target["image"]
+                                        is_explicit = target.get("is_explicit", False)
 
-                                        log_msg(f"处理最新待回复消息 (共 {len(reply_candidates)} 条待回复，取最新一条): {s}: {c[:30]}")
                                         recent_history = get_recent(limit=15)
-                                        reply_content = generate_reply_with_search(
-                                            s,
-                                            c,
-                                            cfg,
-                                            recent_history=recent_history,
-                                            quote_info=q_info,
-                                            image_info=img_info,
-                                        )
-                                        log_msg(f"生成回复: {reply_content}")
-                                        if reply_content and reply_content != last_reply_text:
-                                            x11_send_text(reply_content)
-                                            save_msg("bot", reply_content, is_bot=True)
-                                            mark_seen("bot", reply_content)
-                                            last_recorded_text = reply_content
-                                            last_reply_text = reply_content
+                                        success, sent_text = safe_generate_and_reply(target, cfg, recent_history)
+                                        if success:
+                                            last_recorded_text = sent_text
+                                            last_reply_text = sent_text
                                             last_bot_reply_ts = time.time()
                                             last_replied_user = s
                                             log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
-                                            time.sleep(1.5)
+                                            # 清理本批次其余非显式消息，避免堆积
+                                            for cand in reply_candidates:
+                                                if cand != target and not cand.get("is_explicit"):
+                                                    mark_seen(cand["sender"], cand["content"])
+                                            time.sleep(1.2)
                                             img3, _ = capture_screen_pil()
                                             prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
                                             last_send_ts = time.time()
+                                        else:
+                                            log_msg(f"本次回复未成功，保持未标记已读状态，触发下轮重试")
                                 except Exception as ke:
                                     log_msg(f"消息处理异常: {ke}")
                         else:
