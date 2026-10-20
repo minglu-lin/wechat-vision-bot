@@ -660,6 +660,92 @@ if register_image_sender:
     register_image_sender(x11_send_image)
 
 
+def extract_image_via_clipboard(px, py):
+    """
+    方案B: 模拟定位到图片 -> 触发复制/双击复制 -> 从 X11 剪贴板提取原始解密图片
+    """
+    if not display or not xtest:
+        return False
+    d = None
+    try:
+        d = display.Display(":99")
+        
+        # 1. 鼠标移动到图片中心，右击弹出菜单
+        xtest.fake_input(d, X.MotionNotify, x=int(px), y=int(py))
+        d.sync()
+        time.sleep(0.06)
+        xtest.fake_input(d, X.ButtonPress, 3)
+        xtest.fake_input(d, X.ButtonRelease, 3)
+        d.sync()
+        time.sleep(0.18)
+
+        # 2. 点击右键菜单中的第一项“复制”（通常在右键点击点偏右下约 30px, 18px）
+        xtest.fake_input(d, X.MotionNotify, x=int(px + 30), y=int(py + 18))
+        d.sync()
+        time.sleep(0.06)
+        xtest.fake_input(d, X.ButtonPress, 1)
+        xtest.fake_input(d, X.ButtonRelease, 1)
+        
+        # 发送 'c' 键作为菜单项选择或 Ctrl+C 兜底
+        c_kc = d.keysym_to_keycode(XK.XK_c)
+        xtest.fake_input(d, X.KeyPress, c_kc)
+        xtest.fake_input(d, X.KeyRelease, c_kc)
+        d.sync()
+        time.sleep(0.3)
+
+        # 3. 检查剪贴板是否成功提取到 image/png
+        env = os.environ.copy()
+        env["DISPLAY"] = ":99"
+        xclip_bin = "/usr/local/bin/xclip" if os.path.exists("/usr/local/bin/xclip") else "xclip"
+        res = subprocess.run([xclip_bin, "-selection", "clipboard", "-t", "image/png", "-o"], env=env, capture_output=True, timeout=2)
+        if len(res.stdout) > 2000:
+            with open("/tmp/wechat_last_photo.png", "wb") as f:
+                f.write(res.stdout)
+            log_msg(f"【方案B】成功通过右键复制从剪贴板提取原始图片: {len(res.stdout)} 字节 -> /tmp/wechat_last_photo.png")
+            return True
+
+        # 4. 兜底方案: 双击展开大图 + Ctrl+C
+        xtest.fake_input(d, X.MotionNotify, x=int(px), y=int(py))
+        xtest.fake_input(d, X.ButtonPress, 1)
+        xtest.fake_input(d, X.ButtonRelease, 1)
+        time.sleep(0.08)
+        xtest.fake_input(d, X.ButtonPress, 1)
+        xtest.fake_input(d, X.ButtonRelease, 1)
+        d.sync()
+        time.sleep(0.4)
+
+        ctrl_kc = d.keysym_to_keycode(XK.XK_Control_L)
+        xtest.fake_input(d, X.KeyPress, ctrl_kc)
+        xtest.fake_input(d, X.KeyPress, c_kc)
+        xtest.fake_input(d, X.KeyRelease, c_kc)
+        xtest.fake_input(d, X.KeyRelease, ctrl_kc)
+        d.sync()
+        time.sleep(0.25)
+
+        # 发送 Esc 关闭可能打开的大图窗口
+        esc_kc = d.keysym_to_keycode(XK.XK_Escape)
+        xtest.fake_input(d, X.KeyPress, esc_kc)
+        xtest.fake_input(d, X.KeyRelease, esc_kc)
+        d.sync()
+        time.sleep(0.1)
+
+        res = subprocess.run([xclip_bin, "-selection", "clipboard", "-t", "image/png", "-o"], env=env, capture_output=True, timeout=2)
+        if len(res.stdout) > 2000:
+            with open("/tmp/wechat_last_photo.png", "wb") as f:
+                f.write(res.stdout)
+            log_msg(f"【方案B】成功通过双击大图从剪贴板提取原始图片: {len(res.stdout)} 字节 -> /tmp/wechat_last_photo.png")
+            return True
+    except Exception as e:
+        log_msg(f"【方案B】剪贴板提取图片失败: {e}")
+    finally:
+        if d:
+            try:
+                d.close()
+            except Exception:
+                pass
+    return False
+
+
 def call_llm_chat(messages, tools=None, timeout=75):
     cfg = load_config()
     api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or cfg.get("kimi_api_key", "")
@@ -691,7 +777,7 @@ def call_llm_chat(messages, tools=None, timeout=75):
 call_kimi_chat = call_llm_chat
 
 
-def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="", session_active=False):
+def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="", session_active=False, chat_box=None):
     try:
         chat_img.save("/tmp/wechat_last_chat_img.png")
     except Exception:
@@ -789,6 +875,12 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
                             if crop_box[2] - crop_box[0] > 20 and crop_box[3] - crop_box[1] > 20:
                                 chat_img.crop(crop_box).save("/tmp/wechat_last_photo.png")
                                 log_msg(f"成功定位并裁剪群聊中的真实图片: {crop_box} -> /tmp/wechat_last_photo.png")
+
+                                # 方案B: 若有窗口坐标，通过剪贴板直接提取解密原始大图
+                                if chat_box:
+                                    screen_cx = chat_box[0] + int(((xmin + xmax) / 2) * (chat_box[2] - chat_box[0]) / 1000)
+                                    screen_cy = chat_box[1] + int(((ymin + ymax) / 2) * (chat_box[3] - chat_box[1]) / 1000)
+                                    extract_image_via_clipboard(screen_cx, screen_cy)
                         except Exception as ce:
                             log_msg(f"裁剪图片失败: {ce}")
             if isinstance(msgs, list):
@@ -1215,7 +1307,7 @@ def monitor_loop():
                                 try:
                                     session_active = (time.time() - last_bot_reply_ts < 30) and bool(last_replied_user)
                                     raw_msgs = parse_recent_messages_with_vision(
-                                        chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active
+                                        chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active, chat_box=chat_box
                                     )
 
                                     reply_candidates = []
