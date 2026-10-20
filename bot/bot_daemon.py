@@ -1228,9 +1228,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
 
 def find_unread_badge_in_sidebar(img, w):
     """Scan the left conversation list for a red unread notification badge (R>215, G<85, B<85)."""
-    sx1 = w["x"] + 62
-    sy1 = w["y"] + 115
-    sx2 = w["x"] + 145
+    sx1 = w["x"] + 10
+    sy1 = w["y"] + 90
+    sx2 = w["x"] + 190
     sy2 = w["y"] + w["height"] - 40
     sub = img.crop((sx1, sy1, sx2, sy2))
     px = sub.load()
@@ -1239,7 +1239,7 @@ def find_unread_badge_in_sidebar(img, w):
         for x in range(0, sw, 2):
             r, g, b = px[x, y]
             if r > 215 and g < 85 and b < 85:
-                return sx1 + x + 40, sy1 + y + 10
+                return w["x"] + 100, sy1 + y + 5
     return None
 
 
