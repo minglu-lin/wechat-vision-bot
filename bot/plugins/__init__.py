@@ -17,6 +17,7 @@ from .finance import ExchangeRatePlugin, CryptoPlugin
 from .network import NetworkPlugin
 from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
+from .map_service import FoodSearchPlugin, TransitRoutePlugin
 
 
 class PluginManager:
@@ -37,6 +38,8 @@ class PluginManager:
         self.register(NetworkPlugin())
         self.register(CalculatorPlugin())
         self.register(UtilitiesPlugin())
+        self.register(FoodSearchPlugin())
+        self.register(TransitRoutePlugin())
 
     def get_openai_tools(self) -> List[dict]:
         """Export all registered plugins as OpenAI-compatible function tools."""

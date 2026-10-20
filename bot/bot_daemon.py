@@ -820,8 +820,15 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"【当前系统时间】：{now_str}（北京时间）。\n"
         f"{history_str}"
         f"【实时 API 工具调用指引（高优先级）】：\n"
-        f"- 系统已接入实时 API 工具库：查天气 (get_weather)、汇率换算 (get_exchange_rate)、加密货币 (get_crypto_price)、查IP归属地 (lookup_ip)、科学计算器 (calculate)、随机决策掷骰子 (decision_and_roll)；\n"
-        f"- 当群友询问天气、汇率、币价、算数、查IP、纠结选哪个或掷骰子时，请优先调用对应的 API 工具获取准确真实数据，再结合实际数据进行深入客观、有条理的纯文本回答！\n"
+        f"- 系统已接入丰富实时的本地与在线 API 工具库：\n"
+        f"  • 查天气 (get_weather)：全球实况与未来1-14天逐日预报\n"
+        f"  • 查美食推荐 (search_local_food)：城市与商圈特色餐饮、招牌好店、人均预算与口碑\n"
+        f"  • 查地铁与公交路线 (get_transit_route)：城市公共交通与地铁换乘方案、几号线、换乘站点、用时与票价\n"
+        f"  • 汇率与加密货币 (get_exchange_rate, get_crypto_price)：实时法币汇率与主流数字货币行情\n"
+        f"  • 查IP归属地 (lookup_ip)：公网IP与域名物理位置、ISP运营商\n"
+        f"  • 科学计算 (calculate)：数学公式、求幂、函数计算\n"
+        f"  • 随机决策与掷骰子 (decision_and_roll)：多选项决策、掷骰子、抛硬币\n"
+        f"- 当群友提出上述相关诉求时，请优先调用对应的 API 工具获取准确真实数据后再作答！\n"
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
@@ -1258,6 +1265,8 @@ HTML_PAGE = """<!DOCTYPE html>
     </select>
     <label>小号昵称 / 触发关键词（逗号分隔）：</label>
     <input type="text" id="bot-names" placeholder="@, bot">
+    <label>高德地图 WebKey（可选，用于查美食与地铁换乘）：</label>
+    <input type="text" id="amap-key" placeholder="高德开放平台申请的 Web服务 Key（留空则走全网搜索）">
     <label>Kimi 群聊人设 Prompt：</label>
     <textarea id="sys-prompt" rows="4"></textarea>
     <button onclick="saveCfg()">💾 保存配置</button>
@@ -1291,6 +1300,7 @@ async function loadInitialCfg() {
     document.getElementById('auto-reply').value = String(d.config.auto_reply !== false);
     document.getElementById('trigger-mode').value = d.config.trigger_mode || 'mention_only';
     document.getElementById('bot-names').value = (d.config.bot_names || ['@']).join(', ');
+    document.getElementById('amap-key').value = d.config.amap_api_key || '';
     document.getElementById('sys-prompt').value = d.config.system_prompt || '';
   }
 }
@@ -1315,11 +1325,12 @@ async function saveCfg() {
   const auto_reply = document.getElementById('auto-reply').value === 'true';
   const trigger_mode = document.getElementById('trigger-mode').value;
   const bot_names = document.getElementById('bot-names').value.split(',').map(s => s.trim()).filter(Boolean);
+  const amap_api_key = document.getElementById('amap-key').value.trim();
   const system_prompt = document.getElementById('sys-prompt').value.trim();
   await fetch('/api/config', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({auto_reply, trigger_mode, bot_names, system_prompt})
+    body: JSON.stringify({auto_reply, trigger_mode, bot_names, amap_api_key, system_prompt})
   });
   alert('配置保存成功！');
   setTimeout(refreshStatus, 300);
