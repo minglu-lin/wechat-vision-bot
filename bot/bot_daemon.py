@@ -194,6 +194,62 @@ def has_followup_intent(content):
     return False
 
 
+def extract_urls(text):
+    if not text:
+        return []
+    return re.findall(r'https?://[^\s<>"\')]+', text)
+
+
+def fetch_url_content(url, timeout=10, max_chars=3500):
+    try:
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            raw = resp.read()
+
+            charset = "utf-8"
+            if "charset=" in content_type.lower():
+                charset = content_type.lower().split("charset=")[-1].split(";")[0].strip()
+            try:
+                html = raw.decode(charset, errors="replace")
+            except Exception:
+                html = raw.decode("utf-8", errors="replace")
+
+        import html as html_lib
+        title_match = re.search(r'<title[^>]*>(.*?)</title>', html, re.IGNORECASE | re.DOTALL)
+        title = title_match.group(1).strip() if title_match else ""
+        title = re.sub(r'\s+', ' ', title)
+
+        text = re.sub(r'<!--[\s\S]*?-->', '', html)
+        text = re.sub(r'<(script|style|svg|noscript|header|footer|nav)[\s\S]*?</\1>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'</?(?:p|div|h[1-6]|li|blockquote|tr|section|article)[^>]*>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<br\s*/?>', '\n', text, flags=re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', '', text)
+        text = html_lib.unescape(text)
+
+        lines = [line.strip() for line in text.splitlines()]
+        cleaned_body = "\n".join([line for line in lines if line])
+
+        if len(cleaned_body) > max_chars:
+            cleaned_body = cleaned_body[:max_chars] + "\n...(正文较长，已截取前 3500 字)..."
+
+        log_msg(f"抓取网页链接正文成功 ({url}): 标题='{title}', 正文长度={len(cleaned_body)}")
+        return {
+            "success": True,
+            "url": url,
+            "title": title,
+            "body": cleaned_body
+        }
+    except Exception as e:
+        log_msg(f"抓取 URL 失败 ({url}): {e}")
+        return {"success": False, "url": url, "error": str(e)}
+
+
 def init_db():
     try:
         conn = sqlite3.connect(DB_PATH)
@@ -476,7 +532,10 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         f"   - 【严格禁忌】：群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊，绝对不是在呼叫 bot！is_mentioned 必须为 false！\n"
         f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
         f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
-        f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字、标题或搜索词）\n\n"
+        f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字、标题或搜索词）\n"
+        f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
+        f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
+        f"   - 若不是卡片：is_card=false\n\n"
         f"{session_instruction}"
         f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
         f'{{\n'
@@ -488,7 +547,8 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         f'      "is_mentioned": true,\n'
         f'      "is_followup": false,\n'
         f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
-        f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": ""}}\n'
+        f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": ""}},\n'
+        f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}}\n'
         f'    }}\n'
         f'  ]\n'
         f'}}\n'
@@ -658,6 +718,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"【当前系统时间】：{now_str}（北京时间）。\n"
         f"{history_str}"
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
+        f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
+        f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
+        f"- 如果群聊中分享了微信文章卡片、新闻卡片、或群友要求对刚刚分享的文章‘评价一下’、‘总结下’、‘分析下’、‘你怎么看’、‘讲了什么’等：你绝对不能只凭标题凭空推测或说‘光从标题看’！必须立即调用 $web_search 联网搜索工具获取该文章的完整正文和真实事实细节，以完整报道事实为基础进行客观、深刻、有理有据的分析评价！\n"
         f"【微信引用与群聊图片处理指引】：\n"
         f"- 如果群友在本次提问中使用了微信‘引用’，请特别针对被引用的历史内容进行针对性答复；\n"
         f"- 如果提问附带或关联了群聊中刚刚发送的图片/截图（如搜索结果截图、代码报错、报表、照片等），系统已通过视觉模型提取了图片中的文字、关键词、搜索列表和画面详情，请务必紧密结合图片中的实际文字与证据进行回答，万不可无视图片细节！\n"
@@ -684,6 +747,48 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         img_ocr = str(image_info.get("ocr_and_detail", "")).strip()
         if img_ocr:
             user_query += f"\n【群聊中关联/引用的图片识别详情（视觉OCR与画面解析）】：\n- 图片类别：{img_type}\n- 图片画面与文字详情：{img_ocr}"
+
+    # 1. Automatic URL extraction & web page content fetching
+    candidate_texts = [content]
+    if quote_info and quote_info.get("has_quote"):
+        candidate_texts.append(str(quote_info.get("quoted_content", "")))
+    if recent_history:
+        for h in reversed(recent_history[-4:]):
+            candidate_texts.append(h.get("content", ""))
+
+    found_urls = []
+    for ct in candidate_texts:
+        for u in extract_urls(ct):
+            if u not in found_urls:
+                found_urls.append(u)
+
+    for u in found_urls[:2]:
+        fetch_res = fetch_url_content(u)
+        if fetch_res.get("success"):
+            user_query += f"\n【检测到群聊关联链接网页详情】（URL: {u}）：\n- 网页标题：{fetch_res['title']}\n- 网页正文内容：\n{fetch_res['body']}\n"
+
+    # 2. Automatic WeChat Article Card / News headline resolution
+    card_title = ""
+    card_source = ""
+    for ct in candidate_texts:
+        m = re.search(r'\[分享文章卡片:\s*《(.*?)》(?:[ \t]*来源:[ \t]*([^\]]+))?', ct)
+        if m:
+            card_title = m.group(1).strip()
+            card_source = (m.group(2) or "").strip()
+            break
+        # Heuristic for news headlines with quotes like “出钱雇你也好，麻烦出席一下”，广东一新娘...
+        if "“" in ct and "”" in ct and len(ct) >= 15:
+            if not card_title and any(k in content for k in ["评价", "看下", "怎么看", "分析", "总结", "讲了什么", "读下", "怎么样"]):
+                card_title = ct.strip()
+                break
+
+    if card_title:
+        user_query += (
+            f"\n【重要任务：群友正在要求阅读与评价/分析分享的文章】：\n"
+            f"- 分享文章标题：《{card_title}》\n"
+            f"- 媒体/发布来源：{card_source or '权威新闻媒体'}\n"
+            f"- 核心要求：群友正在要求你阅读并评价/分析这篇分享的文章！由于微信卡片只展示了部分标题，你【必须立即使用 $web_search 联网搜索工具】检索该文章的完整报道正文与真实事件细节！在完整阅读了真实正文后，再进行全面、客观、深入有依据的分析评价！绝对严禁仅凭标题凭空推测或说‘光从标题看’！\n"
+        )
 
     messages = [
         {"role": "system", "content": system_instruction},
@@ -831,10 +936,18 @@ def monitor_loop():
                                             continue
                                         mark_seen(s, c)
 
-                                        # Format recorded text with quote and image tags
+                                        # Format recorded text with card, quote and image tags
+                                        card_info = msg_item.get("article_card", {})
+                                        has_card = card_info.get("is_card", False) if isinstance(card_info, dict) else False
                                         has_q = q_info.get("has_quote", False) if isinstance(q_info, dict) else False
                                         has_img = img_info.get("has_image", False) if isinstance(img_info, dict) else False
                                         rec_c = c
+                                        if has_card and card_info.get("title"):
+                                            c_title = card_info.get("title", "").strip()
+                                            c_src = card_info.get("source", "").strip()
+                                            c_url = card_info.get("url", "").strip()
+                                            card_prefix = f"[分享文章卡片: 《{c_title}》" + (f" 来源: {c_src}" if c_src else "") + (f" 链接: {c_url}" if c_url else "") + "]"
+                                            rec_c = card_prefix + (" " + rec_c if rec_c and rec_c != c_title else "")
                                         if has_q and q_info.get("quoted_content"):
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
                                         if has_img and img_info.get("image_type"):
