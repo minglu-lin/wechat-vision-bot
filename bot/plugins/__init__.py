@@ -17,7 +17,7 @@ from .finance import ExchangeRatePlugin, CryptoPlugin
 from .network import NetworkPlugin, WebSearchPlugin
 from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
-from .map_service import FoodSearchPlugin, TransitRoutePlugin
+from .map_service import FoodSearchPlugin, LocalPlaceSearchPlugin, TransitRoutePlugin
 from .image_tools import GenerateImagePlugin, SearchImagePlugin, register_image_sender
 
 
@@ -40,6 +40,7 @@ class PluginManager:
         self.register(WebSearchPlugin())
         self.register(CalculatorPlugin())
         self.register(UtilitiesPlugin())
+        self.register(LocalPlaceSearchPlugin())
         self.register(FoodSearchPlugin())
         self.register(TransitRoutePlugin())
         self.register(GenerateImagePlugin())

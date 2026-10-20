@@ -157,6 +157,155 @@ class FoodSearchPlugin(BasePlugin):
         return "\n".join(lines)
 
 
+class LocalPlaceSearchPlugin(BasePlugin):
+    name = "search_local_places"
+    description = (
+        "查询城市/商圈的各类线下实体生活场所与商户推荐（包含商场购物、男装/女装买衣服、攀岩馆/健身房/体育运动场馆、"
+        "酒吧/夜生活/休闲娱乐、文化场馆/博物馆/公园景区、生活服务等），返回真实商户名、高德/口碑评分、人均消费预算、详细地址与分类"
+    )
+    parameters = {
+        "type": "object",
+        "properties": {
+            "keywords": {
+                "type": "string",
+                "description": "场所或品类关键词，例如：'攀岩馆'、'男装 买衣服'、'购物中心'、'健身房'、'羽毛球馆'、'酒吧'、'书店'、'Livehouse'、'滑冰场'",
+            },
+            "city": {
+                "type": "string",
+                "description": "所在城市名称，默认为'北京'",
+                "default": "北京",
+            },
+            "area": {
+                "type": "string",
+                "description": "特定商圈、区县或地标（可选），例如：'海淀'、'中关村'、'五道口'、'三里屯'、'朝阳'、'西单'、'望京'",
+            },
+            "category": {
+                "type": "string",
+                "description": "场所分类过滤（可选）：'shopping'(购物/商场/服装), 'sports'(运动健身/攀岩/球馆), 'entertainment'(酒吧/娱乐), 'culture'(博物馆/文化), 'scenic'(景区公园), 'all'(不限)",
+                "enum": ["all", "shopping", "sports", "entertainment", "culture", "scenic"],
+                "default": "all",
+            },
+        },
+        "required": ["keywords"],
+    }
+
+    CATEGORY_MAP = {
+        "shopping": "060000",
+        "sports": "080000",
+        "entertainment": "080300",
+        "culture": "140000",
+        "scenic": "110000",
+        "dining": "050000",
+    }
+
+    fast_patterns = [
+        r'^(?:推荐|查一下?|看下?)?(?P<area>北京|海淀|朝阳|西城|东城|丰台|昌平|中关村|五道口|三里屯|西单|望京)?(?:有什么|附近有啥|在哪买|哪里的)?(?P<keywords>[\u4e00-\u9fa5]{2,12}(?:攀岩馆|攀岩|健身房|羽毛球馆|游泳馆|台球|男装|买衣服|服装店|商场|购物中心|酒吧|Livehouse|书店|博物馆))(?:\s*推荐)?$',
+    ]
+
+    def match_fast_path(self, text: str):
+        if not _get_amap_key():
+            return None
+        return super().match_fast_path(text)
+
+    def execute(self, keywords: str, city: str = "北京", area: str = "", category: str = "all", **kwargs) -> dict:
+        kw = (keywords or "").strip()
+        c = (city or "北京").strip()
+        a = (area or "").strip()
+        if not kw:
+            return {"error": "未提供场所关键词"}
+
+        amap_key = _get_amap_key()
+        search_query = f"{a} {kw}".strip() if a else kw
+
+        if not amap_key:
+            return {
+                "status": "need_key_or_llm_search",
+                "query": search_query,
+                "city": c,
+                "message": (
+                    "未检测到高德地图 API Key (amap_api_key)。"
+                    "请使用大模型结合全网高德地图与大众点评/小红书真实口碑常识，为用户推荐 3~5 家该地区口碑最好、真实存在的线下商户/场馆，"
+                    "包含：店名/场馆名、参考评分、人均预算、具体商圈/地址与特色亮点。"
+                )
+            }
+
+        enc_kw = urllib.parse.quote(search_query)
+        enc_city = urllib.parse.quote(c)
+        type_code = self.CATEGORY_MAP.get(category.lower(), "") if category != "all" else ""
+        type_param = f"&types={type_code}" if type_code else ""
+
+        url = (
+            f"https://restapi.amap.com/v3/place/text?key={amap_key}"
+            f"&keywords={enc_kw}&city={enc_city}{type_param}&offset=8&page=1&extensions=all"
+        )
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "WeChatBot/2.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                data = json.loads(r.read().decode("utf-8"))
+        except Exception as e:
+            return {"error": f"高德地点数据接口请求失败: {e}"}
+
+        if data.get("status") != "1":
+            return {"error": f"查询商户地点失败: {data.get('info', '未知错误')}"}
+
+        pois = data.get("pois", [])
+        if not pois and type_param:
+            # Fallback without type restriction if 0 results
+            url_fallback = (
+                f"https://restapi.amap.com/v3/place/text?key={amap_key}"
+                f"&keywords={enc_kw}&city={enc_city}&offset=8&page=1&extensions=all"
+            )
+            try:
+                req = urllib.request.Request(url_fallback, headers={"User-Agent": "WeChatBot/2.0"})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    data = json.loads(r.read().decode("utf-8"))
+                pois = data.get("pois", [])
+            except Exception:
+                pass
+
+        if not pois:
+            return {"error": f"在{c}{a}未能检索到与‘{kw}’相关的商户或场馆"}
+
+        results = []
+        for p in pois:
+            biz = p.get("biz_ext", {}) or {}
+            rating = biz.get("rating")
+            cost = biz.get("cost")
+            results.append({
+                "name": p.get("name", ""),
+                "rating": f"{rating}分" if rating and str(rating) != "[]" else "暂无评分",
+                "cost": f"人均约 ¥{cost}" if cost and str(cost) != "[]" else "消费视项目而定",
+                "type": p.get("type", "").split(";")[-1] if p.get("type") else "商户/场馆",
+                "address": p.get("address", "详见门店"),
+                "tel": p.get("tel", "暂无电话"),
+            })
+
+        return {
+            "city": c,
+            "query": search_query,
+            "total_found": len(results),
+            "places": results,
+        }
+
+    def format_fast_reply(self, result: dict) -> str:
+        if "error" in result:
+            return f"查询地点出错：{result['error']}"
+
+        if result.get("status") == "need_key_or_llm_search":
+            return f"📍 正在为您检索【{result['city']} {result['query']}】的优质地点与口碑场馆..."
+
+        lines = [
+            f"📍 【{result['city']} 地点与口碑商户推荐】 (检索: {result['query']})",
+        ]
+        for idx, r in enumerate(result.get("places", []), 1):
+            lines.append(
+                f"{idx}. {r['name']}（{r['rating']} | {r['cost']}）\n"
+                f"   • 分类：{r['type']}\n"
+                f"   • 地址：{r['address']}"
+            )
+        return "\n".join(lines)
+
+
 class TransitRoutePlugin(BasePlugin):
     name = "get_transit_route"
     description = "查询城市内的公共交通与地铁换乘路线规划方案（包含乘坐哪条地铁线、换乘站点、途经站数、预计总耗时、步行距离与票价）"
