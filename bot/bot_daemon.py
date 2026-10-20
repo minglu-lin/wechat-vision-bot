@@ -15,11 +15,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
 from PIL import Image, ImageChops, ImageStat
-from Xlib import X, XK, display
-from Xlib.ext import xtest
+try:
+    from Xlib import X, XK, display
+    from Xlib.ext import xtest
+except ImportError:
+    X = XK = display = xtest = None
+
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from plugins import plugin_manager
+except Exception as _pie:
+    plugin_manager = None
 
 os.environ["DISPLAY"] = ":99"
-BASE_DIR = "/home/opc/wechat_bot"
+BASE_DIR = os.environ.get("BOT_BASE_DIR", "/home/opc/wechat_bot" if os.path.exists("/home/opc/wechat_bot") else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DB_PATH = os.path.join(BASE_DIR, "chat_memory.db")
 TZ_BJ = timezone(timedelta(hours=8))
@@ -788,8 +798,16 @@ def clean_bot_reply(text):
 
 
 def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None):
+    # 0. Fast-Path Direct Execution (0 Token, <100ms ultra-low latency)
+    if plugin_manager:
+        matched, fast_reply = plugin_manager.match_fast_path(content)
+        if matched and fast_reply:
+            log_msg(f"命中 Fast-Path 快速直通插件: '{content}' -> 直接返回预置数据")
+            return fast_reply
+
     sys_prompt = cfg.get("system_prompt", "")
-    tools = [{"type": "builtin_function", "function": {"name": "$web_search"}}]
+    plugin_tools = plugin_manager.get_openai_tools() if plugin_manager else []
+    tools = plugin_tools + [{"type": "builtin_function", "function": {"name": "$web_search"}}]
     now_str = datetime.now(TZ_BJ).strftime("%Y年%m月%d日 %H:%M")
 
     history_str = ""
@@ -801,6 +819,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"{sys_prompt}\n"
         f"【当前系统时间】：{now_str}（北京时间）。\n"
         f"{history_str}"
+        f"【实时 API 工具调用指引（高优先级）】：\n"
+        f"- 系统已接入实时 API 工具库：查天气 (get_weather)、汇率换算 (get_exchange_rate)、加密货币 (get_crypto_price)、查IP归属地 (lookup_ip)、科学计算器 (calculate)、随机决策掷骰子 (decision_and_roll)；\n"
+        f"- 当群友询问天气、汇率、币价、算数、查IP、纠结选哪个或掷骰子时，请优先调用对应的 API 工具获取准确真实数据，再结合实际数据进行深入客观、有条理的纯文本回答！\n"
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
@@ -915,6 +936,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     ]
 
     final_reply = ""
+    msg = {}
     for loop_idx in range(3):
         try:
             res = call_kimi_chat(messages, tools=tools, timeout=35)
@@ -922,15 +944,33 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             msg = choice["message"]
 
             if choice.get("finish_reason") == "tool_calls" and msg.get("tool_calls"):
-                log_msg(f"Kimi 触发联网搜索 (第 {loop_idx+1} 轮): {content}")
+                log_msg(f"Kimi 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
                 messages.append(msg)
                 for tc in msg["tool_calls"]:
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": tc["function"]["name"],
-                        "content": tc["function"]["arguments"],
-                    })
+                    fn_name = tc["function"]["name"]
+                    fn_args = tc["function"].get("arguments", "{}")
+                    if fn_name == "$web_search":
+                        log_msg(f"触发内置联网搜索: {content}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": fn_name,
+                            "content": fn_args,
+                        })
+                    else:
+                        log_msg(f"执行 API 插件: {fn_name}({fn_args})")
+                        if plugin_manager:
+                            tool_res = plugin_manager.execute_tool(fn_name, fn_args)
+                        else:
+                            tool_res = {"error": "Plugin manager not loaded"}
+                        res_str = json.dumps(tool_res, ensure_ascii=False) if isinstance(tool_res, (dict, list)) else str(tool_res)
+                        log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:120]}")
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": fn_name,
+                            "content": res_str,
+                        })
                 continue
 
             content_text = msg.get("content", "").strip()

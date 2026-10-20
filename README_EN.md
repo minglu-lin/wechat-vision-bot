@@ -25,6 +25,11 @@ An autonomous, 24/7 intelligent WeChat group chat bot built on **official native
   Vision model detects WeChat rich card shares, article headlines, and news sources (e.g., Dahe Daily, The Paper, Zhihu). When asked to evaluate or summarize, the bot automatically searches and retrieves the complete news reporting and legal facts instead of speculating from a truncated title.
 - ⏱️ **30-Second Follow-Up Window & Anti-Spam Gate**  
   Supports natural multi-turn conversations without repeatedly typing `@bot` (e.g. "look up X again", "why is that?"). Features strict anti-spam filtering: trivial reactions (👍, ?, "ok", "got it") and 3rd-person chatter ("no need to add bot") are silently memorized without spamming replies; batching guarantees at most one single reply per frame update.
+- 🔌 **Modular API Library & Dual-Track Plugin Architecture**  
+  Inspired by mature chatbot frameworks (NoneBot2, AstrBot, CoW), featuring a hybrid dual-track execution model:
+  1. **Fast-Path Direct Execution (<100ms / 0 Token)**: Deterministic commands (e.g. `bot roll dice`, `bot lookup ip 8.8.8.8`, `bot 100 USD in CNY`, `bot calc 1024*768`, `bot choose between A and B`) match regex directly to invoke APIs in milliseconds with zero LLM overhead.
+  2. **Autonomous LLM Function Calling**: For complex, conversational requests (e.g. "what's the 14-day weather in Beijing and is it good for hiking with seniors?"), automatically exposes `get_weather`, `get_exchange_rate`, `get_crypto_price`, `lookup_ip`, `calculate`, and `decision_and_roll` as OpenAI-compatible tools. The LLM extracts parameters, fetches real-time data, and synthesizes answers naturally.
+  3. **Extensible**: Drop a single `.py` file into `bot/plugins/` to plug in any custom API.
 - 🌐 **Real-time Web Search**  
   Integrated with Moonshot Kimi native `$web_search` engine to fetch live stock prices, news, facts, and public data on the fly.
 - 🧹 **Plain-Text & LaTeX Sanitizer**  
