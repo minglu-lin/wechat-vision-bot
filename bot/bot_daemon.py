@@ -244,10 +244,26 @@ def has_followup_intent(content):
     return False
 
 
+def is_valid_mp_url(url: str) -> bool:
+    if not url or not isinstance(url, str):
+        return False
+    if not url.startswith("https://mp.weixin.qq.com/s"):
+        return True  # 允许普通非微信网页链接
+    # 微信公众号短链：/s/<slug>，slug 通常为 15~25 位 hash 字符串，严禁 0/1/null 等占位符
+    m1 = re.match(r'^https://mp\.weixin\.qq\.com/s/([a-zA-Z0-9_\-]{8,})', url)
+    if m1 and m1.group(1).lower() not in ("0", "1", "null", "undefined", "test"):
+        return True
+    # 微信公众号全参数长链：/s?__biz=...&mid=...
+    if "__biz=" in url and ("mid=" in url or "sn=" in url):
+        return True
+    return False
+
+
 def extract_urls(text):
     if not text:
         return []
-    return re.findall(r'https?://[^\s<>"\')]+', text)
+    urls = re.findall(r'https?://[^\s<>"\')]+', text)
+    return [u for u in urls if is_valid_mp_url(u)]
 
 
 def find_article_link_in_memory(keyword=""):
@@ -299,11 +315,13 @@ def find_article_link_in_memory(keyword=""):
                         m = re.search(rb'"link"\s*:\s*"(https://mp\.weixin\.qq\.com/s[^"]+)"', chunk)
                         if m:
                             raw_link = m.group(1).decode("utf-8", errors="ignore").replace("&amp;", "&")
-                            return raw_link
+                            if is_valid_mp_url(raw_link):
+                                return raw_link
                         m2 = re.search(rb'https://mp\.weixin\.qq\.com/s[a-zA-Z0-9_\-\.\/\?\=\&\%]+', chunk)
                         if m2:
                             raw_link = m2.group(0).decode("utf-8", errors="ignore").replace("&amp;", "&").rstrip("\\;&<>'\"")
-                            return raw_link
+                            if is_valid_mp_url(raw_link):
+                                return raw_link
                 except Exception:
                     continue
     except Exception as e:
@@ -356,6 +374,10 @@ def fetch_url_content(url, timeout=10, max_chars=3500):
 
         lines = [line.strip() for line in text.splitlines()]
         cleaned_body = "\n".join([line for line in lines if line])
+
+        if not title and len(cleaned_body) < 120:
+            log_msg(f"抓取 URL 失败 ({url}): 无标题且正文过短或无效占位页面")
+            return {"success": False, "url": url, "error": "Invalid or placeholder content"}
 
         if len(cleaned_body) > max_chars:
             cleaned_body = cleaned_body[:max_chars] + "\n...(正文较长，已截取前 3500 字)..."
@@ -569,10 +591,11 @@ def x11_click(x, y):
 def check_and_dismiss_logout_modal(img=None):
     """
     检测并自动解除微信退出登录模态弹窗或残留的全屏大图查看器：
-    1. 通过 X11 窗口树检测是否存在微信弹出的模态对话框 (width < 450, height < 300)；
-       若检测到，根据弹窗实际几何坐标精准计算出【取消】按钮的位置并点击，随后补发 Escape 键；
-    2. 检测是否存在残留全屏图片查看器 (width > 1000, height > 600, 无名或非主窗口)，
-       自动补发 Escape 键将其关闭，确保实时监控与发消息永远聚焦在主聊天窗口。
+    1. 通过 X11 窗口检测退出登录确认弹窗 (180 < width < 450, 100 < height < 300)；
+       若检测到，根据弹窗实际几何坐标精准点击【取消】按钮 (cx, cy) 予以关闭。
+       【核心铁律】：绝不发送 Escape 键！在 WeChat 4.x Linux 中，按 Escape 会触发退出登录或重新打开确认弹窗。
+    2. 检测是否存在残留全屏图片查看器 (width > 1000, height > 600, 非主窗口)，
+       点击右上角关闭按钮将其安全关闭。
     """
     try:
         d = display.Display(":99")
@@ -588,20 +611,10 @@ def check_and_dismiss_logout_modal(img=None):
                     viewer_win = w
                     break
 
-            if viewer_win:
-                log_msg(f"⚠️ 自动检测到微信大图查看器残留窗口 (id={viewer_win['id']}, size={viewer_win['width']}x{viewer_win['height']})，正在按 Esc 自动关闭...")
-                esc_kc = d.keysym_to_keycode(XK.XK_Escape)
-                xtest.fake_input(d, X.KeyPress, esc_kc)
-                xtest.fake_input(d, X.KeyRelease, esc_kc)
-                d.sync()
-                time.sleep(0.15)
-                return True
-
             if modal_win:
-                cx = modal_win["x"] + int(modal_win["width"] * 0.72)
+                cx = modal_win["x"] + int(modal_win["width"] * 0.71)
                 cy = modal_win["y"] + int(modal_win["height"] * 0.75)
                 log_msg(f"⚠️ 自动检测到微信退出登录确认模态弹窗 (id={modal_win['id']}, pos={modal_win['x']},{modal_win['y']}, size={modal_win['width']}x{modal_win['height']})，正在点击【取消】({cx}, {cy})...")
-
                 xtest.fake_input(d, X.MotionNotify, x=cx, y=cy)
                 d.sync()
                 time.sleep(0.08)
@@ -610,13 +623,28 @@ def check_and_dismiss_logout_modal(img=None):
                 time.sleep(0.12)
                 xtest.fake_input(d, X.ButtonRelease, 1)
                 d.sync()
-                time.sleep(0.15)
+                time.sleep(0.25)
 
-                esc_kc = d.keysym_to_keycode(XK.XK_Escape)
-                xtest.fake_input(d, X.KeyPress, esc_kc)
-                xtest.fake_input(d, X.KeyRelease, esc_kc)
+                remaining = [w for w in find_wechat_windows(d) if 180 < w["width"] < 450 and 100 < w["height"] < 300]
+                if not remaining:
+                    log_msg("✅ 微信退出登录模态弹窗已点击【取消】顺利关闭！")
+                else:
+                    log_msg(f"⚠️ 点击取消后弹窗仍存在: {remaining[0]['id']}")
+                return True
+
+            if viewer_win:
+                close_x = viewer_win["x"] + viewer_win["width"] - 25
+                close_y = viewer_win["y"] + 20
+                log_msg(f"⚠️ 自动检测到微信大图查看器残留窗口 (id={viewer_win['id']})，正在点击右上角关闭 ({close_x}, {close_y})...")
+                xtest.fake_input(d, X.MotionNotify, x=close_x, y=close_y)
                 d.sync()
-                log_msg("✅ 微信模态弹窗已通过动态几何计算精准点击【取消】并顺利关闭！")
+                time.sleep(0.08)
+                xtest.fake_input(d, X.ButtonPress, 1)
+                d.sync()
+                time.sleep(0.12)
+                xtest.fake_input(d, X.ButtonRelease, 1)
+                d.sync()
+                time.sleep(0.2)
                 return True
         finally:
             d.close()
@@ -628,11 +656,10 @@ def check_and_dismiss_logout_modal(img=None):
 def recover_wechat_ui_state():
     """
     微信 UI 排错与防卡顿自愈机制：
-    1. 检查并关闭微信退出登录确认模态弹窗
+    1. 检查并关闭微信退出登录确认模态弹窗（点击取消，严禁发送 Escape）
     2. 关闭所有残留的非主窗口（如 WeChatAppEx 网页、弹窗、图片浏览）
-    3. 发送 Escape 键关闭可能残留的右键上下文菜单、弹层
-    4. 点击主聊天窗口输入框以重新获取焦点
-    5. 清空输入框内残留的异常或半截输入 (Ctrl+A -> Backspace)
+    3. 点击主聊天窗口输入框以重新获取焦点
+    4. 清空输入框内残留的异常或半截输入 (Ctrl+A -> Backspace)
     """
     try:
         check_and_dismiss_logout_modal()
@@ -652,14 +679,7 @@ def recover_wechat_ui_state():
                 except Exception:
                     pass
 
-            # 2. 发送 Escape 键关闭任何可能悬挂的右键菜单或模态
-            esc_kc = d.keysym_to_keycode(XK.XK_Escape)
-            xtest.fake_input(d, X.KeyPress, esc_kc)
-            xtest.fake_input(d, X.KeyRelease, esc_kc)
-            d.sync()
-            time.sleep(0.05)
-
-            # 3. 聚焦输入框并清理输入内容
+            # 2. 聚焦输入框并清理输入内容（无需发送 Escape，防止触发全局快捷键）
             wins = find_wechat_windows(d)
             if wins:
                 main_w = wins[0]
@@ -755,6 +775,13 @@ def x11_send_text(text):
         xtest.fake_input(d, X.KeyRelease, ret_kc)
         d.sync()
     finally:
+        for ks in [XK.XK_Control_L, XK.XK_Control_R, XK.XK_Alt_L, XK.XK_Shift_L]:
+            try:
+                kc = d.keysym_to_keycode(ks)
+                xtest.fake_input(d, X.KeyRelease, kc)
+            except Exception:
+                pass
+        d.sync()
         d.close()
 
     last_send_ts = time.time()
@@ -918,11 +945,7 @@ def extract_image_via_clipboard(px, py):
                 except Exception:
                     pass
 
-        # 4. 按 Esc 键关闭可能残留的右键上下文菜单，确保无遮挡
-        esc_kc = d.keysym_to_keycode(XK.XK_Escape)
-        xtest.fake_input(d, X.KeyPress, esc_kc)
-        xtest.fake_input(d, X.KeyRelease, esc_kc)
-        d.sync()
+        # 4. 点击“复制”已由系统自动收回右键菜单，严禁补发 Escape 键（防止触发微信退出登录）
 
         if img_bytes and len(img_bytes) > 2000:
             with open("/tmp/wechat_last_photo.png", "wb") as f:
@@ -1408,44 +1431,46 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             user_query += f"\n【群聊中关联/引用的图片识别详情（视觉OCR与画面解析）】：\n- 图片类别：{img_type}\n- 图片画面与文字详情：{img_ocr}"
 
     # 1. Automatic URL extraction & web page content fetching
+    is_visual_query = False
+    if image_info and image_info.get("has_image"):
+        is_visual_query = True
+    elif any(k in content for k in ["图", "图片", "这图", "看图", "走势图", "截图", "照片", "k线"]):
+        is_visual_query = True
+
     candidate_texts = [content]
     if quote_info and quote_info.get("has_quote"):
         candidate_texts.append(str(quote_info.get("quoted_content", "")))
-    if recent_history:
-        for h in reversed(recent_history[-5:]):
-            candidate_texts.append(h.get("content", ""))
 
     found_urls = []
     for ct in candidate_texts:
         for u in extract_urls(ct):
-            if u not in found_urls:
+            if is_valid_mp_url(u) and u not in found_urls:
                 found_urls.append(u)
 
     # 2. If no explicit HTTP link found in text, check for WeChat Article Card or quote with 🔗
-    # Scan WeChat process memory to convert the card into the real mp.weixin.qq.com URL!
-    if not found_urls:
+    # ONLY scan memory if this is NOT a visual/image query, AND the user explicitly provided or quoted an article card!
+    if not found_urls and not is_visual_query:
         card_kw = ""
         for ct in candidate_texts:
-            if "🔗" in ct or "http" in ct:
-                card_kw = re.sub(r'.*?🔗\s*', '', ct)
+            if "🔗" in ct:
+                card_kw = re.sub(r'.*?🔗\s*', '', ct).strip()
                 break
             m = re.search(r'\[分享文章卡片:\s*《(.*?)》', ct)
             if m:
                 card_kw = m.group(1).strip()
                 break
-            if "“" in ct and "”" in ct and len(ct) >= 10:
-                card_kw = ct
-                break
 
-        if not card_kw and any(k in content for k in ["链接", "文章", "卡片", "新闻", "内容", "评价", "看下", "怎么看"]):
+        # Only allow explicit article references (e.g. user mentions 文章/链接/公众号)
+        if not card_kw and any(k in content for k in ["链接", "文章", "公众号", "卡片", "推文"]):
             for ct in candidate_texts:
-                if len(ct) >= 10 and not any(bn in ct for bn in ["bot", "albot"]):
-                    card_kw = ct
+                m = re.search(r'《(.*?)》', ct)
+                if m and len(m.group(1).strip()) >= 4:
+                    card_kw = m.group(1).strip()
                     break
 
         if card_kw:
             mem_url = find_article_link_in_memory(card_kw)
-            if mem_url:
+            if mem_url and is_valid_mp_url(mem_url):
                 log_msg(f"微信内存成功解析出真实链接: {mem_url}")
                 found_urls.append(mem_url)
 
@@ -1464,7 +1489,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             )
 
     # 3. Fallback: If memory URL search failed, but title is present, trigger $web_search
-    if not fetched_any_article:
+    if not fetched_any_article and not is_visual_query:
         card_title = ""
         card_source = ""
         for ct in candidate_texts:
@@ -1473,8 +1498,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 card_title = m.group(1).strip()
                 card_source = (m.group(2) or "").strip()
                 break
-            if "“" in ct and "”" in ct and len(ct) >= 12:
-                card_title = ct.strip()
+            m_book = re.search(r'《(.*?)》', ct)
+            if m_book and len(m_book.group(1).strip()) >= 4 and any(k in content for k in ["文章", "新闻", "报道", "链接"]):
+                card_title = m_book.group(1).strip()
                 break
 
         if card_title:
@@ -1485,9 +1511,24 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 f"- 核心要求：群友正在要求你阅读并评价/分析这篇分享的文章！由于微信卡片只展示了部分标题，你【必须立即使用 $web_search 联网搜索工具】检索该文章的完整报道正文与真实事件细节！在完整阅读了真实正文后，再进行全面、客观、深入有依据的分析评价！绝对严禁仅凭标题凭空推测或说‘光从标题看’！\n"
             )
 
+    user_content_payload = user_query
+    if provider == "gemini" and image_info and image_info.get("has_image") and os.path.exists("/tmp/wechat_last_photo.png"):
+        try:
+            with open("/tmp/wechat_last_photo.png", "rb") as f:
+                img_data = f.read()
+            if img_data and len(img_data) > 1000:
+                img_b64 = base64.b64encode(img_data).decode("ascii")
+                user_content_payload = [
+                    {"type": "text", "text": user_query},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
+                ]
+                log_msg(f"已将群聊原图 ({len(img_data)} 字节) 作为视觉多模态输入直接送入 Gemini 3.8 Flash")
+        except Exception as e:
+            log_msg(f"组装图片多模态 payload 异常: {e}")
+
     messages = [
         {"role": "system", "content": system_instruction},
-        {"role": "user", "content": user_query},
+        {"role": "user", "content": user_content_payload},
     ]
 
     final_reply = ""
@@ -2558,16 +2599,7 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
         elif parsed.path == "/api/dismiss_popup":
             dismissed = check_and_dismiss_logout_modal()
             if not dismissed:
-                x11_click(700, 440)
-                time.sleep(0.08)
-                d = display.Display(":99")
-                try:
-                    esc_kc = d.keysym_to_keycode(XK.XK_Escape)
-                    xtest.fake_input(d, X.KeyPress, esc_kc)
-                    xtest.fake_input(d, X.KeyRelease, esc_kc)
-                    d.sync()
-                finally:
-                    d.close()
+                x11_click(702, 437)
             log_msg("控制台指令: 执行解除退出模态弹窗")
             self._send_json({"ok": True, "message": "已触发关闭退出登录弹窗"})
         elif parsed.path == "/api/key":
