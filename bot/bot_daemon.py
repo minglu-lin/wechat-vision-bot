@@ -173,11 +173,11 @@ def is_genuine_mention(content, bot_names=None):
             if not rem or rem[0] in [",", "，", ":", "：", " ", "、", "?", "？", "！", "!", "\t"] or ord(rem[0]) > 127:
                 return True
 
-    # 2. 显式 @bot 放行
-    if re.search(r'@(?:Albot|albot|bot|Bot|BOT|AIbot|aibot|微信小号|\S+bot|\S+机器人)', c):
+    # 2. 显式 @bot 放行（严格校验 @ 后面跟的必须是 bot 相关名称，严禁把 @其他群成员 误判为呼叫 bot）
+    if re.search(r'@\s*(?:Albot|albot|bot|Bot|BOT|AIbot|aibot|微信小号|\S*bot|\S*机器人)', c):
         return True
-    if re.search(r'(?:^|\s)@(?:\S+)?', c):
-        if not re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', c):
+    for name in candidate_names:
+        if re.search(r'@\s*' + re.escape(name), c_lower):
             return True
 
     # 3. 只有非 bot 开头时，才过滤群友闲聊第三人称随口提及（如“不用加bot”、“这个bot好逗”）
@@ -1116,7 +1116,8 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
         f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
         f"   - 【用户最高铁律】：只要消息开头包含 @AIbot、@Albot、@bot、@微信小号，或者以 bot、aibot 开头（如 'bot ...'、'@AIbot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
-        f"   - 【严格禁忌】：只有当群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊而非指令时，is_mentioned 才为 false！\n"
+        f"   - 【严格禁忌1】：如果群友是在 @其他群成员（例如 '@张三 ...'、'@黄嘉诚 ...'，@后面跟的不是 AIbot/Albot/bot），绝对不属于呼叫 bot，is_mentioned 必须为 false！\n"
+        f"   - 【严格禁忌2】：当群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊而非指令时，is_mentioned 必须为 false！\n"
         f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
         f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
         f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
@@ -1802,7 +1803,7 @@ def monitor_loop():
                                 new_crop = img2.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
                                 last_check_reply_ts = time.time()
 
-                                bot_names = cfg.get("bot_names", ["@"])
+                                bot_names = [b for b in cfg.get("bot_names", ["AIbot", "Albot", "aibot", "bot"]) if b.strip() != "@"]
                                 trigger_mode = cfg.get("trigger_mode", "mention_only")
 
                                 try:
@@ -2540,7 +2541,7 @@ async function loadInitialConfig() {
     if (d.config) {
       document.getElementById('auto-reply').value = String(d.config.auto_reply !== false);
       document.getElementById('trigger-mode').value = d.config.trigger_mode || 'mention_only';
-      document.getElementById('bot-names').value = (d.config.bot_names || ['@']).join(', ');
+      document.getElementById('bot-names').value = (d.config.bot_names || ['AIbot', 'Albot', 'aibot', 'bot']).join(', ');
       document.getElementById('temperature').value = d.config.temperature !== undefined ? d.config.temperature : 0.75;
       document.getElementById('amap-key').value = d.config.amap_api_key || '';
       document.getElementById('sys-prompt').value = d.config.system_prompt || '';
