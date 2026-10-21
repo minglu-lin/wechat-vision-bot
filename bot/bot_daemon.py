@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
@@ -12,7 +14,7 @@ import time
 import urllib.request
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 from PIL import Image, ImageChops, ImageStat
 try:
@@ -559,15 +561,62 @@ def x11_click(x, y):
         d.close()
 
 
+def check_and_dismiss_logout_modal(img=None):
+    """
+    检测并自动解除微信退出登录模态弹窗：
+    通过 X11 窗口树检测是否存在微信弹出的模态对话框 (width < 450, height < 300)；
+    若检测到，根据弹窗实际几何坐标精准计算出【取消】按钮的位置并点击，随后补发 Escape 键，
+    彻底杜绝任何模态窗口阻塞主聊天窗口事件循环与按键队列。
+    """
+    try:
+        d = display.Display(":99")
+        try:
+            wins = find_wechat_windows(d)
+            modal_win = None
+            for w in wins:
+                if 180 < w["width"] < 450 and 100 < w["height"] < 300:
+                    modal_win = w
+                    break
+
+            if modal_win:
+                cx = modal_win["x"] + int(modal_win["width"] * 0.72)
+                cy = modal_win["y"] + int(modal_win["height"] * 0.75)
+                log_msg(f"⚠️ 自动检测到微信退出登录确认模态弹窗 (id={modal_win['id']}, pos={modal_win['x']},{modal_win['y']}, size={modal_win['width']}x{modal_win['height']})，正在点击【取消】({cx}, {cy})...")
+
+                xtest.fake_input(d, X.MotionNotify, x=cx, y=cy)
+                d.sync()
+                time.sleep(0.08)
+                xtest.fake_input(d, X.ButtonPress, 1)
+                d.sync()
+                time.sleep(0.12)
+                xtest.fake_input(d, X.ButtonRelease, 1)
+                d.sync()
+                time.sleep(0.15)
+
+                esc_kc = d.keysym_to_keycode(XK.XK_Escape)
+                xtest.fake_input(d, X.KeyPress, esc_kc)
+                xtest.fake_input(d, X.KeyRelease, esc_kc)
+                d.sync()
+                log_msg("✅ 微信模态弹窗已通过动态几何计算精准点击【取消】并顺利关闭！")
+                return True
+        finally:
+            d.close()
+    except Exception as e:
+        log_msg(f"模态检测异常: {e}")
+    return False
+
+
 def recover_wechat_ui_state():
     """
     微信 UI 排错与防卡顿自愈机制：
-    1. 关闭所有残留的非主窗口（如 WeChatAppEx 网页、弹窗、图片浏览）
-    2. 发送 Escape 键关闭可能残留的右键上下文菜单、弹层
-    3. 点击主聊天窗口输入框以重新获取焦点
-    4. 清空输入框内残留的异常或半截输入 (Ctrl+A -> Backspace)
+    1. 检查并关闭微信退出登录确认模态弹窗
+    2. 关闭所有残留的非主窗口（如 WeChatAppEx 网页、弹窗、图片浏览）
+    3. 发送 Escape 键关闭可能残留的右键上下文菜单、弹层
+    4. 点击主聊天窗口输入框以重新获取焦点
+    5. 清空输入框内残留的异常或半截输入 (Ctrl+A -> Backspace)
     """
     try:
+        check_and_dismiss_logout_modal()
         d = display.Display(":99")
         try:
             root = d.screen().root
@@ -624,6 +673,7 @@ def recover_wechat_ui_state():
 
 def x11_send_text(text):
     global last_send_ts, last_reply_text
+    check_and_dismiss_logout_modal()
     text = clean_bot_reply(text).strip()
     if not text:
         return False, "Empty text"
@@ -1512,6 +1562,11 @@ def monitor_loop():
             img, wins = capture_screen_pil()
             img.save("/tmp/screen.png")
 
+            if check_and_dismiss_logout_modal(img):
+                time.sleep(0.3)
+                img, wins = capture_screen_pil()
+                img.save("/tmp/screen.png")
+
             if wins:
                 w = wins[0]
                 pad = 12
@@ -1707,161 +1762,627 @@ def monitor_loop():
         time.sleep(2.0)
 
 
-HTML_PAGE = """<!DOCTYPE html>
+LOGIN_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>WeChat + Kimi 群聊机器人控制台 (Oracle SG)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>管理员登录 - WeChat Bot 控制台</title>
 <style>
-  body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 20px; }
-  .wrap { max-width: 1200px; margin: 0 auto; display: grid; grid-template-columns: 1fr 380px; gap: 20px; }
-  .card { background: #1e293b; border-radius: 12px; padding: 16px; border: 1px solid #334155; }
-  h2 { margin-top: 0; font-size: 18px; color: #38bdf8; }
-  #screen-wrap { position: relative; display: inline-block; border: 2px solid #475569; border-radius: 8px; overflow: hidden; cursor: crosshair; background: #000; }
-  #screen-img { display: block; max-width: 100%; height: auto; }
-  input, textarea, select, button { width: 100%; box-sizing: border-box; margin-top: 6px; margin-bottom: 12px; padding: 9px 12px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; font-size: 14px; }
-  button { background: #0284c7; border: none; font-weight: 600; cursor: pointer; }
-  button:hover { background: #0369a1; }
-  .log-box { background: #090d16; font-family: monospace; font-size: 12px; padding: 10px; height: 220px; overflow-y: auto; border-radius: 6px; border: 1px solid #334155; white-space: pre-wrap; }
-  .badge { display: inline-block; padding: 3px 8px; border-radius: 99px; font-size: 12px; font-weight: bold; }
-  .badge-ok { background: #065f46; color: #6ee7b7; }
-  .badge-wait { background: #92400e; color: #fde68a; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0b0f19; color: #f1f5f9; display: flex; align-items: center; justify-content: center; min-height: 100vh; padding: 20px; }
+  .card { background: rgba(30, 41, 59, 0.75); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.12); border-radius: 16px; padding: 36px 32px; width: 100%; max-width: 400px; box-shadow: 0 20px 45px rgba(0, 0, 0, 0.6); }
+  .logo { font-size: 42px; text-align: center; margin-bottom: 12px; }
+  h1 { font-size: 22px; text-align: center; font-weight: 700; margin-bottom: 6px; background: linear-gradient(135deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  p.sub { font-size: 13px; color: #94a3b8; text-align: center; margin-bottom: 24px; }
+  .form-group { margin-bottom: 18px; }
+  label { display: block; font-size: 13px; font-weight: 600; color: #cbd5e1; margin-bottom: 8px; }
+  input[type="password"] { width: 100%; padding: 12px 14px; background: #090d16; border: 1px solid #334155; border-radius: 8px; color: #fff; font-size: 15px; outline: none; transition: border 0.2s, box-shadow 0.2s; }
+  input[type="password"]:focus { border-color: #38bdf8; box-shadow: 0 0 0 3px rgba(56, 189, 248, 0.2); }
+  button { width: 100%; padding: 12px; background: linear-gradient(135deg, #0284c7, #2563eb); border: none; border-radius: 8px; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; transition: transform 0.1s, opacity 0.2s; }
+  button:hover { opacity: 0.92; }
+  button:active { transform: scale(0.99); }
+  .err { display: none; background: rgba(239, 68, 68, 0.15); border: 1px solid #ef4444; color: #fca5a5; padding: 10px; border-radius: 8px; font-size: 13px; text-align: center; margin-bottom: 16px; }
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="card">
-    <h2>📱 微信实时画面（点击画面可直接在云端微信内操作） <span id="status-badge" class="badge badge-wait">检测中...</span></h2>
-    <div id="screen-wrap">
-      <img id="screen-img" src="/api/screen.png?t=0" onclick="handleScreenClick(event)">
+<div class="card">
+  <div class="logo">🤖</div>
+  <h1>WeChat Bot 控制台</h1>
+  <p class="sub">Oracle Singapore • MAGA 智能助手</p>
+  <div id="err" class="err"></div>
+  <form onsubmit="handleLogin(event)">
+    <div class="form-group">
+      <label for="pwd">管理员密码</label>
+      <input type="password" id="pwd" placeholder="请输入管理员密码..." autofocus required>
     </div>
-  </div>
-  <div class="card">
-    <h2>🤖 Kimi 机器人控制与配置</h2>
-    <label>手动发送消息到当前打开的群聊：</label>
-    <input type="text" id="manual-text" placeholder="输入要让小号在群里说的话...">
-    <button onclick="sendManual()">🚀 立即发送到群聊</button>
-    <hr style="border-color:#334155;margin:14px 0;">
-    <label>自动回复开关：</label>
-    <select id="auto-reply">
-      <option value="true">开启 Kimi 自动回复</option>
-      <option value="false">暂停自动回复（仅手动控制）</option>
-    </select>
-    <label>群聊触发模式：</label>
-    <select id="trigger-mode">
-      <option value="mention_only">仅被 @ 或呼叫小号名字时回复</option>
-      <option value="all">群内所有新消息均回复</option>
-    </select>
-    <label>小号昵称 / 触发关键词（逗号分隔）：</label>
-    <input type="text" id="bot-names" placeholder="@, bot">
-    <label>高德地图 WebKey（可选，用于查美食与地铁换乘）：</label>
-    <input type="text" id="amap-key" placeholder="高德开放平台申请的 Web服务 Key（留空则走全网搜索）">
-    <label>Kimi 群聊人设 Prompt：</label>
-    <textarea id="sys-prompt" rows="4"></textarea>
-    <button onclick="saveCfg()">💾 保存配置</button>
-    <h2>📜 实时运行日志</h2>
-    <div id="logs" class="log-box"></div>
-  </div>
+    <button type="submit" id="btn">验证并登录</button>
+  </form>
 </div>
 <script>
-async function refreshStatus() {
+async function handleLogin(e) {
+  e.preventDefault();
+  const btn = document.getElementById('btn');
+  const err = document.getElementById('err');
+  const pwd = document.getElementById('pwd').value;
+  btn.disabled = true;
+  btn.innerText = '正在验证...';
+  err.style.display = 'none';
   try {
-    const r = await fetch('/api/status');
-    const d = await r.json();
-    const badge = document.getElementById('status-badge');
-    if (d.logged_in) {
-      badge.className = 'badge badge-ok';
-      badge.innerText = '✅ 已扫码登录在线';
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({password: pwd})
+    });
+    const d = await res.json();
+    if (d.ok) {
+      window.location.href = '/';
     } else {
-      badge.className = 'badge badge-wait';
-      badge.innerText = '⏳ 等待手机微信扫码登录';
+      err.innerText = d.error || '密码错误';
+      err.style.display = 'block';
+      btn.disabled = false;
+      btn.innerText = '验证并登录';
     }
-    document.getElementById('logs').innerText = (d.logs || []).join('\n');
-    const logEl = document.getElementById('logs');
-    logEl.scrollTop = logEl.scrollHeight;
-  } catch (e) {}
-  document.getElementById('screen-img').src = '/api/screen.png?t=' + Date.now();
-}
-async function loadInitialCfg() {
-  const r = await fetch('/api/status');
-  const d = await r.json();
-  if (d.config) {
-    document.getElementById('auto-reply').value = String(d.config.auto_reply !== false);
-    document.getElementById('trigger-mode').value = d.config.trigger_mode || 'mention_only';
-    document.getElementById('bot-names').value = (d.config.bot_names || ['@']).join(', ');
-    document.getElementById('amap-key').value = d.config.amap_api_key || '';
-    document.getElementById('sys-prompt').value = d.config.system_prompt || '';
+  } catch (ex) {
+    err.innerText = '网络连接异常，请重试';
+    err.style.display = 'block';
+    btn.disabled = false;
+    btn.innerText = '验证并登录';
   }
 }
-async function handleScreenClick(ev) {
-  const img = ev.target;
-  const rect = img.getBoundingClientRect();
-  const scaleX = 1280 / rect.width;
-  const scaleY = 800 / rect.height;
-  const x = Math.round((ev.clientX - rect.left) * scaleX);
-  const y = Math.round((ev.clientY - rect.top) * scaleY);
-  await fetch('/api/click', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({x, y})});
-  setTimeout(refreshStatus, 400);
-}
-async function sendManual() {
-  const t = document.getElementById('manual-text').value.trim();
-  if (!t) return;
-  await fetch('/api/send', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({text: t})});
-  document.getElementById('manual-text').value = '';
-  setTimeout(refreshStatus, 500);
-}
-async function saveCfg() {
-  const auto_reply = document.getElementById('auto-reply').value === 'true';
-  const trigger_mode = document.getElementById('trigger-mode').value;
-  const bot_names = document.getElementById('bot-names').value.split(',').map(s => s.trim()).filter(Boolean);
-  const amap_api_key = document.getElementById('amap-key').value.trim();
-  const system_prompt = document.getElementById('sys-prompt').value.trim();
-  await fetch('/api/config', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({auto_reply, trigger_mode, bot_names, amap_api_key, system_prompt})
-  });
-  alert('配置保存成功！');
-  setTimeout(refreshStatus, 300);
-}
-loadInitialCfg();
-refreshStatus();
-setInterval(refreshStatus, 3000);
 </script>
 </body>
 </html>
 """
 
 
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>WeChat Bot 运维控制台 (Oracle SG)</title>
+<style>
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif; background: #0b0f19; color: #e2e8f0; margin: 0; padding: 16px; }
+  .header { max-width: 1300px; margin: 0 auto 16px; display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding-bottom: 12px; border-bottom: 1px solid #1e293b; }
+  .title-group { display: flex; align-items: center; gap: 10px; }
+  h1 { font-size: 20px; font-weight: 700; margin: 0; background: linear-gradient(135deg, #38bdf8, #818cf8); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .status-badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .badge { display: inline-flex; align-items: center; gap: 4px; padding: 4px 10px; border-radius: 9999px; font-size: 12px; font-weight: 600; }
+  .badge-ok { background: rgba(16, 185, 129, 0.2); color: #34d399; border: 1px solid rgba(16, 185, 129, 0.4); }
+  .badge-wait { background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid rgba(245, 158, 11, 0.4); }
+  .badge-err { background: rgba(239, 68, 68, 0.2); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
+  .badge-info { background: rgba(56, 189, 248, 0.2); color: #38bdf8; border: 1px solid rgba(56, 189, 248, 0.4); }
+  .btn-logout { background: transparent; border: 1px solid #475569; color: #94a3b8; padding: 4px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  .btn-logout:hover { color: #f87171; border-color: #ef4444; }
+
+  .wrap { max-width: 1300px; margin: 0 auto; display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 16px; }
+  @media (max-width: 980px) { .wrap { grid-template-columns: 1fr; } }
+
+  .card { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border-radius: 14px; padding: 16px; border: 1px solid #334155; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.3); }
+  .card-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; flex-wrap: wrap; gap: 8px; }
+  h2 { margin: 0; font-size: 16px; font-weight: 600; color: #38bdf8; display: flex; align-items: center; gap: 6px; }
+
+  /* Screen area */
+  .view-switch { display: flex; gap: 6px; }
+  .view-btn { padding: 4px 10px; font-size: 12px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #94a3b8; cursor: pointer; }
+  .view-btn.active { background: #0284c7; color: #fff; border-color: #38bdf8; }
+
+  #screen-wrap { position: relative; width: 100%; border: 2px solid #475569; border-radius: 8px; overflow: hidden; background: #000; cursor: crosshair; user-select: none; }
+  #screen-img { display: block; width: 100%; height: auto; }
+  #coord-hud { position: absolute; bottom: 8px; right: 8px; background: rgba(0, 0, 0, 0.75); padding: 2px 8px; border-radius: 4px; font-size: 11px; font-family: monospace; color: #38bdf8; pointer-events: none; border: 1px solid rgba(56, 189, 248, 0.3); }
+  .ripple { position: absolute; border: 2px solid #ef4444; border-radius: 50%; pointer-events: none; animation: rip 0.4s ease-out forwards; }
+  @keyframes rip { from { width: 6px; height: 6px; opacity: 1; transform: translate(-50%, -50%); } to { width: 34px; height: 34px; opacity: 0; transform: translate(-50%, -50%); } }
+
+  /* Toolbar */
+  .toolbar { display: flex; gap: 6px; margin-top: 10px; flex-wrap: wrap; }
+  .tool-btn { flex: 1; min-width: 90px; padding: 8px 10px; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; border: none; transition: 0.15s; display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
+  .btn-danger { background: #dc2626; color: #fff; }
+  .btn-danger:hover { background: #b91c1c; }
+  .btn-warning { background: #d97706; color: #fff; }
+  .btn-warning:hover { background: #b45309; }
+  .btn-primary { background: #0284c7; color: #fff; }
+  .btn-primary:hover { background: #0369a1; }
+  .btn-secondary { background: #334155; color: #e2e8f0; }
+  .btn-secondary:hover { background: #475569; }
+
+  /* Tabs */
+  .tabs { display: flex; border-bottom: 1px solid #334155; margin-bottom: 14px; gap: 4px; }
+  .tab { padding: 8px 12px; font-size: 13px; font-weight: 600; color: #94a3b8; cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab.active { color: #38bdf8; border-color: #38bdf8; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* Form controls */
+  label { display: block; font-size: 12px; font-weight: 600; color: #94a3b8; margin-top: 10px; margin-bottom: 4px; }
+  input, textarea, select { width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 6px; border: 1px solid #475569; background: #090d16; color: #f8fafc; font-size: 13px; outline: none; }
+  input:focus, textarea:focus, select:focus { border-color: #38bdf8; }
+  .action-btn { width: 100%; margin-top: 12px; padding: 10px; background: #0284c7; color: #fff; border: none; border-radius: 6px; font-weight: 600; cursor: pointer; }
+  .action-btn:hover { background: #0369a1; }
+
+  .log-box { background: #050811; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11.5px; line-height: 1.5; padding: 10px; height: 320px; overflow-y: auto; border-radius: 6px; border: 1px solid #1e293b; color: #cbd5e1; white-space: pre-wrap; word-break: break-all; }
+  .toast { position: fixed; bottom: 20px; right: 20px; background: #1e293b; border: 1px solid #38bdf8; color: #fff; padding: 10px 16px; border-radius: 8px; font-size: 13px; box-shadow: 0 10px 20px rgba(0,0,0,0.5); opacity: 0; transform: translateY(10px); transition: all 0.25s; pointer-events: none; z-index: 9999; }
+  .toast.show { opacity: 1; transform: translateY(0); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="title-group">
+    <h1>🤖 WeChat Bot 实时监控与控制中枢</h1>
+  </div>
+  <div class="status-badges">
+    <span id="badge-wechat" class="badge badge-wait">微信检测中...</span>
+    <span id="badge-bot" class="badge badge-ok">Bot 在线</span>
+    <span id="badge-autoreply" class="badge badge-ok">自动回复: 开</span>
+    <span class="badge badge-info">:99 (1280x800)</span>
+    <button class="btn-logout" onclick="logout()">退出登录</button>
+  </div>
+</div>
+
+<div class="wrap">
+  <!-- Left: Live Screen -->
+  <div class="card">
+    <div class="card-header">
+      <h2>🖥️ 微信实时屏幕 (点击画面可直接在云端微信内操作)</h2>
+      <div class="view-switch">
+        <button id="btn-view-win" class="view-btn active" onclick="switchView('win')">🖼️ 微信窗口</button>
+        <button id="btn-view-full" class="view-btn" onclick="switchView('screen')">🖥️ 全桌面</button>
+      </div>
+    </div>
+
+    <div id="screen-wrap" onmousemove="handleMouseMove(event)" onmouseleave="handleMouseLeave()">
+      <img id="screen-img" src="/api/win.png?t=0" onclick="handleScreenClick(event)">
+      <div id="coord-hud">X: 0, Y: 0</div>
+    </div>
+
+    <!-- Quick action toolbar -->
+    <div class="toolbar">
+      <button class="tool-btn btn-warning" onclick="dismissModal()" title="关闭退出登录确认模态弹窗，解决输入框锁定">🛡️ 一键解除退出弹窗</button>
+      <button class="tool-btn btn-primary" onclick="forceRefreshScreen()" title="立即抓取最新云端截图">🔄 立即刷新</button>
+      <button class="tool-btn btn-secondary" onclick="sendVirtualKey('Clear')" title="清空当前输入框残留字符">🧹 清空输入框</button>
+      <button class="tool-btn btn-secondary" onclick="sendVirtualKey('Enter')" title="向当前焦点窗口发送回车键">⏎ 发送回车</button>
+      <button class="tool-btn btn-secondary" onclick="sendVirtualKey('Escape')" title="发送 Escape 键关闭上下文菜单">⎋ 发送 Esc</button>
+    </div>
+  </div>
+
+  <!-- Right: Tabs & Controls -->
+  <div class="card">
+    <div class="tabs">
+      <div class="tab active" onclick="showTab(0)">💬 手动发消息</div>
+      <div class="tab" onclick="showTab(1)">🤖 机器人控制</div>
+      <div class="tab" onclick="showTab(2)">🛠️ 进程管理</div>
+      <div class="tab" onclick="showTab(3)">📜 实时日志</div>
+    </div>
+
+    <!-- Tab 0: Manual Send -->
+    <div class="tab-content active" id="tab-0">
+      <label>手动发送文本到当前已打开的聊天窗口：</label>
+      <textarea id="manual-text" rows="4" placeholder="在此输入文字，点击下方按钮将直接自动粘贴并回车发送到当前群聊..."></textarea>
+      <button class="action-btn" onclick="sendManualText()">🚀 立即发送到当前群聊</button>
+
+      <div style="margin-top:14px; font-size:12px; color:#94a3b8;">
+        快捷快捷发送预设测试语：
+        <div style="display:flex; gap:6px; margin-top:6px; flex-wrap:wrap;">
+          <button class="view-btn" onclick="fillTest('bot 状态汇报')">bot 状态汇报</button>
+          <button class="view-btn" onclick="fillTest('bot 评价一下')">bot 评价一下</button>
+          <button class="view-btn" onclick="fillTest('bot 今天有什么热点')">bot 今天有什么热点</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Tab 1: Bot Config -->
+    <div class="tab-content" id="tab-1">
+      <label>AI 自动回复开关：</label>
+      <select id="auto-reply">
+        <option value="true">开启自动回复 (根据消息特征自动调用模型)</option>
+        <option value="false">暂停自动回复 (仅保留人工手动控制与监控)</option>
+      </select>
+
+      <label>群聊触发模式：</label>
+      <select id="trigger-mode">
+        <option value="mention_only">仅被 @ 或呼叫小号名字时回复 (推荐)</option>
+        <option value="all">群内所有新消息均自动回复</option>
+      </select>
+
+      <label>小号触发关键词 (英文逗号分隔)：</label>
+      <input type="text" id="bot-names" placeholder="@, bot, AIbot, Bot, BOT">
+
+      <label>高德地图 WebKey (查美食与出行)：</label>
+      <input type="text" id="amap-key" placeholder="可选高德 Web 服务 Key">
+
+      <label>机器人人设 System Prompt：</label>
+      <textarea id="sys-prompt" rows="3"></textarea>
+
+      <label>修改 Web 控制台管理员密码 (留空则不修改)：</label>
+      <input type="password" id="new-pwd" placeholder="输入新的管理员密码...">
+
+      <button class="action-btn" onclick="saveConfig()">💾 保存配置</button>
+    </div>
+
+    <!-- Tab 2: Process & Recovery -->
+    <div class="tab-content" id="tab-2">
+      <label>微信与系统进程状态：</label>
+      <div id="proc-info" style="font-size:12px; background:#050811; padding:8px 10px; border-radius:6px; border:1px solid #1e293b; font-family:monospace; margin-bottom:12px;">加载中...</div>
+
+      <div style="display:flex; flex-direction:column; gap:8px;">
+        <button class="tool-btn btn-warning" onclick="recoverUI()">🩺 一键运行 UI 排错与防卡顿自愈</button>
+        <button class="tool-btn btn-danger" onclick="restartWechat()">🔄 重启微信主进程 (kill & relaunch)</button>
+        <button class="tool-btn btn-secondary" onclick="restartDaemon()">⚡ 重启 wechat-bot 后台服务</button>
+      </div>
+    </div>
+
+    <!-- Tab 3: Realtime Logs -->
+    <div class="tab-content" id="tab-3">
+      <div class="card-header" style="margin-bottom:6px;">
+        <span style="font-size:12px; color:#94a3b8;">自动更新 (2s/次)</span>
+        <button class="view-btn" onclick="fetchLogs()">🔄 刷新日志</button>
+      </div>
+      <div id="logs" class="log-box">正在加载日志...</div>
+    </div>
+  </div>
+</div>
+
+<div id="toast" class="toast">操作成功</div>
+
+<script>
+let currentView = 'win';
+let windowMeta = {x: 0, y: 0, width: 1280, height: 800};
+
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.innerText = msg;
+  el.className = 'toast show';
+  setTimeout(() => { el.className = 'toast'; }, 2200);
+}
+
+function switchView(view) {
+  currentView = view;
+  document.getElementById('btn-view-win').className = 'view-btn' + (view === 'win' ? ' active' : '');
+  document.getElementById('btn-view-full').className = 'view-btn' + (view === 'screen' ? ' active' : '');
+  forceRefreshScreen();
+}
+
+function forceRefreshScreen() {
+  const img = document.getElementById('screen-img');
+  const endpoint = currentView === 'win' ? '/api/win.png' : '/api/screen.png';
+  img.src = endpoint + '?t=' + Date.now();
+}
+
+function showTab(idx) {
+  const tabs = document.querySelectorAll('.tab');
+  const contents = document.querySelectorAll('.tab-content');
+  tabs.forEach((t, i) => t.className = 'tab' + (i === idx ? ' active' : ''));
+  contents.forEach((c, i) => c.className = 'tab-content' + (i === idx ? ' active' : ''));
+}
+
+function getActualCoords(ev) {
+  const img = document.getElementById('screen-img');
+  const rect = img.getBoundingClientRect();
+  const clickFractionX = (ev.clientX - rect.left) / rect.width;
+  const clickFractionY = (ev.clientY - rect.top) / rect.height;
+
+  if (currentView === 'screen') {
+    return {
+      x: Math.round(clickFractionX * 1280),
+      y: Math.round(clickFractionY * 800)
+    };
+  } else {
+    const pad = 12;
+    const cropX = Math.max(0, windowMeta.x - pad);
+    const cropY = Math.max(0, windowMeta.y - pad);
+    const cropW = windowMeta.width + pad * 2;
+    const cropH = windowMeta.height + pad * 2;
+    return {
+      x: Math.round(cropX + clickFractionX * cropW),
+      y: Math.round(cropY + clickFractionY * cropH)
+    };
+  }
+}
+
+function handleMouseMove(ev) {
+  const pt = getActualCoords(ev);
+  document.getElementById('coord-hud').innerText = `X: ${pt.x}, Y: ${pt.y}`;
+}
+
+function handleMouseLeave() {
+  document.getElementById('coord-hud').innerText = 'X: 0, Y: 0';
+}
+
+async function handleScreenClick(ev) {
+  const pt = getActualCoords(ev);
+  const wrap = document.getElementById('screen-wrap');
+  const rect = wrap.getBoundingClientRect();
+  const rip = document.createElement('div');
+  rip.className = 'ripple';
+  rip.style.left = (ev.clientX - rect.left) + 'px';
+  rip.style.top = (ev.clientY - rect.top) + 'px';
+  wrap.appendChild(rip);
+  setTimeout(() => rip.remove(), 450);
+
+  try {
+    await fetch('/api/click', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({x: pt.x, y: pt.y})
+    });
+    toast(`已点击 (${pt.x}, ${pt.y})`);
+    setTimeout(forceRefreshScreen, 350);
+  } catch (e) {
+    toast('点击指令发送失败');
+  }
+}
+
+async function dismissModal() {
+  try {
+    const res = await fetch('/api/dismiss_popup', {method: 'POST'});
+    const d = await res.json();
+    toast(d.message || '已触发关闭弹窗');
+    setTimeout(forceRefreshScreen, 400);
+  } catch (e) { toast('关闭弹窗异常'); }
+}
+
+async function sendVirtualKey(key) {
+  try {
+    await fetch('/api/key', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key})
+    });
+    toast(`已发送按键: ${key}`);
+    setTimeout(forceRefreshScreen, 400);
+  } catch (e) { toast('按键发送失败'); }
+}
+
+async function sendManualText() {
+  const el = document.getElementById('manual-text');
+  const text = el.value.trim();
+  if (!text) return toast('请输入发送文本');
+  try {
+    const res = await fetch('/api/send', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({text})
+    });
+    const d = await res.json();
+    if (d.ok) {
+      toast('文本已成功发送至群聊！');
+      el.value = '';
+      setTimeout(forceRefreshScreen, 600);
+    } else {
+      toast('发送失败: ' + (d.message || '未知错误'));
+    }
+  } catch (e) { toast('网络错误'); }
+}
+
+function fillTest(str) {
+  document.getElementById('manual-text').value = str;
+}
+
+async function recoverUI() {
+  toast('正在执行 UI 排错与自愈...');
+  try {
+    const res = await fetch('/api/recover_ui', {method: 'POST'});
+    const d = await res.json();
+    toast(d.message || '自愈完成');
+    setTimeout(forceRefreshScreen, 500);
+  } catch (e) { toast('自愈执行失败'); }
+}
+
+async function restartWechat() {
+  if (!confirm('确定要重启云端微信主进程吗？')) return;
+  toast('正在重启微信...');
+  try {
+    await fetch('/api/restart_wechat', {method: 'POST'});
+    toast('微信正在后台重新启动，请稍候 5 秒...');
+    setTimeout(forceRefreshScreen, 5000);
+  } catch (e) { toast('重启命令发送失败'); }
+}
+
+async function restartDaemon() {
+  if (!confirm('确定要重启 wechat-bot 机器人后台服务吗？')) return;
+  toast('正在重启服务...');
+  try {
+    await fetch('/api/restart_daemon', {method: 'POST'});
+    toast('服务已重启，页面即将重新连接...');
+    setTimeout(() => window.location.reload(), 2500);
+  } catch (e) { toast('服务重启异常'); }
+}
+
+async function saveConfig() {
+  const auto_reply = document.getElementById('auto-reply').value === 'true';
+  const trigger_mode = document.getElementById('trigger-mode').value;
+  const bot_names = document.getElementById('bot-names').value.split(',').map(s => s.trim()).filter(Boolean);
+  const amap_api_key = document.getElementById('amap-key').value.trim();
+  const system_prompt = document.getElementById('sys-prompt').value.trim();
+  const new_password = document.getElementById('new-pwd').value.trim();
+
+  const payload = {auto_reply, trigger_mode, bot_names, amap_api_key, system_prompt};
+  if (new_password) payload.admin_password = new_password;
+
+  try {
+    const res = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await res.json();
+    if (d.ok) {
+      toast('配置已成功保存！');
+      document.getElementById('new-pwd').value = '';
+    } else {
+      toast('保存失败: ' + (d.error || ''));
+    }
+  } catch (e) { toast('保存网络异常'); }
+}
+
+async function fetchStatus() {
+  try {
+    const res = await fetch('/api/status');
+    if (res.status === 401) {
+      window.location.href = '/login';
+      return;
+    }
+    const d = await res.json();
+
+    const wechatBadge = document.getElementById('badge-wechat');
+    if (d.logged_in) {
+      wechatBadge.className = 'badge badge-ok';
+      wechatBadge.innerText = '✅ 微信在线';
+    } else {
+      wechatBadge.className = 'badge badge-wait';
+      wechatBadge.innerText = '⏳ 等待登录';
+    }
+
+    const autoBadge = document.getElementById('badge-autoreply');
+    if (d.config && d.config.auto_reply !== false) {
+      autoBadge.className = 'badge badge-ok';
+      autoBadge.innerText = '自动回复: 开';
+    } else {
+      autoBadge.className = 'badge badge-wait';
+      autoBadge.innerText = '自动回复: 关';
+    }
+
+    if (d.windows && d.windows.length > 0) {
+      windowMeta = d.windows[0];
+    }
+
+    const proc = document.getElementById('proc-info');
+    proc.innerText = `WeChat PID: ${d.wechat_pid || '运行中'} | 窗口尺寸: ${windowMeta.width}x${windowMeta.height} (${windowMeta.x}, ${windowMeta.y})\n运行时长: ${d.uptime || '持续在役'} | 监控线程: Active`;
+
+    const logBox = document.getElementById('logs');
+    if (d.logs && d.logs.length > 0) {
+      logBox.innerText = d.logs.join('\\n');
+      logBox.scrollTop = logBox.scrollHeight;
+    }
+  } catch (e) {}
+}
+
+async function loadInitialConfig() {
+  try {
+    const res = await fetch('/api/status');
+    const d = await res.json();
+    if (d.config) {
+      document.getElementById('auto-reply').value = String(d.config.auto_reply !== false);
+      document.getElementById('trigger-mode').value = d.config.trigger_mode || 'mention_only';
+      document.getElementById('bot-names').value = (d.config.bot_names || ['@']).join(', ');
+      document.getElementById('amap-key').value = d.config.amap_api_key || '';
+      document.getElementById('sys-prompt').value = d.config.system_prompt || '';
+    }
+  } catch (e) {}
+}
+
+function logout() {
+  window.location.href = '/logout';
+}
+
+loadInitialConfig();
+fetchStatus();
+setInterval(fetchStatus, 2500);
+setInterval(forceRefreshScreen, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+def get_admin_token(pwd):
+    return hashlib.sha256((pwd + "_wechat_salt_2026").encode("utf-8")).hexdigest()
+
+
 class BotHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def _send_json(self, data, code=200):
+    def _send_json(self, data, code=200, extra_headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
         self.end_headers()
         self.wfile.write(body)
 
+    def _is_authenticated(self):
+        cfg = load_config()
+        admin_pwd = cfg.get("admin_password", "Lin2026@k9x2!")
+        expected_token = get_admin_token(admin_pwd)
+
+        # 1. 检查 Cookie
+        cookie_header = self.headers.get("Cookie", "")
+        if f"bot_session={expected_token}" in cookie_header:
+            return True
+
+        # 2. 检查 HTTP Basic Auth
+        auth_header = self.headers.get("Authorization", "")
+        if auth_header.startswith("Basic "):
+            try:
+                raw = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
+                parts = raw.split(":", 1)
+                if len(parts) == 2 and parts[1] == admin_pwd:
+                    return True
+            except Exception:
+                pass
+
+        # 3. 检查 Query Param (?token=... or ?pwd=...)
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        if "token" in qs and qs["token"][0] == expected_token:
+            return True
+        if "pwd" in qs and qs["pwd"][0] == admin_pwd:
+            return True
+
+        return False
+
     def do_GET(self):
         parsed = urlparse(self.path)
-        if parsed.path in ("/", "/index.html"):
-            body = HTML_PAGE.encode("utf-8")
+
+        if parsed.path == "/logout":
+            self.send_response(302)
+            self.send_header("Set-Cookie", "bot_session=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Location", "/")
+            self.end_headers()
+            return
+
+        if parsed.path == "/login":
+            body = LOGIN_HTML.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
-        elif parsed.path == "/api/screen.png":
+            return
+
+        is_auth = self._is_authenticated()
+
+        if parsed.path in ("/", "/index.html"):
+            if not is_auth:
+                body = LOGIN_HTML.encode("utf-8")
+            else:
+                body = HTML_PAGE.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        # 针对 API 与图片接口的鉴权防护
+        if not is_auth:
+            self._send_json({"ok": False, "error": "Unauthorized"}, code=401)
+            return
+
+        if parsed.path == "/api/screen.png":
             p = "/tmp/screen.png"
             if os.path.exists(p):
                 with open(p, "rb") as f:
                     data = f.read()
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
-                self.send_header("Cache-Control", "no-store")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -1874,7 +2395,7 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
                     data = f.read()
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
-                self.send_header("Cache-Control", "no-store")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
                 self.wfile.write(data)
@@ -1884,68 +2405,139 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             _, wins = capture_screen_pil()
             logged_in = bool(wins and wins[0]["width"] >= 550)
             cfg = load_config()
-            safe_cfg = {k: v for k, v in cfg.items() if k != "kimi_api_key"}
+            safe_cfg = {k: v for k, v in cfg.items() if not k.endswith("_key") and k != "admin_password"}
             with state_lock:
                 logs_copy = list(recent_logs)
+            
+            wechat_pid = ""
+            try:
+                wechat_pid = subprocess.check_output(["pgrep", "-f", "/usr/bin/wechat"]).decode("utf-8").strip().split("\n")[0]
+            except Exception:
+                pass
+
             self._send_json({
+                "ok": True,
                 "logged_in": logged_in,
+                "wechat_pid": wechat_pid,
+                "uptime": "Active",
                 "windows": [{k: v for k, v in w.items() if k != "win"} for w in wins],
                 "config": safe_cfg,
                 "logs": logs_copy,
             })
         elif parsed.path == "/api/history":
-            self._send_json({"history": get_recent(30)})
+            self._send_json({"ok": True, "history": get_recent(30)})
         else:
             self.send_error(404)
 
     def do_POST(self):
         parsed = urlparse(self.path)
         length = int(self.headers.get("Content-Length", "0"))
-        body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+        except Exception:
+            body = {}
+
+        # 登录接口无需鉴权
+        if parsed.path == "/api/login":
+            pwd = body.get("password", "")
+            cfg = load_config()
+            admin_pwd = cfg.get("admin_password", "Lin2026@k9x2!")
+            if pwd == admin_pwd:
+                token = get_admin_token(admin_pwd)
+                cookie = f"bot_session={token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax"
+                self._send_json({"ok": True, "token": token}, extra_headers={"Set-Cookie": cookie})
+            else:
+                self._send_json({"ok": False, "error": "密码错误，请重新输入"}, code=403)
+            return
+
+        # 其他所有 POST 接口必须经过认证
+        if not self._is_authenticated():
+            self._send_json({"ok": False, "error": "Unauthorized"}, code=401)
+            return
 
         if parsed.path == "/api/click":
             x = int(body.get("x", 640))
             y = int(body.get("y", 400))
             x11_click(x, y)
-            log_msg(f"点击坐标 ({x}, {y})")
+            log_msg(f"控制台指令: 点击坐标 ({x}, {y})")
             self._send_json({"ok": True, "x": x, "y": y})
         elif parsed.path == "/api/send":
             text = body.get("text", "")
             ok, msg = x11_send_text(text)
             self._send_json({"ok": ok, "message": msg})
-        elif parsed.path == "/api/send_image":
-            img_path = body.get("path") or body.get("url") or ""
-            ok, msg = x11_send_image(img_path)
-            self._send_json({"ok": ok, "message": msg})
+        elif parsed.path == "/api/dismiss_popup":
+            dismissed = check_and_dismiss_logout_modal()
+            if not dismissed:
+                x11_click(700, 440)
+                time.sleep(0.08)
+                d = display.Display(":99")
+                try:
+                    esc_kc = d.keysym_to_keycode(XK.XK_Escape)
+                    xtest.fake_input(d, X.KeyPress, esc_kc)
+                    xtest.fake_input(d, X.KeyRelease, esc_kc)
+                    d.sync()
+                finally:
+                    d.close()
+            log_msg("控制台指令: 执行解除退出模态弹窗")
+            self._send_json({"ok": True, "message": "已触发关闭退出登录弹窗"})
+        elif parsed.path == "/api/key":
+            key_name = body.get("key", "")
+            d = display.Display(":99")
+            try:
+                if key_name == "Enter":
+                    kc = d.keysym_to_keycode(XK.XK_Return)
+                    xtest.fake_input(d, X.KeyPress, kc)
+                    xtest.fake_input(d, X.KeyRelease, kc)
+                elif key_name == "Escape":
+                    kc = d.keysym_to_keycode(XK.XK_Escape)
+                    xtest.fake_input(d, X.KeyPress, kc)
+                    xtest.fake_input(d, X.KeyRelease, kc)
+                elif key_name == "Clear":
+                    ctrl_kc = d.keysym_to_keycode(XK.XK_Control_L)
+                    a_kc = d.keysym_to_keycode(XK.XK_a)
+                    bs_kc = d.keysym_to_keycode(XK.XK_BackSpace)
+                    xtest.fake_input(d, X.KeyPress, ctrl_kc)
+                    xtest.fake_input(d, X.KeyPress, a_kc)
+                    xtest.fake_input(d, X.KeyRelease, a_kc)
+                    xtest.fake_input(d, X.KeyRelease, ctrl_kc)
+                    d.sync()
+                    time.sleep(0.03)
+                    xtest.fake_input(d, X.KeyPress, bs_kc)
+                    xtest.fake_input(d, X.KeyRelease, bs_kc)
+                d.sync()
+            finally:
+                d.close()
+            log_msg(f"控制台指令: 发送按键 {key_name}")
+            self._send_json({"ok": True, "key": key_name})
+        elif parsed.path == "/api/recover_ui":
+            recover_wechat_ui_state()
+            self._send_json({"ok": True, "message": "UI 排错自愈机制已执行完毕"})
+        elif parsed.path == "/api/restart_wechat":
+            def _restart_wc():
+                time.sleep(0.5)
+                subprocess.call(["killall", "-9", "wechat"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                time.sleep(2.0)
+                env = os.environ.copy()
+                env["DISPLAY"] = ":99"
+                subprocess.Popen(["/usr/bin/wechat"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            threading.Thread(target=_restart_wc, daemon=True).start()
+            log_msg("控制台指令: 触发重启微信客户端")
+            self._send_json({"ok": True, "message": "微信正在重启中..."})
+        elif parsed.path == "/api/restart_daemon":
+            def _restart_dm():
+                time.sleep(0.8)
+                subprocess.call(["sudo", "systemctl", "restart", "wechat-bot"])
+            threading.Thread(target=_restart_dm, daemon=True).start()
+            log_msg("控制台指令: 触发重启 wechat-bot 服务")
+            self._send_json({"ok": True, "message": "机器人服务正在重启..."})
         elif parsed.path == "/api/config":
             cfg = load_config()
-            for k in ("auto_reply", "trigger_mode", "bot_names", "system_prompt"):
+            for k in ("auto_reply", "trigger_mode", "bot_names", "system_prompt", "amap_api_key", "admin_password"):
                 if k in body:
                     cfg[k] = body[k]
             save_config(cfg)
-            log_msg(f"已更新配置: trigger_mode={cfg.get('trigger_mode')}, bot_names={cfg.get('bot_names')}")
+            log_msg(f"控制台更新配置: trigger_mode={cfg.get('trigger_mode')}, auto_reply={cfg.get('auto_reply')}")
             self._send_json({"ok": True})
-        elif parsed.path == "/api/read_chat":
-            img, wins = capture_screen_pil()
-            if not wins:
-                self._send_json({"ok": False, "error": "No WeChat window"})
-                return
-            w = wins[0]
-            prompt = body.get("prompt", "请完整读取当前微信窗口中的群名、左侧会话列表以及右侧最新聊天记录内容，按条列出。")
-            box = (w["x"], w["y"], w["x"] + w["width"], w["y"] + w["height"])
-            buf = io.BytesIO()
-            img.crop(box).save(buf, format="PNG")
-            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}},
-                ],
-            }]
-            res = call_routed_llm("gemini", "gemini-3.8-flash", messages, timeout=35)
-            summary = res["choices"][0]["message"]["content"].strip()
-            self._send_json({"ok": True, "summary": summary})
         else:
             self.send_error(404)
 
