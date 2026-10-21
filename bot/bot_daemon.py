@@ -529,7 +529,12 @@ def find_wechat_windows(d):
             pass
 
     walk(root)
-    wins.sort(key=lambda item: item["width"] * item["height"], reverse=True)
+    # Prioritize official main WeChat window (name == 'WeChat' or '微信') first, then larger subwindows
+    def _win_rank(item):
+        n = (item["name"] or "").strip().lower()
+        is_main = 1 if (n == "wechat" or n == "微信") else 0
+        return (is_main, item["width"] * item["height"])
+    wins.sort(key=_win_rank, reverse=True)
     return wins
 
 
@@ -563,20 +568,34 @@ def x11_click(x, y):
 
 def check_and_dismiss_logout_modal(img=None):
     """
-    检测并自动解除微信退出登录模态弹窗：
-    通过 X11 窗口树检测是否存在微信弹出的模态对话框 (width < 450, height < 300)；
-    若检测到，根据弹窗实际几何坐标精准计算出【取消】按钮的位置并点击，随后补发 Escape 键，
-    彻底杜绝任何模态窗口阻塞主聊天窗口事件循环与按键队列。
+    检测并自动解除微信退出登录模态弹窗或残留的全屏大图查看器：
+    1. 通过 X11 窗口树检测是否存在微信弹出的模态对话框 (width < 450, height < 300)；
+       若检测到，根据弹窗实际几何坐标精准计算出【取消】按钮的位置并点击，随后补发 Escape 键；
+    2. 检测是否存在残留全屏图片查看器 (width > 1000, height > 600, 无名或非主窗口)，
+       自动补发 Escape 键将其关闭，确保实时监控与发消息永远聚焦在主聊天窗口。
     """
     try:
         d = display.Display(":99")
         try:
             wins = find_wechat_windows(d)
             modal_win = None
+            viewer_win = None
             for w in wins:
                 if 180 < w["width"] < 450 and 100 < w["height"] < 300:
                     modal_win = w
                     break
+                elif w["width"] > 1000 and w["height"] > 600 and (w["name"] or "").strip().lower() not in ("wechat", "微信"):
+                    viewer_win = w
+                    break
+
+            if viewer_win:
+                log_msg(f"⚠️ 自动检测到微信大图查看器残留窗口 (id={viewer_win['id']}, size={viewer_win['width']}x{viewer_win['height']})，正在按 Esc 自动关闭...")
+                esc_kc = d.keysym_to_keycode(XK.XK_Escape)
+                xtest.fake_input(d, X.KeyPress, esc_kc)
+                xtest.fake_input(d, X.KeyRelease, esc_kc)
+                d.sync()
+                time.sleep(0.15)
+                return True
 
             if modal_win:
                 cx = modal_win["x"] + int(modal_win["width"] * 0.72)
@@ -950,11 +969,16 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
         "messages": messages,
     }
 
-    target_temp = temperature if temperature is not None else cfg.get("temperature", 0.75)
-    try:
-        payload["temperature"] = float(target_temp)
-    except (ValueError, TypeError):
-        payload["temperature"] = 0.75
+    if provider == "kimi":
+        # Note: Kimi Coding API (kimi-for-coding-highspeed) strictly only supports temperature=1,
+        # passing other values returns HTTP 400: 'invalid temperature: only 1 is allowed for this model'.
+        pass
+    else:
+        target_temp = temperature if temperature is not None else cfg.get("temperature", 0.75)
+        try:
+            payload["temperature"] = float(target_temp)
+        except (ValueError, TypeError):
+            payload["temperature"] = 0.75
 
     if tools:
         payload["tools"] = tools
