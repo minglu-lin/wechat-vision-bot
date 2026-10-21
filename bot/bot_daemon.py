@@ -2437,8 +2437,9 @@ HTML_PAGE = """<!DOCTYPE html>
     <div class="tabs">
       <div class="tab active" onclick="showTab(0)">💬 手动发消息</div>
       <div class="tab" onclick="showTab(1)">🤖 机器人控制</div>
-      <div class="tab" onclick="showTab(2)">🛠️ 进程管理</div>
-      <div class="tab" onclick="showTab(3)">📜 实时日志</div>
+      <div class="tab" onclick="showTab(2)">🔍 搜索 Key 池</div>
+      <div class="tab" onclick="showTab(3)">🛠️ 进程管理</div>
+      <div class="tab" onclick="showTab(4)">📜 实时日志</div>
     </div>
 
     <!-- Tab 0: Manual Send -->
@@ -2489,8 +2490,28 @@ HTML_PAGE = """<!DOCTYPE html>
       <button class="action-btn" onclick="saveConfig()">💾 保存配置</button>
     </div>
 
-    <!-- Tab 2: Process & Recovery -->
+    <!-- Tab 2: Serper Key Pool -->
     <div class="tab-content" id="tab-2">
+      <div class="card-header" style="margin-bottom:6px;">
+        <h2>🔍 Serper Google 搜索 API Key 池</h2>
+        <button class="view-btn" onclick="loadSerperKeys()">🔄 刷新列表</button>
+      </div>
+      <p style="font-size:12px; color:#94a3b8; margin-bottom:12px; line-height:1.5;">
+        系统接入了 Serper.dev Google 全网检索。每个免费 Key 拥有 2,500 次查询额度。当主力 Key 额度耗尽（HTTP 403）时，系统会自动将其废弃并无缝切入下一个后备 Key！
+      </p>
+
+      <label style="font-weight:600; margin-bottom:6px; display:block;">当前可用 Key 列表 (按优先调用顺序排列)：</label>
+      <div id="serper-keys-list" style="margin-bottom:14px;">正在加载 Key 池...</div>
+
+      <label style="font-weight:600; margin-bottom:6px; display:block;">➕ 添加新的后备 Serper API Key：</label>
+      <textarea id="input-new-serper-keys" rows="3" placeholder="在此粘贴新申请的 Serper API Key (支持一次输入一个或多个，换行、空格或逗号分隔即可)..."></textarea>
+      <button class="action-btn" onclick="addSerperKeys()">🚀 立即添加到后备池</button>
+
+      <div id="serper-exhausted-list" style="margin-top:14px; display:none;"></div>
+    </div>
+
+    <!-- Tab 3: Process & Recovery -->
+    <div class="tab-content" id="tab-3">
       <label>微信与系统进程状态：</label>
       <div id="proc-info" style="font-size:12px; background:#050811; padding:8px 10px; border-radius:6px; border:1px solid #1e293b; font-family:monospace; margin-bottom:12px;">加载中...</div>
 
@@ -2501,8 +2522,8 @@ HTML_PAGE = """<!DOCTYPE html>
       </div>
     </div>
 
-    <!-- Tab 3: Realtime Logs -->
-    <div class="tab-content" id="tab-3">
+    <!-- Tab 4: Realtime Logs -->
+    <div class="tab-content" id="tab-4">
       <div class="card-header" style="margin-bottom:6px;">
         <span style="font-size:12px; color:#94a3b8;">自动更新 (2s/次)</span>
         <button class="view-btn" onclick="fetchLogs()">🔄 刷新日志</button>
@@ -2763,11 +2784,100 @@ async function loadInitialConfig() {
   } catch (e) {}
 }
 
+async function loadSerperKeys() {
+  try {
+    const res = await fetch('/api/serper_keys');
+    const d = await res.json();
+    if (d.ok) {
+      renderSerperKeys(d);
+    }
+  } catch (e) {}
+}
+
+function renderSerperKeys(d) {
+  const container = document.getElementById('serper-keys-list');
+  if (!d.active_keys || d.active_keys.length === 0) {
+    container.innerHTML = '<div style="color:#ef4444; font-size:13px; padding:10px; background:rgba(239,68,68,0.12); border-radius:6px; border:1px solid rgba(239,68,68,0.3);">⚠️ 当前无可用 Key，联网搜索将自动降级使用维基百科与必应搜索</div>';
+    return;
+  }
+  let html = '';
+  d.active_keys.forEach((k, idx) => {
+    const isPri = idx === 0;
+    const tag = isPri ? '<span class="badge badge-ok">当前主力 (优先调用)</span>' : `<span class="badge badge-info">后备 #${idx}</span>`;
+    html += `
+      <div style="display:flex; align-items:center; justify-content:space-between; background:#050811; border:1px solid #1e293b; padding:8px 12px; border-radius:6px; margin-bottom:6px;">
+        <div style="display:flex; align-items:center; gap:8px;">
+          <span style="font-family:monospace; font-size:13px; color:#f1f5f9;">${k.masked}</span>
+          ${tag}
+        </div>
+        <button class="tool-btn btn-danger" style="flex:none; min-width:auto; padding:3px 10px; font-size:11px;" onclick="removeSerperKey('${k.key}')">🗑️ 废弃/移除</button>
+      </div>
+    `;
+  });
+  container.innerHTML = html;
+
+  const exhContainer = document.getElementById('serper-exhausted-list');
+  if (d.exhausted_keys && d.exhausted_keys.length > 0) {
+    let exhHtml = '<label style="margin-top:14px; color:#94a3b8; font-size:12px; font-weight:600; display:block;">已自动废弃的失效/用尽 Key 记录 (最近20条)：</label>';
+    d.exhausted_keys.forEach(e => {
+      exhHtml += `
+        <div style="font-size:11px; color:#64748b; font-family:monospace; padding:5px 0; border-bottom:1px dashed #1e293b;">
+          ❌ ${e.masked || e.key} — ${e.discarded_at} (${e.reason || '额度用完'})
+        </div>
+      `;
+    });
+    exhContainer.innerHTML = exhHtml;
+    exhContainer.style.display = 'block';
+  } else {
+    exhContainer.style.display = 'none';
+  }
+}
+
+async function addSerperKeys() {
+  const txt = document.getElementById('input-new-serper-keys').value.trim();
+  if (!txt) {
+    toast('请输入要添加的 Serper Key');
+    return;
+  }
+  try {
+    const res = await fetch('/api/serper_keys/add', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: txt})
+    });
+    const d = await res.json();
+    if (d.ok) {
+      toast(`成功添加 ${d.added || 1} 个 Key 到后备池！`);
+      document.getElementById('input-new-serper-keys').value = '';
+      loadSerperKeys();
+    } else {
+      toast('添加失败: ' + (d.error || ''));
+    }
+  } catch (e) { toast('添加网络异常'); }
+}
+
+async function removeSerperKey(key) {
+  if (!confirm('确定要从后备池中移除此 Key 吗？')) return;
+  try {
+    const res = await fetch('/api/serper_keys/remove', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({key: key})
+    });
+    const d = await res.json();
+    if (d.ok) {
+      toast('已成功移除 Key');
+      loadSerperKeys();
+    }
+  } catch (e) { toast('移除网络异常'); }
+}
+
 function logout() {
   window.location.href = '/logout';
 }
 
 loadInitialConfig();
+loadSerperKeys();
 fetchStatus();
 setInterval(fetchStatus, 2500);
 setInterval(forceRefreshScreen, 3000);
@@ -2916,6 +3026,9 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             })
         elif parsed.path == "/api/history":
             self._send_json({"ok": True, "history": get_recent(30)})
+        elif parsed.path == "/api/serper_keys":
+            from plugins.serper_pool import get_serper_pool_status
+            self._send_json(get_serper_pool_status())
         else:
             self.send_error(404)
 
@@ -3019,6 +3132,19 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             save_config(cfg)
             log_msg(f"控制台更新配置: trigger_mode={cfg.get('trigger_mode')}, auto_reply={cfg.get('auto_reply')}, temp={cfg.get('temperature')}")
             self._send_json({"ok": True})
+        elif parsed.path == "/api/serper_keys/add":
+            from plugins.serper_pool import add_serper_keys, get_serper_pool_status
+            keys_input = body.get("keys") or body.get("key") or ""
+            added_cnt, _ = add_serper_keys(keys_input)
+            log_msg(f"控制台指令: 新增 {added_cnt} 个 Serper API Key 到后备池")
+            self._send_json({"ok": True, "added": added_cnt, "pool": get_serper_pool_status()})
+        elif parsed.path == "/api/serper_keys/remove":
+            from plugins.serper_pool import remove_serper_key, get_serper_pool_status
+            target_key = body.get("key", "").strip()
+            removed, _ = remove_serper_key(target_key)
+            masked = f"{target_key[:6]}...{target_key[-4:]}" if len(target_key) >= 10 else target_key
+            log_msg(f"控制台指令: 手动移除 Serper API Key: {masked}")
+            self._send_json({"ok": True, "removed": removed, "pool": get_serper_pool_status()})
         else:
             self.send_error(404)
 

@@ -9,6 +9,7 @@ import urllib.request
 import json
 import re
 from .base import BasePlugin
+from .serper_pool import get_serper_keys, discard_exhausted_serper_key
 
 
 class NetworkPlugin(BasePlugin):
@@ -113,20 +114,10 @@ class WebSearchPlugin(BasePlugin):
             return {"error": "未提供搜索关键词"}
 
         items = []
-        serper_key = os.environ.get("SERPER_API_KEY", "").strip()
-        if not serper_key:
-            try:
-                cfg_path = "/home/opc/wechat_bot/config.json"
-                if not os.path.exists(cfg_path):
-                    cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
-                if os.path.exists(cfg_path):
-                    with open(cfg_path, "r", encoding="utf-8") as cf:
-                        serper_key = json.load(cf).get("serper_api_key", "").strip()
-            except Exception:
-                pass
-
-        # 1. Primary: Serper.dev Google Search API (Covers Domestic & Global platforms with real-time Google index)
-        if serper_key:
+        # 1. Primary: Serper.dev Google Search API Key Pool (Covers Domestic & Global platforms with real-time Google index)
+        # Automatic key failover: when a key runs out of credits (403), auto-discard and try next key seamlessly!
+        serper_keys = get_serper_keys()
+        for serper_key in serper_keys:
             try:
                 s_req = urllib.request.Request(
                     "https://google.serper.dev/search",
@@ -138,6 +129,15 @@ class WebSearchPlugin(BasePlugin):
                 )
                 with urllib.request.urlopen(s_req, timeout=7) as r:
                     s_data = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+                # Check for quota/credit error in JSON body
+                if isinstance(s_data, dict):
+                    err_msg = str(s_data.get("message") or "")
+                    sc = s_data.get("statusCode")
+                    if sc in (401, 403, 429) or any(w in err_msg.lower() for w in ["unauthorized", "not enough credits", "credit", "quota"]):
+                        masked = f"{serper_key[:6]}...{serper_key[-4:]}" if len(serper_key) >= 10 else serper_key
+                        discard_exhausted_serper_key(serper_key, reason=err_msg or "Credits exhausted")
+                        continue
 
                 ab = s_data.get("answerBox")
                 if isinstance(ab, dict):
@@ -167,8 +167,21 @@ class WebSearchPlugin(BasePlugin):
                             "snippet": (f"[{date_str}] {snippet}" if date_str else snippet),
                             "url": org.get("link", ""),
                         })
-            except Exception:
-                pass
+
+                if items:
+                    break
+            except urllib.error.HTTPError as he:
+                masked = f"{serper_key[:6]}...{serper_key[-4:]}" if len(serper_key) >= 10 else serper_key
+                if he.code in (401, 403, 429) or "credit" in str(he).lower():
+                    discard_exhausted_serper_key(serper_key, reason=f"HTTP {he.code}: {he.reason}")
+                    continue
+                else:
+                    continue
+            except Exception as e:
+                err_s = str(e).lower()
+                if any(w in err_s for w in ["401", "403", "unauthorized", "credit"]):
+                    discard_exhausted_serper_key(serper_key, reason=str(e))
+                    continue
 
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
