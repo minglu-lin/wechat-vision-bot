@@ -116,7 +116,7 @@ class WebSearchPlugin(BasePlugin):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
         items = []
-        q_tokens = [tok.lower() for tok in re.split(r'[\s,，。？！?!""\'']+', q) if len(tok) >= 2]
+        q_tokens = [tok.lower() for tok in re.split(r'[\s,，。？！?!"\']+', q) if len(tok) >= 2]
         if not q_tokens and q:
             q_tokens = [q.lower()]
 
