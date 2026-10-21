@@ -1193,22 +1193,26 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
     ]
     res = None
     last_v_err = None
-    for v_attempt in range(2):
+    vision_models = [
+        ("gemini-3.1-flash-lite", None),
+        ("gemini-3.8-flash", "low"),
+    ]
+    for v_attempt, (v_model, v_effort) in enumerate(vision_models):
         try:
             res = call_routed_llm(
                 "gemini",
-                "gemini-3.8-flash",
+                v_model,
                 messages,
-                timeout=18,
+                timeout=15,
                 temperature=0.1,
-                reasoning_effort="low",
+                reasoning_effort=v_effort,
             )
             break
         except Exception as ve:
             last_v_err = ve
-            log_msg(f"视觉读图请求异常 (第 {v_attempt+1}/2 次): {ve}")
+            log_msg(f"视觉读图请求异常 [{v_model}] (第 {v_attempt+1}/2 次): {ve}")
             if v_attempt == 0:
-                time.sleep(0.8)
+                time.sleep(0.4)
     if res is None:
         raise last_v_err
 
@@ -1569,12 +1573,42 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 break
 
         if card_title:
-            user_query += (
-                f"\n【重要任务：群友正在要求阅读与评价/分析分享的文章】：\n"
-                f"- 分享文章标题：《{card_title}》\n"
-                f"- 媒体/发布来源：{card_source or '权威新闻媒体'}\n"
-                f"- 核心要求：群友正在要求你阅读并评价/分析这篇分享的文章！由于微信卡片只展示了部分标题，你【必须立即使用 $web_search 联网搜索工具】检索该文章的完整报道正文与真实事件细节！在完整阅读了真实正文后，再进行全面、客观、深入有依据的分析评价！绝对严禁仅凭标题凭空推测或说‘光从标题看’！\n"
-            )
+            if plugin_manager:
+                log_msg(f"【前置联网搜索】检测到分享卡片《{card_title}》，先调用 Serper Google 搜索 API 获取全文报道再交由 AI 整理判断...")
+                pre_res = plugin_manager.execute_tool("web_search", {"query": f"{card_title} {card_source}".strip()})
+                if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
+                    user_query += (
+                        f"\n\n【系统已预先通过 Google (Serper API) 检索到该分享文章《{card_title}》的权威报道摘要】：\n"
+                        f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
+                        f"【核心要求】：请直接结合上述检索到的真实事件细节进行全面、客观、深入的分析评价，无需再次调用搜索工具！\n"
+                    )
+                    tools = None
+            if tools is not None:
+                user_query += (
+                    f"\n【重要任务：群友正在要求阅读与评价/分析分享的文章】：\n"
+                    f"- 分享文章标题：《{card_title}》\n"
+                    f"- 媒体/发布来源：{card_source or '权威新闻媒体'}\n"
+                    f"- 核心要求：请使用 web_search 检索该文章的真实事件细节后再进行分析评价。\n"
+                )
+        else:
+            # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
+            clean_q = re.sub(r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s,，:：、?!？！]*', '', content.strip(), flags=re.IGNORECASE).strip()
+            search_intent_kws = [
+                "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
+                "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "行情", "汇率", "百科", "历史", "事件",
+                "真假", "真的吗", "搜", "查", "名人", "教授", "大学", "博士", "法院", "判决", "公司",
+                "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
+            ]
+            if plugin_manager and len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws):
+                log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{clean_q}'")
+                pre_res = plugin_manager.execute_tool("web_search", {"query": clean_q})
+                if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
+                    log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
+                    user_query += (
+                        f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具）】：\n"
+                        f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
+                    )
+                    tools = None
 
     user_content_payload = user_query
     if provider == "gemini" and image_info and image_info.get("has_image") and os.path.exists("/tmp/wechat_last_photo.png"):

@@ -105,17 +105,75 @@ class WebSearchPlugin(BasePlugin):
     }
 
     def execute(self, query: str, **kwargs) -> dict:
+        import os
         import urllib.parse
         import html as html_lib
         q = (query or "").strip()
         if not q:
             return {"error": "未提供搜索关键词"}
 
+        items = []
+        serper_key = os.environ.get("SERPER_API_KEY", "").strip()
+        if not serper_key:
+            try:
+                cfg_path = "/home/opc/wechat_bot/config.json"
+                if not os.path.exists(cfg_path):
+                    cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "config.json")
+                if os.path.exists(cfg_path):
+                    with open(cfg_path, "r", encoding="utf-8") as cf:
+                        serper_key = json.load(cf).get("serper_api_key", "").strip()
+            except Exception:
+                pass
+
+        # 1. Primary: Serper.dev Google Search API (Covers Domestic & Global platforms with real-time Google index)
+        if serper_key:
+            try:
+                s_req = urllib.request.Request(
+                    "https://google.serper.dev/search",
+                    data=json.dumps({"q": q, "gl": "cn", "hl": "zh-cn", "num": 6}).encode("utf-8"),
+                    headers={
+                        "X-API-KEY": serper_key,
+                        "Content-Type": "application/json",
+                    },
+                )
+                with urllib.request.urlopen(s_req, timeout=7) as r:
+                    s_data = json.loads(r.read().decode("utf-8", errors="ignore"))
+
+                ab = s_data.get("answerBox")
+                if isinstance(ab, dict):
+                    ab_snip = ab.get("answer") or ab.get("snippet") or ""
+                    if ab_snip:
+                        items.append({
+                            "title": ab.get("title", "Google 精选摘要"),
+                            "snippet": str(ab_snip),
+                            "url": ab.get("link", ""),
+                        })
+
+                kg = s_data.get("knowledgeGraph")
+                if isinstance(kg, dict) and kg.get("description"):
+                    items.append({
+                        "title": f"{kg.get('title', q)} ({kg.get('type', '知识图谱')})",
+                        "snippet": str(kg.get("description", "")),
+                        "url": kg.get("descriptionLink", ""),
+                    })
+
+                for org in s_data.get("organic", [])[:6]:
+                    title = (org.get("title") or "").strip()
+                    snippet = (org.get("snippet") or "").strip()
+                    date_str = (org.get("date") or "").strip()
+                    if title and snippet:
+                        items.append({
+                            "title": title,
+                            "snippet": (f"[{date_str}] {snippet}" if date_str else snippet),
+                            "url": org.get("link", ""),
+                        })
+            except Exception:
+                pass
+
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        items = []
         q_tokens = [tok.lower() for tok in re.split(r'[\s,，。？！?!"\']+', q) if len(tok) >= 2]
         if not q_tokens and q:
             q_tokens = [q.lower()]
@@ -124,23 +182,24 @@ class WebSearchPlugin(BasePlugin):
             combined = (title_str + " " + snippet_str).lower()
             return any(tok in combined for tok in q_tokens)
 
-        # 1. Primary: Chinese Wikipedia API (0.2s, structured JSON, never returns anti-scraper poison)
-        try:
-            wiki_url = f"https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q)}&utf8=1&format=json"
-            w_req = urllib.request.Request(wiki_url, headers={"User-Agent": "WeChatBot/1.0 (https://github.com/minglu-lin/wechat-vision-bot)"})
-            with urllib.request.urlopen(w_req, timeout=5) as r:
-                w_data = json.loads(r.read().decode("utf-8", errors="ignore"))
-            for entry in w_data.get("query", {}).get("search", [])[:4]:
-                c_title = html_lib.unescape(re.sub(r'<[^>]+>', '', entry.get("title", "")).strip())
-                c_snip = html_lib.unescape(re.sub(r'<[^>]+>', '', entry.get("snippet", "")).strip())
-                if c_title and c_snip and is_relevant(c_title, c_snip):
-                    items.append({
-                        "title": f"{c_title} - 维基百科",
-                        "snippet": c_snip,
-                        "url": f"https://zh.wikipedia.org/wiki/{urllib.parse.quote(c_title)}",
-                    })
-        except Exception:
-            pass
+        # 2. Fallback: Chinese Wikipedia API (if Serper returned no results)
+        if not items:
+            try:
+                wiki_url = f"https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q)}&utf8=1&format=json"
+                w_req = urllib.request.Request(wiki_url, headers={"User-Agent": "WeChatBot/1.0 (https://github.com/minglu-lin/wechat-vision-bot)"})
+                with urllib.request.urlopen(w_req, timeout=5) as r:
+                    w_data = json.loads(r.read().decode("utf-8", errors="ignore"))
+                for entry in w_data.get("query", {}).get("search", [])[:4]:
+                    c_title = html_lib.unescape(re.sub(r'<[^>]+>', '', entry.get("title", "")).strip())
+                    c_snip = html_lib.unescape(re.sub(r'<[^>]+>', '', entry.get("snippet", "")).strip())
+                    if c_title and c_snip and is_relevant(c_title, c_snip):
+                        items.append({
+                            "title": f"{c_title} - 维基百科",
+                            "snippet": c_snip,
+                            "url": f"https://zh.wikipedia.org/wiki/{urllib.parse.quote(c_title)}",
+                        })
+            except Exception:
+                pass
 
         # 2. Secondary: Bing search with strict relevance filter (blocks fake decoy results like 淘宝/小红书/Google翻译)
         if len(items) < 3:
