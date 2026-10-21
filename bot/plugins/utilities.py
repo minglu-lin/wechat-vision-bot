@@ -84,13 +84,20 @@ class UtilitiesPlugin(BasePlugin):
 
     def format_fast_reply(self, result: dict) -> str:
         if "error" in result:
-            return f"决策失败：{result['error']}"
+            return "没看清候选项，你列几个我帮选。"
 
         act = result.get("action")
         if act == "coin":
-            return f"抛硬币结果：{result['result']}"
+            side = result['result'].replace("🪙 ", "").strip()
+            return f"抛了下硬币，是{side}。"
         elif act == "dice":
-            return f"🎲 掷骰子结果 (1~{result['dice_max']})：{result['result']} 点"
+            return f"掷了下骰子，{result['result']} 点。"
         else:
-            opts_str = "、".join(result.get("options", []))
-            return f"🎯 帮选结果：在【{opts_str}】中，我推荐选 👉【{result.get('chosen')}】！"
+            chosen = result.get("chosen", "")
+            replies = [
+                f"那就选 {chosen}。",
+                f"纠结的话听我的，选 {chosen}。",
+                f"选 {chosen} 吧。",
+                f"我看 {chosen} 行。",
+            ]
+            return random.choice(replies)

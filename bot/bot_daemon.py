@@ -924,9 +924,9 @@ def extract_image_via_clipboard(px, py):
                 pass
 
 
-def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65):
+def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65, temperature: float = None):
     """
-    通用多模型分流调用引擎，统一调度 Kimi 与 Gemini 两大服务商。
+    通用多模型分流调用引擎，统一调度 Kimi 与 Gemini 两大服务商，原生支持 temperature。
     """
     cfg = load_config()
     if provider == "kimi":
@@ -949,6 +949,13 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
         "model": model_name,
         "messages": messages,
     }
+
+    target_temp = temperature if temperature is not None else cfg.get("temperature", 0.75)
+    try:
+        payload["temperature"] = float(target_temp)
+    except (ValueError, TypeError):
+        payload["temperature"] = 0.75
+
     if tools:
         payload["tools"] = tools
 
@@ -1283,6 +1290,37 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         lines = [f"[{h['time']}] {h['sender']}: {h['content']}" for h in recent_history]
         history_str = "【群聊最近上下文记录（供参考理解语境、代词与话题连贯性）】：\n" + "\n".join(lines) + "\n\n"
 
+    # Dynamic scene intent detection for length & style control
+    content_lower = content.lower()
+    is_deep_eval = any(kw in content_lower for kw in [
+        "评价", "分析", "解读", "怎么看", "如何看", "你怎么认为", "深度", "对比", "优缺点", "讲了什么", "研报", "总结", "详细说", "为什么"
+    ]) or (quote_info and any(kw in str(quote_info.get("quoted_content", "")).lower() for kw in ["《", "http", "mp.weixin.qq.com"]))
+
+    is_factual_lookup = any(kw in content_lower for kw in [
+        "推荐", "哪家", "哪里", "买衣服", "商场", "餐馆", "美食", "攀岩", "酒吧", "健身房", "地铁", "路线", "怎么走", "多少钱", "汇率", "天气", "价格", "报错", "怎么解决", "怎么配", "代码"
+    ])
+
+    is_chat_banter = not is_deep_eval and not is_factual_lookup and len(content.strip()) < 30
+
+    if is_chat_banter:
+        scene_guidance = (
+            "- 当前对话场景：群聊日常闲聊/吐槽/轻松接话。\n"
+            "- 回复篇幅：极简，通常1~2句话即可，就像真实群友在微信随手打字。\n"
+            "- 表达要点：接住对方的情绪、笑点或最值得接的那句话。严禁长篇大论、严禁列数字清单、严禁在结尾追加反问或套话。"
+        )
+    elif is_deep_eval:
+        scene_guidance = (
+            "- 当前对话场景：观点分析/新闻解读/深度提问。\n"
+            "- 回复篇幅：根据分析深度自然展开，说透核心逻辑。\n"
+            "- 表达要点：先给结论和关键依据，再结合真实事实展开分析，观点客观鲜明，有理有据，避免废话。"
+        )
+    else:
+        scene_guidance = (
+            "- 当前对话场景：信息查询/生活推荐/技术问答。\n"
+            "- 回复篇幅：简明直接，就事论事。\n"
+            "- 表达要点：直接给出推荐结果、核心数据或解决方案与关键理由，不拖泥带水，不用客服客套。"
+        )
+
     system_instruction = (
         f"{sys_prompt}\n"
         f"【当前系统时间】：{now_str}（北京时间）。\n"
@@ -1314,11 +1352,22 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"- 严禁使用任何星号粗体（如 **文字**）、斜体（*文字*）、反引号代码框（`文字`）或 # 标题符！\n"
         f"- 严禁使用 LaTeX 数学公式符号（如 $...$ 或 $$...$$）；\n"
         f"- 必须输出如同普通人在微信打字一样的纯文本（Plain Text）。列项时可直接使用数字编号（如 1. 2.）或圆点符号（• ），重点内容直接写出，切勿加粗或带语法标记。\n"
-        f"【回答规范与要求】：\n"
-        f"1. 回答篇幅根据问题需要自然展开即可，不需要死板限制在 1~3 句以内。简单问题简明直接，需要查询或解释的问题要把事情说清楚、回答透彻、内容充实有用。\n"
-        f"2. 结合上面的最近聊天记录，准确理解群友话语中的代词（如‘这句话’、‘刚才说的’、‘他’、‘那个’等）以及话题脉络，保持连贯记忆。\n"
-        f"3. 保持沉稳、自然、客观的朋友口吻，分寸感要好，不用太俏皮，严禁客服腔和AI味。严禁与群友抬杠、辩解或刻意戏谑调侃。\n"
-        f"4. 直接输出面向群友的最终纯文本回答，严禁输出任何‘我查一下’、‘稍等’等过渡性碎碎念，绝对严禁输出任何代码、JSON、搜索函数名或 `$web_search` 等内部指令标签！"
+        f"【场景与回答规范】：\n"
+        f"{scene_guidance}\n"
+        f"- 结合最近聊天记录，准确理解群友话语中的代词（如‘这句话’、‘刚才说的’、‘他’、‘那个’等）以及话题脉络，保持连贯记忆。\n"
+        f"- 保持好相处、自然、松弛的朋友口吻，分寸感要好，严禁客服腔和AI味。严禁‘很高兴为您解答’‘希望对您有所帮助’‘如有其他问题欢迎随时提问’等任何客服模板套话。\n"
+        f"- 直接输出面向群友的最终纯文本回答，严禁输出任何‘我查一下’、‘稍等’等过渡性碎碎念，绝对严禁输出任何代码、JSON、搜索函数名或 `$web_search` 等内部指令标签！\n\n"
+        f"【群聊表达示范（仅参考语气、节奏与精简度，严禁机械重复）】：\n"
+        f"群友：周一又不想上班。\n"
+        f"bot：才周一，电量已经见底了。\n"
+        f"群友：你说得太长了。\n"
+        f"bot：行，我说短点。\n"
+        f"群友：这个方案肯定没问题吧？\n"
+        f"bot：我还不敢打包票，主要看那个前提能不能成立。\n"
+        f"群友：北京西站附近有啥好吃的？\n"
+        f"bot：南广场出来走两步有家老字号炙子烤肉，或者北广场食宝街转转，看你想吃快餐还是踏实坐下吃。\n"
+        f"群友：今天怎么这么冷？\n"
+        f"bot：冷空气突袭降温贼猛，出门裹紧大衣别冻着。"
     )
 
     user_query = f"{sender}: {content}"
@@ -1470,6 +1519,18 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     return final_reply or clean_bot_reply(msg.get("content", "").strip())
 
 
+def get_persona_error_reply(query_text=""):
+    import random
+    candidates = [
+        "刚才网络抖了一下没连上，过会儿我再瞅瞅。",
+        "脑子卡了一下刚才没查出来，稍等我再试下。",
+        "刚才网络波动没连上，过会儿再试。",
+        "网络刚才卡了下没发出来，过会儿再问我试试。",
+        "刚才走神了没连上，过两分钟再问我试试。"
+    ]
+    return random.choice(candidates)
+
+
 def safe_generate_and_reply(target, cfg, recent_history):
     """
     执行带有自动排错、多级兜底与防丢单重试机制的回复生成与发送。
@@ -1519,7 +1580,7 @@ def safe_generate_and_reply(target, cfg, recent_history):
         try:
             log_msg(f"触发必须回应紧急保底回复机制 (sender={s}, query={c[:25]})")
             recover_wechat_ui_state()
-            emergency_reply = f"收到你的提问：\"{c[:35]}\"。刚才网络或接口处理稍有波动，请稍后再试或换个问法，我随时在！"
+            emergency_reply = get_persona_error_reply(c)
             ok, _ = x11_send_text(emergency_reply)
             if ok:
                 save_msg("bot", emergency_reply, is_bot=True)
@@ -1989,6 +2050,9 @@ HTML_PAGE = """<!DOCTYPE html>
       <label>小号触发关键词 (英文逗号分隔)：</label>
       <input type="text" id="bot-names" placeholder="@, bot, AIbot, Bot, BOT">
 
+      <label>模型回复发散度 Temperature (0.1 ~ 1.5，日常群聊推荐 0.75)：</label>
+      <input type="number" id="temperature" step="0.05" min="0.1" max="1.5" placeholder="0.75">
+
       <label>高德地图 WebKey (查美食与出行)：</label>
       <input type="text" id="amap-key" placeholder="可选高德 Web 服务 Key">
 
@@ -2194,11 +2258,12 @@ async function saveConfig() {
   const auto_reply = document.getElementById('auto-reply').value === 'true';
   const trigger_mode = document.getElementById('trigger-mode').value;
   const bot_names = document.getElementById('bot-names').value.split(',').map(s => s.trim()).filter(Boolean);
+  const temperature = parseFloat(document.getElementById('temperature').value) || 0.75;
   const amap_api_key = document.getElementById('amap-key').value.trim();
   const system_prompt = document.getElementById('sys-prompt').value.trim();
   const new_password = document.getElementById('new-pwd').value.trim();
 
-  const payload = {auto_reply, trigger_mode, bot_names, amap_api_key, system_prompt};
+  const payload = {auto_reply, trigger_mode, bot_names, temperature, amap_api_key, system_prompt};
   if (new_password) payload.admin_password = new_password;
 
   try {
@@ -2267,6 +2332,7 @@ async function loadInitialConfig() {
       document.getElementById('auto-reply').value = String(d.config.auto_reply !== false);
       document.getElementById('trigger-mode').value = d.config.trigger_mode || 'mention_only';
       document.getElementById('bot-names').value = (d.config.bot_names || ['@']).join(', ');
+      document.getElementById('temperature').value = d.config.temperature !== undefined ? d.config.temperature : 0.75;
       document.getElementById('amap-key').value = d.config.amap_api_key || '';
       document.getElementById('sys-prompt').value = d.config.system_prompt || '';
     }
@@ -2532,11 +2598,11 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "message": "机器人服务正在重启..."})
         elif parsed.path == "/api/config":
             cfg = load_config()
-            for k in ("auto_reply", "trigger_mode", "bot_names", "system_prompt", "amap_api_key", "admin_password"):
+            for k in ("auto_reply", "trigger_mode", "bot_names", "system_prompt", "amap_api_key", "admin_password", "temperature"):
                 if k in body:
                     cfg[k] = body[k]
             save_config(cfg)
-            log_msg(f"控制台更新配置: trigger_mode={cfg.get('trigger_mode')}, auto_reply={cfg.get('auto_reply')}")
+            log_msg(f"控制台更新配置: trigger_mode={cfg.get('trigger_mode')}, auto_reply={cfg.get('auto_reply')}, temp={cfg.get('temperature')}")
             self._send_json({"ok": True})
         else:
             self.send_error(404)

@@ -121,6 +121,6 @@ class CalculatorPlugin(BasePlugin):
 
     def format_fast_reply(self, result: dict) -> str:
         if "error" in result:
-            return f"计算失败：{result['error']}"
+            return f"算不出来：{result['error']}"
 
-        return f"🧮 计算结果：{result['expression']} = {result['formatted']}"
+        return f"{result['expression']} = {result['formatted']}"

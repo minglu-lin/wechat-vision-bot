@@ -173,9 +173,9 @@ class GenerateImagePlugin(BasePlugin):
 
     def format_fast_reply(self, result: dict) -> str:
         if "error" in result:
-            return f"绘画失败：{result['error']}"
-        action = "重制好照片" if result.get("is_remix") else "画好"
-        return f"🎨 已经为你{action}并发送到群里啦：【{result.get('prompt')}】"
+            return f"作图出了点问题：{result['error']}"
+        action = "重制好了" if result.get("is_remix") else "画好了"
+        return f"{action}，图发在上面了。"
 
 
 class SearchImagePlugin(BasePlugin):
@@ -272,5 +272,5 @@ class SearchImagePlugin(BasePlugin):
 
     def format_fast_reply(self, result: dict) -> str:
         if "error" in result:
-            return f"搜图失败：{result['error']}"
-        return f"🖼️ 已经为你找到并发送了【{result.get('keywords')}】的图片！"
+            return f"搜图出了点问题：{result['error']}"
+        return "图发在上面了，瞅瞅合不合适。"
