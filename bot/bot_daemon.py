@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import urllib.request
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -1633,10 +1634,10 @@ def get_persona_error_reply(query_text=""):
     return random.choice(candidates)
 
 
-def safe_generate_and_reply(target, cfg, recent_history):
+def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pre_send_check_fn=None):
     """
     执行带有自动排错、多级兜底与防丢单重试机制的回复生成与发送。
-    确保 @AIbot / bot 消息绝不漏回。
+    确保 @AIbot / bot 消息绝不漏回，支持多用户并发队列 @昵称 区分与思考期新消息检测。
     """
     s = target["sender"]
     c = target["content"]
@@ -1646,6 +1647,7 @@ def safe_generate_and_reply(target, cfg, recent_history):
 
     max_attempts = 3 if is_explicit else 2
     reply_content = ""
+    concurrent_arrival = False
 
     for attempt in range(1, max_attempts + 1):
         try:
@@ -1659,12 +1661,20 @@ def safe_generate_and_reply(target, cfg, recent_history):
                 image_info=img_info,
             )
             if reply_content and reply_content.strip():
+                if pre_send_check_fn:
+                    try:
+                        if pre_send_check_fn():
+                            concurrent_arrival = True
+                    except Exception:
+                        pass
+                if (prefix_sender or concurrent_arrival) and s and s not in ("群友", "未知", "bot") and not reply_content.startswith(f"@{s}"):
+                    reply_content = f"@{s} {reply_content}"
                 ok, send_res = x11_send_text(reply_content)
                 if ok:
                     save_msg("bot", reply_content, is_bot=True)
                     mark_seen("bot", reply_content)
                     mark_seen(s, c)
-                    return True, reply_content
+                    return True, reply_content, concurrent_arrival
                 else:
                     log_msg(f"x11 发送文本失败: {send_res}，尝试 UI 自愈排错...")
                     recover_wechat_ui_state()
@@ -1683,16 +1693,18 @@ def safe_generate_and_reply(target, cfg, recent_history):
             log_msg(f"触发必须回应紧急保底回复机制 (sender={s}, query={c[:25]})")
             recover_wechat_ui_state()
             emergency_reply = get_persona_error_reply(c)
+            if (prefix_sender or concurrent_arrival) and s and s not in ("群友", "未知", "bot"):
+                emergency_reply = f"@{s} {emergency_reply}"
             ok, _ = x11_send_text(emergency_reply)
             if ok:
                 save_msg("bot", emergency_reply, is_bot=True)
                 mark_seen("bot", emergency_reply)
                 mark_seen(s, c)
-                return True, emergency_reply
+                return True, emergency_reply, concurrent_arrival
         except Exception as ee:
             log_msg(f"紧急保底回复发送失败: {ee}")
 
-    return False, ""
+    return False, "", concurrent_arrival
 
 
 def find_unread_badge_in_sidebar(img, w):
@@ -1715,9 +1727,18 @@ def find_unread_badge_in_sidebar(img, w):
 def monitor_loop():
     prev_crop = None
     anim_mask = None
+    force_rescan = False
+    reply_task_queue = deque()
     last_check_reply_ts = 0.0
     global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text, last_send_ts
-    log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + Web Search + Local Memory)")
+    log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + FIFO 任务队列 + Local Memory)")
+
+    def is_in_task_queue(sender, content):
+        norm_c = re.sub(r"\s+", "", content or "")
+        for item in reply_task_queue:
+            if item.get("sender") == sender and re.sub(r"\s+", "", item.get("content") or "") == norm_c:
+                return True
+        return False
 
     while True:
         try:
@@ -1743,30 +1764,32 @@ def monitor_loop():
                 img.crop(box).save("/tmp/wechat_win.png")
 
                 if w["width"] >= 550 and cfg.get("auto_reply", True):
-                    # Auto-click unread red badge in sidebar if any
-                    badge_pos = find_unread_badge_in_sidebar(img, w)
-                    if badge_pos:
-                        log_msg(f"检测到左侧会话列表红点未读消息，自动点击打开: {badge_pos}")
-                        x11_click(badge_pos[0], badge_pos[1])
-                        time.sleep(0.6)
-                        img, wins = capture_screen_pil()
-                        anim_mask = None
+                    # Auto-click unread red badge in sidebar if any (only when current queue is empty)
+                    if not reply_task_queue:
+                        badge_pos = find_unread_badge_in_sidebar(img, w)
+                        if badge_pos:
+                            log_msg(f"检测到左侧会话列表红点未读消息，自动点击打开: {badge_pos}")
+                            x11_click(badge_pos[0], badge_pos[1])
+                            time.sleep(0.6)
+                            img, wins = capture_screen_pil()
+                            anim_mask = None
 
-                    # Check if right panel has an open chat
-                    if time.time() - last_send_ts > 2.5:
-                        rx1 = w["x"] + int(w["width"] * 0.33)
-                        ry1 = w["y"] + int(w["height"] * 0.38)
-                        rx2 = w["x"] + int(w["width"] * 0.80)
-                        ry2 = w["y"] + w["height"] - 140
-                        cur_crop = img.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                    rx1 = w["x"] + int(w["width"] * 0.33)
+                    ry1 = w["y"] + int(w["height"] * 0.38)
+                    rx2 = w["x"] + int(w["width"] * 0.80)
+                    ry2 = w["y"] + w["height"] - 140
+                    cur_crop = img.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
 
+                    # 阶段一 (Producer)：检测画面新动态或思考期插话，扫描并推入 FIFO 任务队列
+                    if force_rescan or (time.time() - last_send_ts > 2.2):
                         if prev_crop is not None:
                             diff = ImageChops.difference(cur_crop, prev_crop)
-                            if anim_mask is not None:
+                            if anim_mask is not None and not force_rescan:
                                 diff.paste(0, mask=anim_mask)
                             mean_diff = ImageStat.Stat(diff).mean[0]
-                            if mean_diff > 1.2 and (time.time() - last_check_reply_ts > 2.0):
-                                log_msg(f"检测到聊天窗口新动态 (diff={mean_diff:.2f})，分析最新消息...")
+                            if force_rescan or (mean_diff > 1.2 and (time.time() - last_check_reply_ts > 1.8)):
+                                log_msg(f"检测到聊天窗口新动态 (diff={mean_diff:.2f}, force={force_rescan})，分析最新消息...")
+                                force_rescan = False
                                 time.sleep(0.25)
                                 img2, _ = capture_screen_pil()
                                 chat_box = (
@@ -1803,8 +1826,8 @@ def monitor_loop():
                                         if not c:
                                             continue
 
-                                        # Deduplicate against recent seen messages
-                                        if is_recent_duplicate(s, c):
+                                        # Deduplicate against recent seen messages & pending queue
+                                        if is_recent_duplicate(s, c) or is_in_task_queue(s, c):
                                             continue
 
                                         new_msg_count += 1
@@ -1883,12 +1906,21 @@ def monitor_loop():
                                         log_msg(f"消息队列提取: sender={s}, content={c[:30]}, is_explicit={is_explicit}, is_m={is_m}, valid_f={valid_followup}, valid_q={valid_quote_reply}, should_reply={should_reply}")
 
                                         if should_reply:
+                                            if isinstance(img_info, dict) and img_info.get("has_image") and img_info.get("_crop_box"):
+                                                try:
+                                                    cb = tuple(img_info["_crop_box"])
+                                                    buf = io.BytesIO()
+                                                    chat_img.crop(cb).save(buf, format="PNG")
+                                                    img_info["_img_bytes"] = buf.getvalue()
+                                                except Exception:
+                                                    pass
                                             reply_candidates.append({
                                                 "sender": s,
                                                 "content": c,
                                                 "quote": q_info,
                                                 "image": img_info,
                                                 "is_explicit": is_explicit,
+                                                "is_direct": bool(is_explicit or is_m or valid_quote_reply),
                                             })
                                         else:
                                             # 不需要回复的消息，直接标记为已处理
@@ -1908,55 +1940,96 @@ def monitor_loop():
                                     prev_crop = new_crop
 
                                     if reply_candidates:
-                                        # 优先挑出所有带有显式呼叫 (is_explicit) 的消息依次回复，绝不漏回任何一条 @bot
-                                        explicit_targets = [t for t in reply_candidates if t.get("is_explicit")]
-                                        targets_to_process = explicit_targets if explicit_targets else [reply_candidates[-1]]
+                                        # 所有直接提问 (@bot / 引用bot) 全部按时间顺序入队；纯追问取最新一条入队
+                                        direct_targets = [t for t in reply_candidates if t.get("is_direct")]
+                                        targets_to_enqueue = direct_targets if direct_targets else [reply_candidates[-1]]
                                         for cand in reply_candidates:
-                                            if cand not in targets_to_process:
+                                            if cand not in targets_to_enqueue:
                                                 mark_seen(cand["sender"], cand["content"])
-
-                                        for target in targets_to_process:
-                                            s = target["sender"]
-                                            c = target["content"]
-                                            t_img = target.get("image") or {}
-                                            if isinstance(t_img, dict) and t_img.get("has_image") and t_img.get("_crop_box"):
-                                                try:
-                                                    cb = tuple(t_img["_crop_box"])
-                                                    chat_img.crop(cb).save("/tmp/wechat_last_photo.png")
-                                                    log_msg(f"已按需裁剪待回复消息关联图片并保存至 /tmp/wechat_last_photo.png: box={cb}")
-                                                    if "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
-                                                        spos = t_img["_screen_pos"]
-                                                        extract_image_via_clipboard(spos[0], spos[1], "/tmp/wechat_last_photo.png")
-                                                except Exception as ie:
-                                                    log_msg(f"按需提取消息图片异常: {ie}")
-
-                                            recent_history = get_recent(limit=15)
-                                            success, sent_text = safe_generate_and_reply(target, cfg, recent_history)
-                                            if success:
-                                                last_recorded_text = sent_text
-                                                last_reply_text = sent_text
-                                                last_bot_reply_ts = time.time()
-                                                last_replied_user = s
-                                                log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
-                                                time.sleep(0.8)
-                                                img3, _ = capture_screen_pil()
-                                                prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
-                                                anim_mask = None
-                                                last_send_ts = time.time()
-                                            else:
-                                                log_msg("本次回复未成功，保持未标记已读状态，重置画面快照触发下轮重试")
-                                                prev_crop = None
+                                        for t in targets_to_enqueue:
+                                            if not is_in_task_queue(t["sender"], t["content"]):
+                                                if len(targets_to_enqueue) > 1 or len(reply_task_queue) > 0:
+                                                    t["multi_user"] = True
+                                                reply_task_queue.append(t)
+                                                log_msg(f"[任务队列] 新提问入队: sender={t['sender']}, content={t['content'][:25]} (当前队列长度: {len(reply_task_queue)})")
                                 except Exception as ke:
                                     log_msg(f"消息处理异常 (保留 prev_crop 以便下轮立即重试): {ke}")
                         else:
                             prev_crop = cur_crop
+
+                    # 阶段二 (Consumer)：从 FIFO 任务队列取出队首任务执行回复
+                    if reply_task_queue:
+                        if len(reply_task_queue) > 1:
+                            for item in reply_task_queue:
+                                item["multi_user"] = True
+                        target = reply_task_queue.popleft()
+                        s = target["sender"]
+                        c = target["content"]
+                        log_msg(f"[任务队列] 开始处理队首任务 (剩余排队: {len(reply_task_queue)} 条): sender={s}, content={c[:30]}")
+
+                        t_img = target.get("image") or {}
+                        if isinstance(t_img, dict) and t_img.get("has_image"):
+                            try:
+                                if t_img.get("_img_bytes"):
+                                    with open("/tmp/wechat_last_photo.png", "wb") as pf:
+                                        pf.write(t_img["_img_bytes"])
+                                    log_msg(f"已从队列缓存恢复待回复消息图片至 /tmp/wechat_last_photo.png ({len(t_img['_img_bytes'])} 字节)")
+                                if not reply_task_queue and "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
+                                    spos = t_img["_screen_pos"]
+                                    extract_image_via_clipboard(spos[0], spos[1], "/tmp/wechat_last_photo.png")
+                            except Exception as ie:
+                                log_msg(f"按需提取消息图片异常: {ie}")
+
+                        def check_new_msg_during_thinking():
+                            if prev_crop is None:
+                                return False
+                            img_chk, _ = capture_screen_pil()
+                            chk_crop = img_chk.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                            d_chk = ImageChops.difference(chk_crop, prev_crop)
+                            if anim_mask is not None:
+                                d_chk.paste(0, mask=anim_mask)
+                            m_chk = ImageStat.Stat(d_chk).mean[0]
+                            if m_chk > 1.2:
+                                log_msg(f"检测到模型思考期间群聊有新消息插入 (diff={m_chk:.2f})，本条发送后将立即扫描入队！")
+                                return True
+                            return False
+
+                        recent_history = get_recent(limit=15)
+                        need_prefix = bool(target.get("multi_user") or len(reply_task_queue) > 0)
+                        success, sent_text, had_concurrent_msg = safe_generate_and_reply(
+                            target,
+                            cfg,
+                            recent_history,
+                            prefix_sender=need_prefix,
+                            pre_send_check_fn=check_new_msg_during_thinking,
+                        )
+                        if success:
+                            last_recorded_text = sent_text
+                            last_reply_text = sent_text
+                            last_bot_reply_ts = time.time()
+                            last_replied_user = s
+                            log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
+                            time.sleep(0.7)
+                            if had_concurrent_msg:
+                                # 思考期间有人发了新消息！不覆盖 prev_crop，立即在下一轮触发视觉扫描把新消息排入队列
+                                force_rescan = True
+                                last_send_ts = 0.0
+                                last_check_reply_ts = 0.0
+                            else:
+                                img3, _ = capture_screen_pil()
+                                prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                anim_mask = None
+                                last_send_ts = time.time()
+                        else:
+                            log_msg("本次回复未成功，保持未标记已读状态，重置画面快照触发下轮重试")
+                            prev_crop = None
                 else:
                     prev_crop = None
                     anim_mask = None
         except Exception as e:
             log_msg(f"Monitor error: {e}")
 
-        time.sleep(1.2)
+        time.sleep(0.5 if reply_task_queue or force_rescan else 1.2)
 
 
 LOGIN_HTML = """<!DOCTYPE html>
