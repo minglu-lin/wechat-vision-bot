@@ -1036,7 +1036,8 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
     if provider == "kimi":
         # Note: Kimi Coding API (kimi-for-coding-highspeed) strictly only supports temperature=1,
         # passing other values returns HTTP 400: 'invalid temperature: only 1 is allowed for this model'.
-        pass
+        # Disable internal thinking/CoT to prevent raw English/Chinese reasoning from leaking into content and cut latency by 50%.
+        payload["thinking"] = {"type": "disabled"}
     else:
         target_temp = temperature if temperature is not None else cfg.get("temperature", 0.75)
         try:
@@ -1276,6 +1277,14 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
 def clean_bot_reply(text):
     if not text:
         return ""
+
+    # 0. Strip <think>...</think> blocks or leaked internal CoT / pseudo-tool monologues (e.g. "公办 func... Execute search. Use tools... ）")
+    text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    if any(k in text for k in ["Execute search", "Use tools", "Let's search", "Let's call", "tool_calls", "web_search("]):
+        # If leaked CoT ends with ） or ) followed by Chinese text, strip the leaked prefix
+        m_cot = re.search(r'(?:Execute search|Use tools|Let\'s search|Let\'s call)[\s\S]*?[）\)]\s*(?=[\u4e00-\u9fa5])', text)
+        if m_cot:
+            text = text[m_cot.end():].strip()
 
     # 1. Strip raw tool search directives and JSON query blocks
     text = re.sub(r'\$web_search(?::\d+)?\s*\{[^}]*\}', '', text)
@@ -1591,7 +1600,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     f"- 核心要求：请使用 web_search 检索该文章的真实事件细节后再进行分析评价。\n"
                 )
         else:
-            # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
+            # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
             clean_q = re.sub(r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s,，:：、?!？！]*', '', content.strip(), flags=re.IGNORECASE).strip()
             search_intent_kws = [
                 "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
@@ -1599,9 +1608,17 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 "真假", "真的吗", "搜", "查", "名人", "教授", "大学", "博士", "法院", "判决", "公司",
                 "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
             ]
-            if plugin_manager and len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws):
-                log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{clean_q}'")
-                pre_res = plugin_manager.execute_tool("web_search", {"query": clean_q})
+            expand_followup_kws = ["展开", "细说", "详细", "具体", "多说", "深入", "再查", "深挖", "更多细节", "详细讲"]
+            quoted_text_clean = str((quote_info or {}).get("quoted_content", "")).strip()
+            is_expand_with_quote = bool(quoted_text_clean and any(kw in clean_q for kw in expand_followup_kws))
+            if plugin_manager and ((len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
+                search_query_str = clean_q
+                if is_expand_with_quote:
+                    # Extract key topic from the first clause/sentence of the quoted content so Serper searches the actual subject
+                    first_clause = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
+                    search_query_str = f"{first_clause} {clean_q}".strip()
+                log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
+                pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
                 if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
                     log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
                     user_query += (
@@ -1643,7 +1660,6 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
 
             if active_tools and (choice.get("finish_reason") == "tool_calls" or msg.get("tool_calls")) and msg.get("tool_calls"):
                 log_msg(f"模型 ({target_model}) 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
-                messages.append(msg)
                 for tc in msg["tool_calls"][:2]:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"].get("arguments", "{}")
@@ -1655,12 +1671,18 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     res_str = json.dumps(tool_res, ensure_ascii=False) if isinstance(tool_res, (dict, list)) else str(tool_res)
                     log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:120]}")
                     collected_tool_outputs.append(f"[{fn_name}({fn_args})]: {res_str}")
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": fn_name,
-                        "content": res_str,
-                    })
+                # 重要修复：第 2 轮禁用 tools 时，切勿在 messages 中保留 assistant.tool_calls 与 role='tool'，
+                # 否则 Kimi 在缺少 tools 定义时会发生模板解析错乱并把内部英文思考过程 (Execute search. Use tools...) 泄露进正文！
+                # 直接将工具返回结果组装为干净的单轮 user 上下文交由第 2 轮直接整理输出：
+                synth_query = (
+                    user_query
+                    + "\n\n【系统已通过实时工具/Google (Serper API) 检索到的参考资料（请直接据此整理、判断并输出最终纯中文回答，严禁输出任何思考过程或工具调用指令）】：\n"
+                    + "\n".join(collected_tool_outputs)
+                )
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": synth_query},
+                ]
                 continue
 
             content_text = (msg.get("content") or "").strip()
