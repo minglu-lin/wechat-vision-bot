@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-from PIL import Image, ImageChops, ImageStat
+from PIL import Image, ImageChops, ImageFilter, ImageStat
 try:
     from Xlib import X, XK, display
     from Xlib.ext import xtest
@@ -966,9 +966,9 @@ def extract_image_via_clipboard(px, py):
                 pass
 
 
-def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65, temperature: float = None):
+def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65, temperature: float = None, reasoning_effort: str = None):
     """
-    通用多模型分流调用引擎，统一调度 Kimi 与 Gemini 两大服务商，原生支持 temperature。
+    通用多模型分流调用引擎，统一调度 Kimi 与 Gemini 两大服务商，原生支持 temperature 与 reasoning_effort。
     """
     cfg = load_config()
     if provider == "kimi":
@@ -1002,6 +1002,8 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
             payload["temperature"] = float(target_temp)
         except (ValueError, TypeError):
             payload["temperature"] = 0.75
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
 
     if tools:
         payload["tools"] = tools
@@ -1147,7 +1149,27 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             ],
         }
     ]
-    res = call_routed_llm("gemini", "gemini-3.8-flash", messages, timeout=45)
+    res = None
+    last_v_err = None
+    for v_attempt in range(2):
+        try:
+            res = call_routed_llm(
+                "gemini",
+                "gemini-3.8-flash",
+                messages,
+                timeout=18,
+                temperature=0.1,
+                reasoning_effort="low",
+            )
+            break
+        except Exception as ve:
+            last_v_err = ve
+            log_msg(f"视觉读图请求异常 (第 {v_attempt+1}/2 次): {ve}")
+            if v_attempt == 0:
+                time.sleep(0.8)
+    if res is None:
+        raise last_v_err
+
     text = res["choices"][0]["message"]["content"].strip()
     if text.startswith("```"):
         text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
@@ -1176,16 +1198,13 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
                                 min(ch, int(ymax * ch / 1000))
                             )
                             if crop_box[2] - crop_box[0] > 20 and crop_box[3] - crop_box[1] > 20:
-                                chat_img.crop(crop_box).save("/tmp/wechat_last_photo.png")
-                                log_msg(f"成功定位并裁剪群聊中的真实图片: {crop_box} -> /tmp/wechat_last_photo.png")
-
-                                # 方案B: 若有窗口坐标，通过剪贴板直接提取解密原始大图
+                                ref_img["_crop_box"] = list(crop_box)
                                 if chat_box:
                                     screen_cx = chat_box[0] + int(((xmin + xmax) / 2) * (chat_box[2] - chat_box[0]) / 1000)
                                     screen_cy = chat_box[1] + int(((ymin + ymax) / 2) * (chat_box[3] - chat_box[1]) / 1000)
-                                    extract_image_via_clipboard(screen_cx, screen_cy)
+                                    ref_img["_screen_pos"] = [screen_cx, screen_cy]
                         except Exception as ce:
-                            log_msg(f"裁剪图片失败: {ce}")
+                            log_msg(f"计算图片坐标失败: {ce}")
             if isinstance(msgs, list):
                 return msgs
             elif "content" in data:
@@ -1532,15 +1551,15 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     ]
 
     final_reply = ""
-    msg = {}
-    for loop_idx in range(3):
+    collected_tool_outputs = []
+    for loop_idx in range(4):
         try:
             log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮...")
-            res = call_routed_llm(provider, target_model, messages, tools=tools, timeout=65)
+            res = call_routed_llm(provider, target_model, messages, tools=tools, timeout=32)
             choice = res["choices"][0]
             msg = choice["message"]
 
-            if choice.get("finish_reason") == "tool_calls" and msg.get("tool_calls"):
+            if (choice.get("finish_reason") == "tool_calls" or msg.get("tool_calls")) and msg.get("tool_calls"):
                 log_msg(f"模型 ({target_model}) 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
                 messages.append(msg)
                 for tc in msg["tool_calls"]:
@@ -1553,6 +1572,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                         tool_res = {"error": "Plugin manager not loaded"}
                     res_str = json.dumps(tool_res, ensure_ascii=False) if isinstance(tool_res, (dict, list)) else str(tool_res)
                     log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:120]}")
+                    collected_tool_outputs.append(f"[{fn_name}({fn_args})]: {res_str}")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc["id"],
@@ -1561,27 +1581,44 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     })
                 continue
 
-            content_text = msg.get("content", "").strip()
+            content_text = (msg.get("content") or "").strip()
             final_reply = clean_bot_reply(content_text)
-            break
+            if final_reply:
+                break
         except Exception as e:
             log_msg(f"模型 [{provider}/{target_model}] 请求异常 (第 {loop_idx+1} 轮): {e}")
-            # 容灾自动分流降级：如果 Kimi 超时或出错，无缝切换 Gemini 3.8 Flash 兜底
+            # 容灾自动分流降级：如果 Kimi 超时或出错（含400内容过滤），无缝切换 Gemini 3.8 Flash 兜底
             if provider == "kimi":
-                log_msg("Kimi 服务调用异常，自动切换备用 Gemini 3.8 Flash 进行快速容灾重试...")
+                log_msg("Kimi 服务调用异常，重置干净上下文并自动切换备用 Gemini 3.8 Flash 进行快速容灾重试...")
                 provider = "gemini"
                 target_model = "gemini-3.8-flash"
                 route_reason = "Kimi 异常容灾降级"
+                fallback_query = user_query
+                if collected_tool_outputs:
+                    fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
+                    tools = None
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": fallback_query},
+                ]
                 continue
             # 如果 Gemini 4 Argon 异常，降级至 Gemini 3.8 Flash
             elif target_model == "gemini-4-argon":
-                log_msg("Gemini 4 Argon 异常，降级至 Gemini 3.8 Flash 继续重试...")
+                log_msg("Gemini 4 Argon 异常，重置上下文并降级至 Gemini 3.8 Flash 继续重试...")
                 target_model = "gemini-3.8-flash"
                 route_reason = "Argon 异常容灾降级"
+                fallback_query = user_query
+                if collected_tool_outputs:
+                    fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
+                    tools = None
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": fallback_query},
+                ]
                 continue
             break
 
-    return final_reply or clean_bot_reply(msg.get("content", "").strip())
+    return final_reply
 
 
 def get_persona_error_reply(query_text=""):
@@ -1677,6 +1714,7 @@ def find_unread_badge_in_sidebar(img, w):
 
 def monitor_loop():
     prev_crop = None
+    anim_mask = None
     last_check_reply_ts = 0.0
     global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text, last_send_ts
     log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + Web Search + Local Memory)")
@@ -1710,11 +1748,12 @@ def monitor_loop():
                     if badge_pos:
                         log_msg(f"检测到左侧会话列表红点未读消息，自动点击打开: {badge_pos}")
                         x11_click(badge_pos[0], badge_pos[1])
-                        time.sleep(0.8)
+                        time.sleep(0.6)
                         img, wins = capture_screen_pil()
+                        anim_mask = None
 
                     # Check if right panel has an open chat
-                    if time.time() - last_send_ts > 4.5:
+                    if time.time() - last_send_ts > 2.5:
                         rx1 = w["x"] + int(w["width"] * 0.33)
                         ry1 = w["y"] + int(w["height"] * 0.38)
                         rx2 = w["x"] + int(w["width"] * 0.80)
@@ -1723,10 +1762,12 @@ def monitor_loop():
 
                         if prev_crop is not None:
                             diff = ImageChops.difference(cur_crop, prev_crop)
+                            if anim_mask is not None:
+                                diff.paste(0, mask=anim_mask)
                             mean_diff = ImageStat.Stat(diff).mean[0]
-                            if mean_diff > 1.2 and (time.time() - last_check_reply_ts > 3.5):
+                            if mean_diff > 1.2 and (time.time() - last_check_reply_ts > 2.0):
                                 log_msg(f"检测到聊天窗口新动态 (diff={mean_diff:.2f})，分析最新消息...")
-                                time.sleep(0.6)
+                                time.sleep(0.25)
                                 img2, _ = capture_screen_pil()
                                 chat_box = (
                                     w["x"] + int(w["width"] * 0.29),
@@ -1735,7 +1776,7 @@ def monitor_loop():
                                     w["y"] + w["height"] - 125,
                                 )
                                 chat_img = img2.crop(chat_box)
-                                prev_crop = img2.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                new_crop = img2.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
                                 last_check_reply_ts = time.time()
 
                                 bot_names = cfg.get("bot_names", ["@"])
@@ -1748,6 +1789,7 @@ def monitor_loop():
                                     )
 
                                     reply_candidates = []
+                                    new_msg_count = 0
 
                                     for msg_item in raw_msgs:
                                         is_in = msg_item.get("is_incoming", True)
@@ -1764,6 +1806,8 @@ def monitor_loop():
                                         # Deduplicate against recent seen messages
                                         if is_recent_duplicate(s, c):
                                             continue
+
+                                        new_msg_count += 1
 
                                         # 检查是否为最高优先级强行召唤指令 (@AIbot 或 bot 开头)
                                         is_explicit = is_explicit_bot_invocation(c)
@@ -1850,42 +1894,69 @@ def monitor_loop():
                                             # 不需要回复的消息，直接标记为已处理
                                             mark_seen(s, c)
 
-                                    if reply_candidates:
-                                        # 优先挑出带有显式呼叫 (is_explicit) 的消息，如果有多条取最新一条
-                                        explicit_targets = [t for t in reply_candidates if t.get("is_explicit")]
-                                        target = explicit_targets[-1] if explicit_targets else reply_candidates[-1]
-                                        s = target["sender"]
-                                        c = target["content"]
-                                        is_explicit = target.get("is_explicit", False)
+                                    # 仅在视觉解析成功后才更新 prev_crop，防止超时/503报错吞掉群友消息
+                                    if new_msg_count == 0:
+                                        raw_diff = ImageChops.difference(new_crop, prev_crop)
+                                        m = raw_diff.point(lambda p: 255 if p > 8 else 0).filter(ImageFilter.MaxFilter(5))
+                                        if anim_mask is not None:
+                                            m = ImageChops.lighter(anim_mask, m)
+                                        if ImageStat.Stat(m).mean[0] < 115:
+                                            anim_mask = m
+                                            log_msg("检测到画面内原地动图/表情包闪烁 (无新消息)，已自动屏蔽动图区域像素波动")
+                                    else:
+                                        anim_mask = None
+                                    prev_crop = new_crop
 
-                                        recent_history = get_recent(limit=15)
-                                        success, sent_text = safe_generate_and_reply(target, cfg, recent_history)
-                                        if success:
-                                            last_recorded_text = sent_text
-                                            last_reply_text = sent_text
-                                            last_bot_reply_ts = time.time()
-                                            last_replied_user = s
-                                            log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
-                                            # 清理本批次其余非显式消息，避免堆积
-                                            for cand in reply_candidates:
-                                                if cand != target and not cand.get("is_explicit"):
-                                                    mark_seen(cand["sender"], cand["content"])
-                                            time.sleep(1.2)
-                                            img3, _ = capture_screen_pil()
-                                            prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
-                                            last_send_ts = time.time()
-                                        else:
-                                            log_msg(f"本次回复未成功，保持未标记已读状态，触发下轮重试")
+                                    if reply_candidates:
+                                        # 优先挑出所有带有显式呼叫 (is_explicit) 的消息依次回复，绝不漏回任何一条 @bot
+                                        explicit_targets = [t for t in reply_candidates if t.get("is_explicit")]
+                                        targets_to_process = explicit_targets if explicit_targets else [reply_candidates[-1]]
+                                        for cand in reply_candidates:
+                                            if cand not in targets_to_process:
+                                                mark_seen(cand["sender"], cand["content"])
+
+                                        for target in targets_to_process:
+                                            s = target["sender"]
+                                            c = target["content"]
+                                            t_img = target.get("image") or {}
+                                            if isinstance(t_img, dict) and t_img.get("has_image") and t_img.get("_crop_box"):
+                                                try:
+                                                    cb = tuple(t_img["_crop_box"])
+                                                    chat_img.crop(cb).save("/tmp/wechat_last_photo.png")
+                                                    log_msg(f"已按需裁剪待回复消息关联图片并保存至 /tmp/wechat_last_photo.png: box={cb}")
+                                                    if "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
+                                                        spos = t_img["_screen_pos"]
+                                                        extract_image_via_clipboard(spos[0], spos[1], "/tmp/wechat_last_photo.png")
+                                                except Exception as ie:
+                                                    log_msg(f"按需提取消息图片异常: {ie}")
+
+                                            recent_history = get_recent(limit=15)
+                                            success, sent_text = safe_generate_and_reply(target, cfg, recent_history)
+                                            if success:
+                                                last_recorded_text = sent_text
+                                                last_reply_text = sent_text
+                                                last_bot_reply_ts = time.time()
+                                                last_replied_user = s
+                                                log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
+                                                time.sleep(0.8)
+                                                img3, _ = capture_screen_pil()
+                                                prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                                anim_mask = None
+                                                last_send_ts = time.time()
+                                            else:
+                                                log_msg("本次回复未成功，保持未标记已读状态，重置画面快照触发下轮重试")
+                                                prev_crop = None
                                 except Exception as ke:
-                                    log_msg(f"消息处理异常: {ke}")
+                                    log_msg(f"消息处理异常 (保留 prev_crop 以便下轮立即重试): {ke}")
                         else:
                             prev_crop = cur_crop
                 else:
                     prev_crop = None
+                    anim_mask = None
         except Exception as e:
             log_msg(f"Monitor error: {e}")
 
-        time.sleep(2.0)
+        time.sleep(1.2)
 
 
 LOGIN_HTML = """<!DOCTYPE html>

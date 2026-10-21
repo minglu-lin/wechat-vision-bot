@@ -106,44 +106,68 @@ class WebSearchPlugin(BasePlugin):
 
     def execute(self, query: str, **kwargs) -> dict:
         import urllib.parse
+        import html as html_lib
         q = (query or "").strip()
         if not q:
             return {"error": "未提供搜索关键词"}
 
-        url = f"https://cn.bing.com/search?q={urllib.parse.quote(q)}"
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept-Language": "zh-CN,zh;q=0.9",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
+        items = []
+
+        # 1. Primary: DuckDuckGo HTML search (fast & high recall on overseas VPS)
         try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=8) as r:
-                html = r.read().decode("utf-8", errors="ignore")
+            ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
+            req = urllib.request.Request(ddg_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=6) as r:
+                ddg_html = r.read().decode("utf-8", errors="ignore")
+            blocks = re.findall(r'<div class="links_main[^>]*>(.*?)</div>\s*</div>', ddg_html, re.DOTALL)
+            for b in blocks[:5]:
+                t_m = re.search(r'class="result__a"[^>]*>(.*?)</a>', b, re.DOTALL)
+                s_m = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', b, re.DOTALL)
+                u_m = re.search(r'href="([^"]+)"', b)
+                if t_m and s_m:
+                    clean_title = html_lib.unescape(re.sub(r'<[^>]+>', '', t_m.group(1)).strip())
+                    clean_snippet = html_lib.unescape(re.sub(r'<[^>]+>', '', s_m.group(1)).strip())
+                    href = html_lib.unescape(u_m.group(1)) if u_m else ""
+                    if clean_title and clean_snippet:
+                        items.append({
+                            "title": clean_title,
+                            "snippet": clean_snippet,
+                            "url": href,
+                        })
+        except Exception:
+            pass
 
-            items = []
-            matches = re.findall(r'<li class="b_algo">.*?<h2><a\s+href="([^"]+)".*?>(.*?)</a></h2>.*?<p>(.*?)</p>', html, re.DOTALL)
-            for href, raw_title, raw_snippet in matches[:5]:
-                clean_title = re.sub(r'<[^>]+>', '', raw_title).strip()
-                clean_snippet = re.sub(r'<[^>]+>', '', raw_snippet).strip()
-                if clean_title and clean_snippet:
-                    items.append({
-                        "title": clean_title,
-                        "snippet": clean_snippet,
-                        "url": href,
-                    })
+        # 2. Fallback: Bing search with updated attribute-tolerant regex
+        if not items:
+            try:
+                url = f"https://www.bing.com/search?q={urllib.parse.quote(q)}&ensearch=0"
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    html = r.read().decode("utf-8", errors="ignore")
 
-            if not items:
-                snippets = re.findall(r'<p class="b_lineclamp\d*">(.*?)</p>', html)
-                for s in snippets[:4]:
-                    cs = re.sub(r'<[^>]+>', '', s).strip()
-                    if cs:
-                        items.append({"title": q, "snippet": cs, "url": ""})
+                for block in re.findall(r'<li class="b_algo"[^>]*>(.*?)</li>', html, re.DOTALL)[:5]:
+                    t_m = re.search(r'<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
+                    p_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
+                    if t_m and p_m:
+                        href = html_lib.unescape(t_m.group(1))
+                        clean_title = html_lib.unescape(re.sub(r'<[^>]+>', '', t_m.group(2)).strip())
+                        clean_snippet = html_lib.unescape(re.sub(r'<[^>]+>', '', p_m.group(1)).strip())
+                        if clean_title and clean_snippet:
+                            items.append({
+                                "title": clean_title,
+                                "snippet": clean_snippet,
+                                "url": href,
+                            })
+            except Exception as e:
+                return {"error": f"联网搜索请求失败: {e}"}
 
-            return {
-                "query": q,
-                "count": len(items),
-                "results": items if items else [{"snippet": f"已联网检索关键词‘{q}’，未发现明显异动网页。"}]
-            }
-        except Exception as e:
-            return {"error": f"联网搜索请求失败: {e}"}
+        return {
+            "query": q,
+            "count": len(items),
+            "results": items if items else [{"snippet": f"已联网检索关键词‘{q}’，未发现明显异动网页。"}]
+        }
 
