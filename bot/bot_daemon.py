@@ -2564,6 +2564,9 @@ function showTab(idx) {
   const contents = document.querySelectorAll('.tab-content');
   tabs.forEach((t, i) => t.className = 'tab' + (i === idx ? ' active' : ''));
   contents.forEach((c, i) => c.className = 'tab-content' + (i === idx ? ' active' : ''));
+  if (idx === 2) {
+    loadSerperKeys();
+  }
 }
 
 function getActualCoords(ev) {
