@@ -3153,6 +3153,6 @@ if __name__ == "__main__":
     init_db()
     t = threading.Thread(target=monitor_loop, daemon=True)
     t.start()
-    server = ThreadingHTTPServer(("127.0.0.1", 18890), BotHTTPHandler)
-    log_msg("HTTP 控制台已启动: http://127.0.0.1:18890")
+    server = ThreadingHTTPServer(("0.0.0.0", 18890), BotHTTPHandler)
+    log_msg("HTTP 控制台已启动: http://0.0.0.0:18890 (外网端口 18890)")
     server.serve_forever()
