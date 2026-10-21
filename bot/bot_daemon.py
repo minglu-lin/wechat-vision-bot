@@ -45,32 +45,53 @@ last_reply_text = ""
 last_recorded_text = ""
 last_bot_reply_ts = 0.0
 last_replied_user = ""
+import unicodedata
+
 seen_msg_timestamps = {}
 seen_content_timestamps = {}
 
 
-def is_recent_duplicate(sender, content, window=180):
+def normalize_dedup_sender(sender):
+    s = unicodedata.normalize("NFKC", (sender or "").strip()).lower()
+    s = re.sub(r"\(.*?\)", "", s)
+    s = re.sub(r"\s+", "", s)
+    return s or "群友"
+
+
+def normalize_dedup_text(content):
+    c = unicodedata.normalize("NFKC", (content or "").strip()).lower()
+    # Unify @AIbot / @Albot / @aibot / @bot OCR variations (capital I vs lowercase l)
+    c = re.sub(r"@\s*(?:aibot|albot|bot|微信小号)\b", "@bot", c)
+    c = re.sub(r"^(?:aibot|albot|bot)\b", "@bot", c)
+    c = re.sub(r"\s+", "", c)
+    return c
+
+
+def is_recent_duplicate(sender, content, window=86400):
     now = time.time()
-    c_clean = content.strip()
-    s_clean = sender.strip()
+    c_clean = normalize_dedup_text(content)
+    s_clean = normalize_dedup_sender(sender)
+    if not c_clean:
+        return True
     key_full = f"{s_clean}:::{c_clean}"
     if now - seen_msg_timestamps.get(key_full, 0) < window:
         return True
-    if len(c_clean) > 3 and now - seen_content_timestamps.get(c_clean, 0) < 60:
+    if now - seen_content_timestamps.get(c_clean, 0) < 3600:
         return True
     return False
 
 
 def mark_seen(sender, content):
     now = time.time()
-    c_clean = content.strip()
-    s_clean = sender.strip()
+    c_clean = normalize_dedup_text(content)
+    s_clean = normalize_dedup_sender(sender)
+    if not c_clean:
+        return
     key_full = f"{s_clean}:::{c_clean}"
     seen_msg_timestamps[key_full] = now
-    if c_clean:
-        seen_content_timestamps[c_clean] = now
-    if len(seen_msg_timestamps) > 300:
-        cutoff = now - 600
+    seen_content_timestamps[c_clean] = now
+    if len(seen_msg_timestamps) > 1000:
+        cutoff = now - 86400
         for k in [k for k, t in seen_msg_timestamps.items() if t < cutoff]:
             del seen_msg_timestamps[k]
         for k in [k for k, t in seen_content_timestamps.items() if t < cutoff]:
@@ -396,7 +417,11 @@ def fetch_url_content(url, timeout=10, max_chars=3500):
         return {"success": False, "url": url, "error": str(e)}
 
 
+last_processed_ts = 0.0
+
+
 def init_db():
+    global last_processed_ts
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -412,19 +437,34 @@ def init_db():
             )
         """)
         conn.commit()
+        # 启动时从数据库预热最近 100 条历史消息时间戳水位线，防止服务重启后重复识别/重复回复屏幕上残留的旧消息
+        cur.execute("SELECT ts, sender, content FROM messages ORDER BY id DESC LIMIT 100")
+        rows = cur.fetchall()
+        for r_ts, r_sender, r_content in rows:
+            ts_val = float(r_ts or time.time())
+            if ts_val > last_processed_ts:
+                last_processed_ts = ts_val
+            raw_c = re.sub(r"^\[(?:分享文章卡片|引用|附图):.*?\]\s*", "", r_content or "").strip()
+            for candidate_c in (r_content, raw_c):
+                c_clean = normalize_dedup_text(candidate_c)
+                s_clean = normalize_dedup_sender(r_sender)
+                if c_clean:
+                    seen_msg_timestamps[f"{s_clean}:::{c_clean}"] = ts_val
+                    seen_content_timestamps[c_clean] = ts_val
         conn.close()
+        log_msg(f"已从数据库预热 {len(rows)} 条历史消息时间戳索引 (当前水位线 ts={last_processed_ts:.2f})")
     except Exception as e:
         log_msg(f"Init DB error: {e}")
 
 
-def save_msg(sender, content, is_bot=False, is_mentioned=False):
+def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None):
     content = (content or "").strip()
     if not content:
         return
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
-        ts = time.time()
+        ts = float(msg_ts) if msg_ts is not None else time.time()
         now_str = datetime.now(TZ_BJ).strftime("%H:%M:%S")
         cur.execute(
             "INSERT INTO messages (ts, time_str, sender, content, is_bot, is_mentioned) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1334,7 +1374,7 @@ def clean_bot_reply(text):
     return "\n".join(cleaned_lines).strip()
 
 
-def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None):
+def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None, force_provider=None):
     # 0. Fast-Path Direct Execution (0 Token, <100ms ultra-low latency)
     if plugin_manager:
         matched, fast_reply = plugin_manager.match_fast_path(content)
@@ -1347,6 +1387,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     provider = route_info["provider"]
     target_model = route_info["model"]
     route_reason = route_info["reason"]
+    if force_provider == "gemini" and provider == "kimi":
+        provider = "gemini"
+        target_model = "gemini-3.8-flash"
+        route_reason = "重试强制切换 Gemini 3.8 Flash 兜底"
 
     plugin_tools = plugin_manager.get_openai_tools() if plugin_manager else []
     tools = plugin_tools
@@ -1554,17 +1598,19 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
 
     final_reply = ""
     collected_tool_outputs = []
-    for loop_idx in range(4):
+    for loop_idx in range(3):
         try:
-            log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮...")
-            res = call_routed_llm(provider, target_model, messages, tools=tools, timeout=32)
+            # 严格限制最多只允许第 1 轮 (loop_idx == 0) 触发工具调用；第 2 轮起强制 tools=None 直接根据已有信息+自身知识作答，彻底杜绝无限连环搜！
+            active_tools = tools if (loop_idx == 0 and not collected_tool_outputs) else None
+            log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮 (tools={'开' if active_tools else '关-强制总结'})...")
+            res = call_routed_llm(provider, target_model, messages, tools=active_tools, timeout=32)
             choice = res["choices"][0]
             msg = choice["message"]
 
-            if (choice.get("finish_reason") == "tool_calls" or msg.get("tool_calls")) and msg.get("tool_calls"):
+            if active_tools and (choice.get("finish_reason") == "tool_calls" or msg.get("tool_calls")) and msg.get("tool_calls"):
                 log_msg(f"模型 ({target_model}) 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
                 messages.append(msg)
-                for tc in msg["tool_calls"]:
+                for tc in msg["tool_calls"][:2]:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"].get("arguments", "{}")
                     log_msg(f"执行 API 插件: {fn_name}({fn_args})")
@@ -1587,6 +1633,21 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             final_reply = clean_bot_reply(content_text)
             if final_reply:
                 break
+            # 如果 Kimi 返回空内容，下一轮自动切 Gemini 兜底
+            if provider == "kimi":
+                log_msg("Kimi 返回空内容，自动切换备用 Gemini 3.8 Flash 直接生成回答...")
+                provider = "gemini"
+                target_model = "gemini-3.8-flash"
+                route_reason = "Kimi 空返回容灾降级"
+                fallback_query = user_query
+                if collected_tool_outputs:
+                    fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
+                tools = None
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": fallback_query},
+                ]
+                continue
         except Exception as e:
             log_msg(f"模型 [{provider}/{target_model}] 请求异常 (第 {loop_idx+1} 轮): {e}")
             # 容灾自动分流降级：如果 Kimi 超时或出错（含400内容过滤），无缝切换 Gemini 3.8 Flash 兜底
@@ -1598,7 +1659,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                    tools = None
+                tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": fallback_query},
@@ -1612,7 +1673,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                    tools = None
+                tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
                     {"role": "user", "content": fallback_query},
@@ -1660,6 +1721,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
                 recent_history=recent_history,
                 quote_info=q_info,
                 image_info=img_info,
+                force_provider="gemini" if attempt >= 2 else None,
             )
             if reply_content and reply_content.strip():
                 if pre_send_check_fn:
@@ -1735,9 +1797,10 @@ def monitor_loop():
     log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + FIFO 任务队列 + Local Memory)")
 
     def is_in_task_queue(sender, content):
-        norm_c = re.sub(r"\s+", "", content or "")
+        norm_c = normalize_dedup_text(content)
+        norm_s = normalize_dedup_sender(sender)
         for item in reply_task_queue:
-            if item.get("sender") == sender and re.sub(r"\s+", "", item.get("content") or "") == norm_c:
+            if normalize_dedup_sender(item.get("sender")) == norm_s and normalize_dedup_text(item.get("content")) == norm_c:
                 return True
         return False
 
@@ -1789,6 +1852,7 @@ def monitor_loop():
                                 diff.paste(0, mask=anim_mask)
                             mean_diff = ImageStat.Stat(diff).mean[0]
                             if force_rescan or (mean_diff > 1.2 and (time.time() - last_check_reply_ts > 1.8)):
+                                was_force_rescan = force_rescan
                                 log_msg(f"检测到聊天窗口新动态 (diff={mean_diff:.2f}, force={force_rescan})，分析最新消息...")
                                 force_rescan = False
                                 time.sleep(0.25)
@@ -1814,8 +1878,39 @@ def monitor_loop():
 
                                     reply_candidates = []
                                     new_msg_count = 0
+                                    batch_ts = time.time()
+                                    global last_processed_ts
 
-                                    for msg_item in raw_msgs:
+                                    # 1. 时间戳水位线与屏幕底部锚点定位 (cutoff_idx)：
+                                    # 微信窗口自上而下严格按时间由旧到新排列。只要某一行 idx 已经被记录在已处理时间戳索引中，
+                                    # 或（非并发补扫时）是机器人自己发出的绿色回复气泡，则位于它上方 (<= cutoff_idx) 的所有消息
+                                    # 必定早于或等于上一批次水位线 (ts <= last_processed_ts)，即使旧消息某次 OCR 有全半角/I与l差异也绝不重复纳入！
+                                    cutoff_idx = -1
+                                    for idx, m_item in enumerate(raw_msgs):
+                                        m_in = m_item.get("is_incoming", True)
+                                        m_s = m_item.get("sender", "群友")
+                                        m_c = (m_item.get("content") or "").strip()
+                                        if not m_c:
+                                            continue
+                                        if is_explicit_bot_invocation(m_c):
+                                            m_in = True
+                                        if not m_in:
+                                            mark_seen("bot", m_c)
+                                            if not was_force_rescan:
+                                                cutoff_idx = max(cutoff_idx, idx)
+                                        elif is_recent_duplicate(m_s, m_c) or is_in_task_queue(m_s, m_c):
+                                            cutoff_idx = max(cutoff_idx, idx)
+
+                                    # 将水位线及上方所有旧消息的当前 OCR 文本变体静默刷新至去重表，不纳入新批次
+                                    for idx in range(0, cutoff_idx + 1):
+                                        m_old = raw_msgs[idx]
+                                        c_old = (m_old.get("content") or "").strip()
+                                        if c_old:
+                                            mark_seen(m_old.get("sender", "群友"), c_old)
+
+                                    # 2. 仅对水位线下方 (idx > cutoff_idx) 的增量新消息打上新批次时间戳 batch_ts 并按批次处理
+                                    for idx in range(cutoff_idx + 1, len(raw_msgs)):
+                                        msg_item = raw_msgs[idx]
                                         is_in = msg_item.get("is_incoming", True)
                                         s = msg_item.get("sender", "群友")
                                         c = msg_item.get("content", "").strip()
@@ -1856,12 +1951,13 @@ def monitor_loop():
                                         if has_img and img_info.get("image_type"):
                                             rec_c = f"[附图: {img_info.get('image_type')}] " + rec_c
 
-                                        # Always save every message to local DB memory for continuity
-                                        save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m)
+                                        # 写入当前批次时间戳 batch_ts 并立即注册去重时间戳，防止重复纳入
+                                        save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m, msg_ts=batch_ts)
+                                        mark_seen(s, c)
+                                        last_processed_ts = batch_ts
 
                                         if not is_in:
                                             log_msg(f"提取自身发送消息: {c[:25]}，已记入本地历史")
-                                            mark_seen(s, c)
                                             continue
 
                                         # 1. Stop command detection (e.g. "bot 别接话", "闭嘴")

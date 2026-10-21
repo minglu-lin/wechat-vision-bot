@@ -116,58 +116,61 @@ class WebSearchPlugin(BasePlugin):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
         items = []
+        q_tokens = [tok.lower() for tok in re.split(r'[\s,，。？！?!""\'']+', q) if len(tok) >= 2]
+        if not q_tokens and q:
+            q_tokens = [q.lower()]
 
-        # 1. Primary: DuckDuckGo HTML search (fast & high recall on overseas VPS)
+        def is_relevant(title_str: str, snippet_str: str) -> bool:
+            combined = (title_str + " " + snippet_str).lower()
+            return any(tok in combined for tok in q_tokens)
+
+        # 1. Primary: Chinese Wikipedia API (0.2s, structured JSON, never returns anti-scraper poison)
         try:
-            ddg_url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(q)}"
-            req = urllib.request.Request(ddg_url, headers=headers)
-            with urllib.request.urlopen(req, timeout=6) as r:
-                ddg_html = r.read().decode("utf-8", errors="ignore")
-            blocks = re.findall(r'<div class="links_main[^>]*>(.*?)</div>\s*</div>', ddg_html, re.DOTALL)
-            for b in blocks[:5]:
-                t_m = re.search(r'class="result__a"[^>]*>(.*?)</a>', b, re.DOTALL)
-                s_m = re.search(r'class="result__snippet"[^>]*>(.*?)</a>', b, re.DOTALL)
-                u_m = re.search(r'href="([^"]+)"', b)
-                if t_m and s_m:
-                    clean_title = html_lib.unescape(re.sub(r'<[^>]+>', '', t_m.group(1)).strip())
-                    clean_snippet = html_lib.unescape(re.sub(r'<[^>]+>', '', s_m.group(1)).strip())
-                    href = html_lib.unescape(u_m.group(1)) if u_m else ""
-                    if clean_title and clean_snippet:
-                        items.append({
-                            "title": clean_title,
-                            "snippet": clean_snippet,
-                            "url": href,
-                        })
+            wiki_url = f"https://zh.wikipedia.org/w/api.php?action=query&list=search&srsearch={urllib.parse.quote(q)}&utf8=1&format=json"
+            w_req = urllib.request.Request(wiki_url, headers={"User-Agent": "WeChatBot/1.0 (https://github.com/minglu-lin/wechat-vision-bot)"})
+            with urllib.request.urlopen(w_req, timeout=5) as r:
+                w_data = json.loads(r.read().decode("utf-8", errors="ignore"))
+            for entry in w_data.get("query", {}).get("search", [])[:4]:
+                c_title = html_lib.unescape(re.sub(r'<[^>]+>', '', entry.get("title", "")).strip())
+                c_snip = html_lib.unescape(re.sub(r'<[^>]+>', '', entry.get("snippet", "")).strip())
+                if c_title and c_snip and is_relevant(c_title, c_snip):
+                    items.append({
+                        "title": f"{c_title} - 维基百科",
+                        "snippet": c_snip,
+                        "url": f"https://zh.wikipedia.org/wiki/{urllib.parse.quote(c_title)}",
+                    })
         except Exception:
             pass
 
-        # 2. Fallback: Bing search with updated attribute-tolerant regex
-        if not items:
+        # 2. Secondary: Bing search with strict relevance filter (blocks fake decoy results like 淘宝/小红书/Google翻译)
+        if len(items) < 3:
             try:
                 url = f"https://www.bing.com/search?q={urllib.parse.quote(q)}&ensearch=0"
                 req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=6) as r:
+                with urllib.request.urlopen(req, timeout=5) as r:
                     html = r.read().decode("utf-8", errors="ignore")
 
-                for block in re.findall(r'<li class="b_algo"[^>]*>(.*?)</li>', html, re.DOTALL)[:5]:
+                for block in re.findall(r'<li class="b_algo"[^>]*>(.*?)</li>', html, re.DOTALL)[:6]:
                     t_m = re.search(r'<h2[^>]*>.*?<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
                     p_m = re.search(r'<p[^>]*>(.*?)</p>', block, re.DOTALL)
                     if t_m and p_m:
                         href = html_lib.unescape(t_m.group(1))
                         clean_title = html_lib.unescape(re.sub(r'<[^>]+>', '', t_m.group(2)).strip())
                         clean_snippet = html_lib.unescape(re.sub(r'<[^>]+>', '', p_m.group(1)).strip())
-                        if clean_title and clean_snippet:
+                        if clean_title and clean_snippet and is_relevant(clean_title, clean_snippet):
                             items.append({
                                 "title": clean_title,
                                 "snippet": clean_snippet,
                                 "url": href,
                             })
-            except Exception as e:
-                return {"error": f"联网搜索请求失败: {e}"}
+            except Exception:
+                pass
 
         return {
             "query": q,
             "count": len(items),
-            "results": items if items else [{"snippet": f"已联网检索关键词‘{q}’，未发现明显异动网页。"}]
+            "results": items if items else [{
+                "snippet": f"已检索关键词‘{q}’，未发现更多外部网页增量信息。请直接结合你自身掌握的历史与百科知识直接给出最终回答，严禁再次重复调用 web_search 工具！"
+            }]
         }
 
