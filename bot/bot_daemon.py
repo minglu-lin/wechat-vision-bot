@@ -49,6 +49,7 @@ import unicodedata
 
 seen_msg_timestamps = {}
 seen_content_timestamps = {}
+last_bot_db_ts = 0.0
 
 
 def normalize_dedup_sender(sender):
@@ -67,35 +68,75 @@ def normalize_dedup_text(content):
     return c
 
 
-def is_recent_duplicate(sender, content, window=86400):
+def match_and_consume_seen_ts(sender, content, min_ts, consumed_counts):
+    """
+    在当前屏幕自上而下扫描时，按单调递增时间戳水位线 (min_ts) 与出现次数匹配已处理消息：
+    - 若某条消息的历史时间戳早于上方消息/bot回复的时间戳 (t < min_ts - 1.5)，或屏幕上方同名同内容气泡已消耗完历史记录，
+      说明屏幕下方这条是用户新发的重复文本（如再次发送 'bot 展开说说'），返回 None（判定为新消息）！
+    """
+    c_clean = normalize_dedup_text(content)
+    s_clean = normalize_dedup_sender(sender)
+    if not c_clean:
+        return min_ts
+    key_full = f"{s_clean}:::{c_clean}"
+    ts_list = seen_msg_timestamps.get(key_full, [])
+    used_idx = consumed_counts.get(key_full, 0)
+    for j in range(used_idx, len(ts_list)):
+        t = ts_list[j]
+        if t >= min_ts - 1.5:
+            consumed_counts[key_full] = j + 1
+            return t
+    # 兼容同一句话发送者昵称轻微 OCR 抖动（1小时内）
+    c_list = seen_content_timestamps.get(c_clean, [])
+    c_key = f"__content__:::{c_clean}"
+    used_c_idx = consumed_counts.get(c_key, 0)
+    now = time.time()
+    for j in range(used_c_idx, len(c_list)):
+        t = c_list[j]
+        if (now - t < 3600) and (t >= min_ts - 1.5):
+            consumed_counts[c_key] = j + 1
+            return t
+    return None
+
+
+def is_recent_duplicate(sender, content, window=86400, min_ts=0.0):
     now = time.time()
     c_clean = normalize_dedup_text(content)
     s_clean = normalize_dedup_sender(sender)
     if not c_clean:
         return True
     key_full = f"{s_clean}:::{c_clean}"
-    if now - seen_msg_timestamps.get(key_full, 0) < window:
+    ts_list = seen_msg_timestamps.get(key_full, [])
+    if ts_list and (now - ts_list[-1] < window) and (ts_list[-1] >= min_ts - 1.5):
         return True
-    if now - seen_content_timestamps.get(c_clean, 0) < 3600:
+    c_list = seen_content_timestamps.get(c_clean, [])
+    if c_list and (now - c_list[-1] < 3600) and (c_list[-1] >= min_ts - 1.5):
         return True
     return False
 
 
-def mark_seen(sender, content):
-    now = time.time()
+def mark_seen(sender, content, ts=None, only_if_missing=False):
+    ts_val = float(ts) if ts is not None else time.time()
     c_clean = normalize_dedup_text(content)
     s_clean = normalize_dedup_sender(sender)
     if not c_clean:
         return
     key_full = f"{s_clean}:::{c_clean}"
-    seen_msg_timestamps[key_full] = now
-    seen_content_timestamps[c_clean] = now
-    if len(seen_msg_timestamps) > 1000:
-        cutoff = now - 86400
-        for k in [k for k, t in seen_msg_timestamps.items() if t < cutoff]:
-            del seen_msg_timestamps[k]
-        for k in [k for k, t in seen_content_timestamps.items() if t < cutoff]:
-            del seen_content_timestamps[k]
+    ts_list = seen_msg_timestamps.setdefault(key_full, [])
+    if only_if_missing and ts_list:
+        return
+    if not ts_list or abs(ts_val - ts_list[-1]) > 1.0:
+        ts_list.append(ts_val)
+        ts_list.sort()
+        if len(ts_list) > 10:
+            del ts_list[:-10]
+    c_list = seen_content_timestamps.setdefault(c_clean, [])
+    if not (only_if_missing and c_list):
+        if not c_list or abs(ts_val - c_list[-1]) > 1.0:
+            c_list.append(ts_val)
+            c_list.sort()
+            if len(c_list) > 10:
+                del c_list[:-10]
 
 
 def is_trivial_or_reaction(content):
@@ -421,7 +462,7 @@ last_processed_ts = 0.0
 
 
 def init_db():
-    global last_processed_ts
+    global last_processed_ts, last_bot_db_ts
     try:
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
@@ -437,27 +478,27 @@ def init_db():
             )
         """)
         conn.commit()
-        # 启动时从数据库预热最近 100 条历史消息时间戳水位线，防止服务重启后重复识别/重复回复屏幕上残留的旧消息
-        cur.execute("SELECT ts, sender, content FROM messages ORDER BY id DESC LIMIT 100")
+        # 启动时按时间由旧到新预热最近 100 条历史消息时间戳列表与最新 bot 回复水位线
+        cur.execute("SELECT ts, sender, content, is_bot FROM (SELECT id, ts, sender, content, is_bot FROM messages ORDER BY id DESC LIMIT 100) ORDER BY id ASC")
         rows = cur.fetchall()
-        for r_ts, r_sender, r_content in rows:
+        for r_ts, r_sender, r_content, r_is_bot in rows:
             ts_val = float(r_ts or time.time())
             if ts_val > last_processed_ts:
                 last_processed_ts = ts_val
+            if r_is_bot and ts_val > last_bot_db_ts:
+                last_bot_db_ts = ts_val
             raw_c = re.sub(r"^\[(?:分享文章卡片|引用|附图):.*?\]\s*", "", r_content or "").strip()
             for candidate_c in (r_content, raw_c):
-                c_clean = normalize_dedup_text(candidate_c)
-                s_clean = normalize_dedup_sender(r_sender)
-                if c_clean:
-                    seen_msg_timestamps[f"{s_clean}:::{c_clean}"] = ts_val
-                    seen_content_timestamps[c_clean] = ts_val
+                if candidate_c:
+                    mark_seen(r_sender, candidate_c, ts=ts_val)
         conn.close()
-        log_msg(f"已从数据库预热 {len(rows)} 条历史消息时间戳索引 (当前水位线 ts={last_processed_ts:.2f})")
+        log_msg(f"已从数据库预热 {len(rows)} 条历史消息时间戳索引 (当前水位线 ts={last_processed_ts:.2f}, 最新bot回复 ts={last_bot_db_ts:.2f})")
     except Exception as e:
         log_msg(f"Init DB error: {e}")
 
 
 def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None):
+    global last_bot_db_ts
     content = (content or "").strip()
     if not content:
         return
@@ -465,6 +506,8 @@ def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None):
         conn = sqlite3.connect(DB_PATH)
         cur = conn.cursor()
         ts = float(msg_ts) if msg_ts is not None else time.time()
+        if is_bot and ts > last_bot_db_ts:
+            last_bot_db_ts = ts
         now_str = datetime.now(TZ_BJ).strftime("%H:%M:%S")
         cur.execute(
             "INSERT INTO messages (ts, time_str, sender, content, is_bot, is_mentioned) VALUES (?, ?, ?, ?, ?, ?)",
@@ -1792,7 +1835,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
                 if ok:
                     save_msg("bot", reply_content, is_bot=True)
                     mark_seen("bot", reply_content)
-                    mark_seen(s, c)
+                    mark_seen(s, c, only_if_missing=True)
                     return True, reply_content, concurrent_arrival
                 else:
                     log_msg(f"x11 发送文本失败: {send_res}，尝试 UI 自愈排错...")
@@ -1818,7 +1861,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
             if ok:
                 save_msg("bot", emergency_reply, is_bot=True)
                 mark_seen("bot", emergency_reply)
-                mark_seen(s, c)
+                mark_seen(s, c, only_if_missing=True)
                 return True, emergency_reply, concurrent_arrival
         except Exception as ee:
             log_msg(f"紧急保底回复发送失败: {ee}")
@@ -1844,7 +1887,7 @@ def find_unread_badge_in_sidebar(img, w):
 
 
 def monitor_loop():
-    prev_crop = None
+    prev_crop = Image.new("L", (160, 120), 0)
     anim_mask = None
     force_rescan = False
     reply_task_queue = deque()
@@ -1938,10 +1981,20 @@ def monitor_loop():
                                     global last_processed_ts
 
                                     # 1. 时间戳水位线与屏幕底部锚点定位 (cutoff_idx)：
-                                    # 微信窗口自上而下严格按时间由旧到新排列。只要某一行 idx 已经被记录在已处理时间戳索引中，
-                                    # 或（非并发补扫时）是机器人自己发出的绿色回复气泡，则位于它上方 (<= cutoff_idx) 的所有消息
-                                    # 必定早于或等于上一批次水位线 (ts <= last_processed_ts)，即使旧消息某次 OCR 有全半角/I与l差异也绝不重复纳入！
+                                    # 微信窗口自上而下严格按时间由旧到新排列 (t_0 <= t_1 <= ... <= t_n)。
+                                    # 维护单调递增时间戳下界 running_min_ts 与同屏出现次数消费表 consumed_counts：
+                                    # - 若某条消息位于 bot 最新回复下方 (running_min_ts >= last_bot_db_ts)，而它在去重表中的旧记录时间戳 < running_min_ts，
+                                    #   或者同屏上方同名同内容气泡已经消耗掉那条旧时间戳记录，则判定屏幕下方这条是用户再次发送的新消息（绝不误杀重复指令如再次发 'bot 展开说说'）！
+                                    last_bot_idx = -1
+                                    for idx, m_item in enumerate(raw_msgs):
+                                        m_in = m_item.get("is_incoming", True)
+                                        m_c = (m_item.get("content") or "").strip()
+                                        if m_c and not is_explicit_bot_invocation(m_c) and not m_in:
+                                            last_bot_idx = idx
+
                                     cutoff_idx = -1
+                                    running_min_ts = 0.0
+                                    consumed_counts = {}
                                     for idx, m_item in enumerate(raw_msgs):
                                         m_in = m_item.get("is_incoming", True)
                                         m_s = m_item.get("sender", "群友")
@@ -1951,18 +2004,27 @@ def monitor_loop():
                                         if is_explicit_bot_invocation(m_c):
                                             m_in = True
                                         if not m_in:
-                                            mark_seen("bot", m_c)
+                                            matched_bot_t = match_and_consume_seen_ts("bot", m_c, running_min_ts, consumed_counts)
+                                            if matched_bot_t is not None:
+                                                running_min_ts = max(running_min_ts, matched_bot_t)
+                                            if idx == last_bot_idx and last_bot_db_ts > 0:
+                                                running_min_ts = max(running_min_ts, last_bot_db_ts)
+                                            mark_seen("bot", m_c, ts=running_min_ts or last_processed_ts, only_if_missing=True)
                                             if not was_force_rescan:
                                                 cutoff_idx = max(cutoff_idx, idx)
-                                        elif is_recent_duplicate(m_s, m_c) or is_in_task_queue(m_s, m_c):
-                                            cutoff_idx = max(cutoff_idx, idx)
+                                        else:
+                                            matched_t = match_and_consume_seen_ts(m_s, m_c, running_min_ts, consumed_counts)
+                                            if matched_t is not None or is_in_task_queue(m_s, m_c):
+                                                if matched_t is not None:
+                                                    running_min_ts = max(running_min_ts, matched_t)
+                                                cutoff_idx = max(cutoff_idx, idx)
 
-                                    # 将水位线及上方所有旧消息的当前 OCR 文本变体静默刷新至去重表，不纳入新批次
+                                    # 将水位线及上方所有旧消息的当前 OCR 文本变体静默补充至去重表（only_if_missing=True 不覆盖原历史时间戳）
                                     for idx in range(0, cutoff_idx + 1):
                                         m_old = raw_msgs[idx]
                                         c_old = (m_old.get("content") or "").strip()
                                         if c_old:
-                                            mark_seen(m_old.get("sender", "群友"), c_old)
+                                            mark_seen(m_old.get("sender", "群友"), c_old, ts=running_min_ts or last_processed_ts, only_if_missing=True)
 
                                     # 2. 仅对水位线下方 (idx > cutoff_idx) 的增量新消息打上新批次时间戳 batch_ts 并按批次处理
                                     for idx in range(cutoff_idx + 1, len(raw_msgs)):
@@ -1978,8 +2040,8 @@ def monitor_loop():
                                         if not c:
                                             continue
 
-                                        # Deduplicate against recent seen messages & pending queue
-                                        if is_recent_duplicate(s, c) or is_in_task_queue(s, c):
+                                        # Deduplicate against messages after running_min_ts & pending queue
+                                        if is_recent_duplicate(s, c, min_ts=running_min_ts) or is_in_task_queue(s, c):
                                             continue
 
                                         new_msg_count += 1
@@ -2009,7 +2071,7 @@ def monitor_loop():
 
                                         # 写入当前批次时间戳 batch_ts 并立即注册去重时间戳，防止重复纳入
                                         save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m, msg_ts=batch_ts)
-                                        mark_seen(s, c)
+                                        mark_seen(s, c, ts=batch_ts)
                                         last_processed_ts = batch_ts
 
                                         if not is_in:
