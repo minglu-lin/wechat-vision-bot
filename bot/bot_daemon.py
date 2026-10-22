@@ -28,9 +28,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from plugins import plugin_manager, register_image_sender
+    from plugins.stock import StockQuantPlugin
 except Exception as _pie:
     plugin_manager = None
     register_image_sender = None
+    StockQuantPlugin = None
 
 os.environ["DISPLAY"] = ":99"
 BASE_DIR = os.environ.get("BOT_BASE_DIR", "/home/opc/wechat_bot" if os.path.exists("/home/opc/wechat_bot") else os.path.dirname(os.path.abspath(__file__)))
@@ -1643,32 +1645,63 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     f"- 核心要求：请使用 web_search 检索该文章的真实事件细节后再进行分析评价。\n"
                 )
         else:
-            # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
-            clean_q = re.sub(r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s,，:：、?!？！]*', '', content.strip(), flags=re.IGNORECASE).strip()
-            search_intent_kws = [
-                "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
-                "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "行情", "汇率", "百科", "历史", "事件",
-                "真假", "真的吗", "搜", "查", "名人", "教授", "大学", "博士", "法院", "判决", "公司",
-                "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
-            ]
-            expand_followup_kws = ["展开", "细说", "详细", "具体", "多说", "深入", "再查", "深挖", "更多细节", "详细讲"]
-            quoted_text_clean = str((quote_info or {}).get("quoted_content", "")).strip()
-            is_expand_with_quote = bool(quoted_text_clean and any(kw in clean_q for kw in expand_followup_kws))
-            if plugin_manager and ((len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
-                search_query_str = clean_q
-                if is_expand_with_quote:
-                    # Extract key topic from the first clause/sentence of the quoted content so Serper searches the actual subject
-                    first_clause = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
-                    search_query_str = f"{first_clause} {clean_q}".strip()
-                log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
-                pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
-                if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
-                    log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
+            # 3.5 针对股票量化诊断与技术面分析：调用 StockQuantPlugin 极速拉取盘口及日K指标，由 AI 专业操盘手一轮直出！
+            stock_sym = None
+            if StockQuantPlugin:
+                try:
+                    stock_sym = StockQuantPlugin.extract_stock_intent(content)
+                except Exception:
+                    stock_sym = None
+
+            stock_handled = False
+            if stock_sym and plugin_manager:
+                log_msg(f"【前置股票量化引擎】检测到股票/指数技术面分析诉求: 目标标的='{stock_sym}'，正在极速拉取盘口与日K量化指标...")
+                stock_res = plugin_manager.execute_tool("analyze_stock", {"symbol": stock_sym})
+                if isinstance(stock_res, dict) and not stock_res.get("error"):
+                    stock_name = stock_res.get("quote", {}).get("name", stock_sym)
+                    log_msg(f"【前置股票量化引擎】成功拉取 {stock_name} ({stock_sym}) 量化数据，交由 AI 专业操盘手一轮直出！")
                     user_query += (
-                        f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具）】：\n"
-                        f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
+                        f"\n\n【系统已实时调取该标的（{stock_name} / {stock_res.get('resolved_code')}）的最新量化诊断盘面数据】：\n"
+                        f"{stock_res.get('report_markdown', '')}\n\n"
+                        f"【量化操盘诊断报告撰写规范】：\n"
+                        f"你是一名拥有 15 年实战经验的顶级资深证券量化投资总监兼技术派操盘手。\n"
+                        f"请直接依据上方系统拉取的权威量化指标（多空均线、MACD/KDJ/RSI、布林带、CYQ获利盘筹码集中度、攻防关键位），在微信群输出一份专业、精炼、重点突出、结构严谨的操盘诊断研报（字数适中，多用项目符号，拒绝车轱辘废话）：\n"
+                        f"1. 📌【盘面格局与均线量价】：解读最新价格表现、多空排列结构、放量/缩量所处博弈阶段。\n"
+                        f"2. ⚡【核心指标多空共振】：结合 MACD 金叉/死叉、KDJ 超买/超卖、布林带轨道、生命线 (MA20) 给出动能判断。\n"
+                        f"3. 🎯【筹码结构与攻防关口】：分析主力获利盘比例与持仓成本，明确指出【第一压力位 R1】、【第一支撑位 S1】及【极端防守止损位 S2】。\n"
+                        f"4. 💡【实战操盘与风控策略】：给出明确的操作建议（如：底仓持有/突破追多/逢高落袋/底部分批建仓/观望防守），并附上纪律性止损位提示。\n"
+                        f"【重要】：无需再次调用任何工具，直接输出终版操盘研报！\n"
                     )
                     tools = None
+                    stock_handled = True
+
+            # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
+            if not stock_handled:
+                clean_q = re.sub(r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s,，:：、?!？！]*', '', content.strip(), flags=re.IGNORECASE).strip()
+                search_intent_kws = [
+                    "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
+                    "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "行情", "汇率", "百科", "历史", "事件",
+                    "真假", "真的吗", "搜", "查", "名人", "教授", "大学", "博士", "法院", "判决", "公司",
+                    "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
+                ]
+                expand_followup_kws = ["展开", "细说", "详细", "具体", "多说", "深入", "再查", "深挖", "更多细节", "详细讲"]
+                quoted_text_clean = str((quote_info or {}).get("quoted_content", "")).strip()
+                is_expand_with_quote = bool(quoted_text_clean and any(kw in clean_q for kw in expand_followup_kws))
+                if plugin_manager and ((len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
+                    search_query_str = clean_q
+                    if is_expand_with_quote:
+                        # Extract key topic from the first clause/sentence of the quoted content so Serper searches the actual subject
+                        first_clause = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
+                        search_query_str = f"{first_clause} {clean_q}".strip()
+                    log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
+                    pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
+                    if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
+                        log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
+                        user_query += (
+                            f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具）】：\n"
+                            f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
+                        )
+                        tools = None
 
     user_content_payload = user_query
     if provider == "gemini" and image_info and image_info.get("has_image") and os.path.exists("/tmp/wechat_last_photo.png"):

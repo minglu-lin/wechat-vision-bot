@@ -14,6 +14,7 @@ from typing import Dict, List, Optional, Tuple, Any
 from .base import BasePlugin
 from .weather import WeatherPlugin
 from .finance import ExchangeRatePlugin, CryptoPlugin
+from .stock import StockQuantPlugin
 from .network import NetworkPlugin, WebSearchPlugin
 from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
@@ -34,6 +35,7 @@ class PluginManager:
 
     def _register_default_plugins(self):
         self.register(WeatherPlugin())
+        self.register(StockQuantPlugin())
         self.register(ExchangeRatePlugin())
         self.register(CryptoPlugin())
         self.register(NetworkPlugin())
