@@ -1936,20 +1936,26 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
 
 
 def find_unread_badge_in_sidebar(img, w):
-    """Scan the left conversation list for a red unread notification badge (R>215, G<85, B<85)."""
+    """Scan the left conversation list for a red unread notification badge (R>215, G<85, B<85) on non-active sessions."""
     sx1 = w["x"] + 65
     sy1 = w["y"] + 80
     sx2 = w["x"] + 140
     sy2 = w["y"] + w["height"] - 30
     sub = img.crop((sx1, sy1, sx2, sy2))
     px = sub.load()
+    img_px = img.load()
     sw, sh = sub.size
     for y in range(0, sh, 2):
         for x in range(0, sw, 2):
             r, g, b = px[x, y][:3]
             if r > 215 and g < 85 and b < 85:
                 # Target click: horizontal center of session item, vertical center of session item
-                return w["x"] + 170, sy1 + y + 12
+                check_y = sy1 + y + 12
+                # Check if this row is currently the active (green-highlighted) session
+                sample_r, sample_g, sample_b = img_px[w["x"] + 170, check_y][:3]
+                if sample_g > 140 and sample_r < 60:
+                    continue
+                return w["x"] + 170, check_y
     return None
 
 
