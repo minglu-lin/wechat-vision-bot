@@ -2329,9 +2329,13 @@ def monitor_loop():
                                     prev_crop = new_crop
 
                                     if reply_candidates:
-                                        # 所有直接提问 (@bot / 引用bot / 私聊) 全部按时间顺序入队；纯追问取最新一条入队
-                                        direct_targets = [t for t in reply_candidates if t.get("is_direct") or t.get("is_private")]
-                                        targets_to_enqueue = direct_targets if direct_targets else [reply_candidates[-1]]
+                                        if is_in_private_chat:
+                                            # 1对1私聊中，同一次读取仅回复最新的一条指令/问题，其余历史气泡仅静默标记已读，绝不并发入队
+                                            targets_to_enqueue = [reply_candidates[-1]]
+                                        else:
+                                            # 群聊中：所有直接提问 (@bot / 引用bot) 全部按时间顺序入队；纯追问取最新一条入队
+                                            direct_targets = [t for t in reply_candidates if t.get("is_direct")]
+                                            targets_to_enqueue = direct_targets if direct_targets else [reply_candidates[-1]]
                                         for cand in reply_candidates:
                                             if cand not in targets_to_enqueue:
                                                 mark_seen(cand["sender"], cand["content"])
@@ -2364,7 +2368,15 @@ def monitor_loop():
                         target = reply_task_queue.popleft()
                         s = target["sender"]
                         c = target["content"]
-                        log_msg(f"[任务队列] 开始处理队首任务 (剩余排队: {len(reply_task_queue)} 条): sender={s}, content={c[:30]}")
+                        is_priv_task = bool(target.get("is_private"))
+                        log_msg(f"[任务队列] 开始处理队首任务 (剩余排队: {len(reply_task_queue)} 条): sender={s}, is_priv={is_priv_task}, content={c[:30]}")
+
+                        # 铁律防御：若当前任务是私聊任务，但窗口却不在私聊状态，绝不可在群聊中发送，先确保切回对应私聊会话
+                        if is_priv_task and not is_in_private_chat:
+                            log_msg(f"[安全防护] 待发送任务为【{s}】的私聊消息，但当前窗口未处于私聊状态，先切入【{s}】私聊会话...")
+                            switch_to_chat(s, w)
+                            is_in_private_chat = True
+                            time.sleep(0.4)
 
                         t_img = target.get("image") or {}
                         if isinstance(t_img, dict) and t_img.get("has_image"):
@@ -2395,14 +2407,14 @@ def monitor_loop():
 
                         recent_history = get_recent(limit=15)
                         need_prefix = bool(target.get("multi_user") or len(reply_task_queue) > 0)
-                        if target.get("is_private"):
+                        if is_priv_task:
                             need_prefix = False
                         success, sent_text, had_concurrent_msg = safe_generate_and_reply(
                             target,
                             cfg,
                             recent_history,
                             prefix_sender=need_prefix,
-                            pre_send_check_fn=check_new_msg_during_thinking if not target.get("is_private") else None,
+                            pre_send_check_fn=check_new_msg_during_thinking if not is_priv_task else None,
                         )
                         if success:
                             last_recorded_text = sent_text
@@ -2412,17 +2424,20 @@ def monitor_loop():
                             log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
                             time.sleep(0.7)
 
-                            # 关注点恢复：若回复的是私聊消息，回复完成后立即切回主关注群聊
-                            if target.get("is_private") or is_in_private_chat:
-                                log_msg(f"[关注点恢复] 管理员私聊回复完成，立即切回主关注群聊【{focus_chat}】...")
-                                switch_to_chat(focus_chat, w)
-                                is_in_private_chat = False
-                                time.sleep(0.5)
-                                img3, _ = capture_screen_pil()
-                                prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
-                                anim_mask = None
-                                last_send_ts = time.time()
-                                log_msg(f"[关注点恢复] 已成功从私聊切回主群聊【{focus_chat}】，主群聊监控继续运行！")
+                            # 关注点恢复：若当前任务是私聊任务，且私聊任务队列已全部清空，才切回主关注群聊
+                            if is_priv_task or is_in_private_chat:
+                                if not reply_task_queue:
+                                    log_msg(f"[关注点恢复] 管理员私聊回复完成，私聊队列已清空，立即切回主关注群聊【{focus_chat}】...")
+                                    switch_to_chat(focus_chat, w)
+                                    is_in_private_chat = False
+                                    time.sleep(0.5)
+                                    img3, _ = capture_screen_pil()
+                                    prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                    anim_mask = None
+                                    last_send_ts = time.time()
+                                    log_msg(f"[关注点恢复] 已成功从私聊切回主群聊【{focus_chat}】，主群聊监控继续运行！")
+                                else:
+                                    log_msg(f"[关注点保持] 私聊队列仍有待处理任务 ({len(reply_task_queue)} 条)，保持在私聊窗口继续处理...")
                             elif had_concurrent_msg:
                                 # 思考期间有人发了新消息！不覆盖 prev_crop，立即在下一轮触发视觉扫描把新消息排入队列
                                 force_rescan = True
@@ -2435,7 +2450,7 @@ def monitor_loop():
                                 last_send_ts = time.time()
                         else:
                             log_msg("本次回复未成功，保持未标记已读状态，重置画面快照触发下轮重试")
-                            if target.get("is_private") or is_in_private_chat:
+                            if (is_priv_task or is_in_private_chat) and not reply_task_queue:
                                 log_msg(f"[关注点恢复] 私聊重试结束，切回主关注群聊【{focus_chat}】...")
                                 switch_to_chat(focus_chat, w)
                                 is_in_private_chat = False
