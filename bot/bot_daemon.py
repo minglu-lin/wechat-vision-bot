@@ -1171,7 +1171,7 @@ def call_llm_chat(messages, tools=None, timeout=75, override_model=None):
 call_kimi_chat = call_llm_chat
 
 
-def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="", session_active=False, chat_box=None):
+def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="", session_active=False, chat_box=None, is_private_chat=False):
     try:
         chat_img.save("/tmp/wechat_last_chat_img.png")
     except Exception:
@@ -1193,40 +1193,73 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"  5. 没有明确提问意图或指令诉求的普通陈述句。\n\n"
         )
 
-    prompt = (
-        f"这是一张微信群聊窗口最新截图。\n"
-        f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括群友发的白色气泡、我们自己发的绿色气泡以及图片消息）：\n\n"
-        f"针对每条消息，提取以下字段：\n"
-        f"1. sender: 发送者群昵称（若是右侧绿色气泡，则为我们自己/bot）\n"
-        f"2. content: 消息主体文本内容（若是图片，简要描述图片类型与核心画面）\n"
-        f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
-        f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
-        f"   - 【用户最高铁律】：只要消息开头包含 @AIbot、@Albot、@bot、@微信小号，或者以 bot、aibot 开头（如 'bot ...'、'@AIbot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
-        f"   - 【严格禁忌1】：如果群友是在 @其他群成员（例如 '@张三 ...'、'@黄嘉诚 ...'，@后面跟的不是 AIbot/Albot/bot），绝对不属于呼叫 bot，is_mentioned 必须为 false！\n"
-        f"   - 【严格禁忌2】：当群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊而非指令时，is_mentioned 必须为 false！\n"
-        f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
-        f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
-        f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
-        f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
-        f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
-        f"   - 若不是卡片：is_card=false\n\n"
-        f"{session_instruction}"
-        f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
-        f'{{\n'
-        f'  "messages": [\n'
-        f'    {{\n'
-        f'      "sender": "昵称",\n'
-        f'      "content": "消息正文",\n'
-        f'      "is_incoming": true,\n'
-        f'      "is_mentioned": true,\n'
-        f'      "is_followup": false,\n'
-        f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
-        f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
-        f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}}\n'
-        f'    }}\n'
-        f'  ]\n'
-        f'}}\n'
-    )
+    if is_private_chat:
+        prompt = (
+            f"这是一张微信【私聊窗口】（好友 1 对 1 对话）最新截图。\n"
+            f"当前是好友与 bot 的私信单聊界面。\n"
+            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括对方发的白色气泡、我们自己发的绿色气泡以及图片消息）：\n\n"
+            f"针对每条消息，提取以下字段：\n"
+            f"1. sender: 对方好友昵称（查看聊天窗口顶部标题所显示的名称，或者对方发送的白色气泡发送者）\n"
+            f"2. content: 消息主体文本内容（若是图片，简要描述图片类型与核心画面）\n"
+            f"3. is_incoming: 是否是对方发送的左侧白色气泡（true 为对方发送，false 为右侧绿色气泡我们自己/bot 发送）\n"
+            f"4. is_mentioned: 【私聊核心原则】：在 1 对 1 私聊中，对方发送的任何消息（is_incoming=True）都是直接对 bot 说的！因此只要对方发送了有效提问、指令或闲聊，is_mentioned 必须强制设为 true（无需 @bot 或 bot 关键字）！如果是敷衍附和或无意义标点，可设为 false。\n"
+            f"5. is_followup: 是否是对上一轮回答的连续追问（若是追问设为 true，否则 false）\n"
+            f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
+            f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
+            f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
+            f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
+            f"   - 若不是卡片：is_card=false\n\n"
+            f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
+            f'{{\n'
+            f'  "messages": [\n'
+            f'    {{\n'
+            f'      "sender": "昵称",\n'
+            f'      "content": "消息正文",\n'
+            f'      "is_incoming": true,\n'
+            f'      "is_mentioned": true,\n'
+            f'      "is_followup": false,\n'
+            f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
+            f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
+            f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}}\n'
+            f'    }}\n'
+            f'  ]\n'
+            f'}}\n'
+        )
+    else:
+        prompt = (
+            f"这是一张微信群聊窗口最新截图。\n"
+            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括群友发的白色气泡、我们自己发的绿色气泡以及图片消息）：\n\n"
+            f"针对每条消息，提取以下字段：\n"
+            f"1. sender: 发送者群昵称（若是右侧绿色气泡，则为我们自己/bot）\n"
+            f"2. content: 消息主体文本内容（若是图片，简要描述图片类型与核心画面）\n"
+            f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
+            f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
+            f"   - 【用户最高铁律】：只要消息开头包含 @AIbot、@Albot、@bot、@微信小号，或者以 bot、aibot 开头（如 'bot ...'、'@AIbot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
+            f"   - 【严格禁忌1】：如果群友是在 @其他群成员（例如 '@张三 ...'、'@黄嘉诚 ...'，@后面跟的不是 AIbot/Albot/bot），绝对不属于呼叫 bot，is_mentioned 必须为 false！\n"
+            f"   - 【严格禁忌2】：当群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊而非指令时，is_mentioned 必须为 false！\n"
+            f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
+            f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
+            f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
+            f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
+            f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
+            f"   - 若不是卡片：is_card=false\n\n"
+            f"{session_instruction}"
+            f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
+            f'{{\n'
+            f'  "messages": [\n'
+            f'    {{\n'
+            f'      "sender": "昵称",\n'
+            f'      "content": "消息正文",\n'
+            f'      "is_incoming": true,\n'
+            f'      "is_mentioned": true,\n'
+            f'      "is_followup": false,\n'
+            f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
+            f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
+            f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}}\n'
+            f'    }}\n'
+            f'  ]\n'
+            f'}}\n'
+        )
 
     messages = [
         {
@@ -1862,7 +1895,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
                             concurrent_arrival = True
                     except Exception:
                         pass
-                if (prefix_sender or concurrent_arrival) and s and s not in ("群友", "未知", "bot") and not reply_content.startswith(f"@{s}"):
+                if (prefix_sender or concurrent_arrival) and not target.get("is_private") and s and s not in ("群友", "未知", "bot") and not reply_content.startswith(f"@{s}"):
                     reply_content = f"@{s} {reply_content}"
                 ok, send_res = x11_send_text(reply_content)
                 if ok:
@@ -1888,7 +1921,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
             log_msg(f"触发必须回应紧急保底回复机制 (sender={s}, query={c[:25]})")
             recover_wechat_ui_state()
             emergency_reply = get_persona_error_reply(c)
-            if (prefix_sender or concurrent_arrival) and s and s not in ("群友", "未知", "bot"):
+            if (prefix_sender or concurrent_arrival) and not target.get("is_private") and s and s not in ("群友", "未知", "bot"):
                 emergency_reply = f"@{s} {emergency_reply}"
             ok, _ = x11_send_text(emergency_reply)
             if ok:
@@ -1904,19 +1937,90 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
 
 def find_unread_badge_in_sidebar(img, w):
     """Scan the left conversation list for a red unread notification badge (R>215, G<85, B<85)."""
-    sx1 = w["x"] + 10
-    sy1 = w["y"] + 90
-    sx2 = w["x"] + 190
-    sy2 = w["y"] + w["height"] - 40
+    sx1 = w["x"] + 65
+    sy1 = w["y"] + 80
+    sx2 = w["x"] + 140
+    sy2 = w["y"] + w["height"] - 30
     sub = img.crop((sx1, sy1, sx2, sy2))
     px = sub.load()
     sw, sh = sub.size
     for y in range(0, sh, 2):
         for x in range(0, sw, 2):
-            r, g, b = px[x, y]
+            r, g, b = px[x, y][:3]
             if r > 215 and g < 85 and b < 85:
-                return w["x"] + 100, sy1 + y + 5
+                # Target click: horizontal center of session item, vertical center of session item
+                return w["x"] + 170, sy1 + y + 12
     return None
+
+
+def switch_to_chat(chat_name, w=None):
+    """
+    Switch WeChat window to a target chat/group by typing its name in the search box.
+    Fast, deterministic (approx 0.4s).
+    """
+    if not chat_name:
+        return False
+    if w is None:
+        _, wins = capture_screen_pil()
+        if not wins:
+            return False
+        w = wins[0]
+
+    search_x = w["x"] + 169
+    search_y = w["y"] + 59
+    x11_click(search_x, search_y)
+    time.sleep(0.12)
+
+    d = display.Display(":99")
+    try:
+        ctrl_kc = d.keysym_to_keycode(XK.XK_Control_L)
+        a_kc = d.keysym_to_keycode(XK.XK_a)
+        bs_kc = d.keysym_to_keycode(XK.XK_BackSpace)
+        v_kc = d.keysym_to_keycode(XK.XK_v)
+        ret_kc = d.keysym_to_keycode(XK.XK_Return)
+
+        # Clear existing search input
+        xtest.fake_input(d, X.KeyPress, ctrl_kc)
+        xtest.fake_input(d, X.KeyPress, a_kc)
+        xtest.fake_input(d, X.KeyRelease, a_kc)
+        xtest.fake_input(d, X.KeyRelease, ctrl_kc)
+        d.sync()
+        time.sleep(0.04)
+        xtest.fake_input(d, X.KeyPress, bs_kc)
+        xtest.fake_input(d, X.KeyRelease, bs_kc)
+        d.sync()
+        time.sleep(0.06)
+
+        # Paste target chat name
+        env = os.environ.copy()
+        env["DISPLAY"] = ":99"
+        p = subprocess.Popen(
+            ["/usr/local/bin/xclip", "-selection", "clipboard", "-i"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+        p.communicate(input=chat_name.encode("utf-8"), timeout=2)
+
+        xtest.fake_input(d, X.KeyPress, ctrl_kc)
+        xtest.fake_input(d, X.KeyPress, v_kc)
+        xtest.fake_input(d, X.KeyRelease, v_kc)
+        xtest.fake_input(d, X.KeyRelease, ctrl_kc)
+        d.sync()
+        time.sleep(0.3)
+
+        # Press Return to open top matched search result
+        xtest.fake_input(d, X.KeyPress, ret_kc)
+        xtest.fake_input(d, X.KeyRelease, ret_kc)
+        d.sync()
+        time.sleep(0.35)
+        return True
+    except Exception as e:
+        log_msg(f"switch_to_chat 异常: {e}")
+        return False
+    finally:
+        d.close()
 
 
 def monitor_loop():
@@ -1926,7 +2030,11 @@ def monitor_loop():
     reply_task_queue = deque()
     last_check_reply_ts = 0.0
     global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text, last_send_ts
-    log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + FIFO 任务队列 + Local Memory)")
+    log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + FIFO 任务队列 + Local Memory + 关注点机制)")
+
+    is_in_private_chat = False
+    private_chat_opened_ts = 0.0
+    initial_focus_done = False
 
     def is_in_task_queue(sender, content):
         norm_c = normalize_dedup_text(content)
@@ -1940,6 +2048,10 @@ def monitor_loop():
         try:
             ensure_processes()
             cfg = load_config()
+            focus_chat = cfg.get("focus_chat", "MAGA")
+            admin_users = cfg.get("admin_users", ["林明露", "枫"])
+            auto_switch_private = cfg.get("auto_switch_private", True)
+
             img, wins = capture_screen_pil()
             img.save("/tmp/screen.png")
 
@@ -1959,15 +2071,28 @@ def monitor_loop():
                 )
                 img.crop(box).save("/tmp/wechat_win.png")
 
+                # 初始启动锚定：若主群聊配置存在，初次启动确保窗口聚焦于关注群聊
+                if not initial_focus_done and focus_chat and w["width"] >= 550:
+                    initial_focus_done = True
+                    log_msg(f"[关注点初始化] 确保初始窗口锚定在主关注群聊【{focus_chat}】...")
+                    switch_to_chat(focus_chat, w)
+                    time.sleep(0.5)
+                    img, wins = capture_screen_pil()
+                    w = wins[0]
+
                 if w["width"] >= 550 and cfg.get("auto_reply", True):
-                    # Auto-click unread red badge in sidebar if any (only when current queue is empty)
-                    if not reply_task_queue:
+                    # 关注点机制：主群聊闲置且未读红点出现时，自动切入私聊
+                    if auto_switch_private and not reply_task_queue and not is_in_private_chat and (time.time() - last_send_ts > 2.5):
                         badge_pos = find_unread_badge_in_sidebar(img, w)
                         if badge_pos:
-                            log_msg(f"检测到左侧会话列表红点未读消息，自动点击打开: {badge_pos}")
+                            log_msg(f"[关注点调度] 主群聊【{focus_chat}】当前闲置，检测到侧边栏未读红点: {badge_pos}，切换私聊会话...")
                             x11_click(badge_pos[0], badge_pos[1])
-                            time.sleep(0.6)
+                            time.sleep(0.5)
                             img, wins = capture_screen_pil()
+                            is_in_private_chat = True
+                            private_chat_opened_ts = time.time()
+                            force_rescan = True
+                            prev_crop = None
                             anim_mask = None
 
                     rx1 = w["x"] + int(w["width"] * 0.33)
@@ -2005,7 +2130,7 @@ def monitor_loop():
                                 try:
                                     session_active = (time.time() - last_bot_reply_ts < 30) and bool(last_replied_user)
                                     raw_msgs = parse_recent_messages_with_vision(
-                                        chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active, chat_box=chat_box
+                                        chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active, chat_box=chat_box, is_private_chat=is_in_private_chat
                                     )
 
                                     reply_candidates = []
@@ -2150,8 +2275,17 @@ def monitor_loop():
                                                 else:
                                                     log_msg(f"用户引用 bot 消息但仅为简短附和/闲聊: '{c}' -> 跳过回复")
 
-                                        should_reply = is_explicit or (trigger_mode == "all") or is_m or valid_followup or valid_quote_reply
-                                        log_msg(f"消息队列提取: sender={s}, content={c[:30]}, is_explicit={is_explicit}, is_m={is_m}, valid_f={valid_followup}, valid_q={valid_quote_reply}, should_reply={should_reply}")
+                                        if is_in_private_chat:
+                                            is_admin = (not admin_users) or any(adm in s or s in adm for adm in admin_users)
+                                            if not is_admin:
+                                                log_msg(f"[私聊权限拦截] 私聊发送者【{s}】不在管理员白名单 {admin_users}，不予回复")
+                                                should_reply = False
+                                            else:
+                                                should_reply = True
+                                        else:
+                                            should_reply = is_explicit or (trigger_mode == "all") or is_m or valid_followup or valid_quote_reply
+
+                                        log_msg(f"消息队列提取: sender={s}, content={c[:30]}, is_explicit={is_explicit}, is_m={is_m}, valid_f={valid_followup}, valid_q={valid_quote_reply}, is_priv={is_in_private_chat}, should_reply={should_reply}")
 
                                         if should_reply:
                                             if isinstance(img_info, dict) and img_info.get("has_image") and img_info.get("_crop_box"):
@@ -2167,8 +2301,9 @@ def monitor_loop():
                                                 "content": c,
                                                 "quote": q_info,
                                                 "image": img_info,
-                                                "is_explicit": is_explicit,
-                                                "is_direct": bool(is_explicit or is_m or valid_quote_reply),
+                                                "is_explicit": is_explicit or is_in_private_chat,
+                                                "is_direct": bool(is_explicit or is_m or valid_quote_reply or is_in_private_chat),
+                                                "is_private": is_in_private_chat,
                                             })
                                         else:
                                             # 不需要回复的消息，直接标记为已处理
@@ -2188,8 +2323,8 @@ def monitor_loop():
                                     prev_crop = new_crop
 
                                     if reply_candidates:
-                                        # 所有直接提问 (@bot / 引用bot) 全部按时间顺序入队；纯追问取最新一条入队
-                                        direct_targets = [t for t in reply_candidates if t.get("is_direct")]
+                                        # 所有直接提问 (@bot / 引用bot / 私聊) 全部按时间顺序入队；纯追问取最新一条入队
+                                        direct_targets = [t for t in reply_candidates if t.get("is_direct") or t.get("is_private")]
                                         targets_to_enqueue = direct_targets if direct_targets else [reply_candidates[-1]]
                                         for cand in reply_candidates:
                                             if cand not in targets_to_enqueue:
@@ -2200,6 +2335,16 @@ def monitor_loop():
                                                     t["multi_user"] = True
                                                 reply_task_queue.append(t)
                                                 log_msg(f"[任务队列] 新提问入队: sender={t['sender']}, content={t['content'][:25]} (当前队列长度: {len(reply_task_queue)})")
+                                    elif is_in_private_chat and not reply_task_queue:
+                                        # 私聊窗口内无有效新提问（如未授权用户或纯表情/已读旧消息），立即切回主群聊
+                                        log_msg(f"[关注点恢复] 当前私聊无待回复消息或已处理完毕，切回主关注群聊【{focus_chat}】...")
+                                        switch_to_chat(focus_chat, w)
+                                        is_in_private_chat = False
+                                        time.sleep(0.4)
+                                        img_fresh, _ = capture_screen_pil()
+                                        prev_crop = img_fresh.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                        anim_mask = None
+                                        force_rescan = False
                                 except Exception as ke:
                                     log_msg(f"消息处理异常 (保留 prev_crop 以便下轮立即重试): {ke}")
                         else:
@@ -2244,12 +2389,14 @@ def monitor_loop():
 
                         recent_history = get_recent(limit=15)
                         need_prefix = bool(target.get("multi_user") or len(reply_task_queue) > 0)
+                        if target.get("is_private"):
+                            need_prefix = False
                         success, sent_text, had_concurrent_msg = safe_generate_and_reply(
                             target,
                             cfg,
                             recent_history,
                             prefix_sender=need_prefix,
-                            pre_send_check_fn=check_new_msg_during_thinking,
+                            pre_send_check_fn=check_new_msg_during_thinking if not target.get("is_private") else None,
                         )
                         if success:
                             last_recorded_text = sent_text
@@ -2258,7 +2405,19 @@ def monitor_loop():
                             last_replied_user = s
                             log_msg(f"更新追问会话状态: 用户={last_replied_user}, 30秒追问窗口开启中")
                             time.sleep(0.7)
-                            if had_concurrent_msg:
+
+                            # 关注点恢复：若回复的是私聊消息，回复完成后立即切回主关注群聊
+                            if target.get("is_private") or is_in_private_chat:
+                                log_msg(f"[关注点恢复] 管理员私聊回复完成，立即切回主关注群聊【{focus_chat}】...")
+                                switch_to_chat(focus_chat, w)
+                                is_in_private_chat = False
+                                time.sleep(0.5)
+                                img3, _ = capture_screen_pil()
+                                prev_crop = img3.crop((rx1, ry1, rx2, ry2)).convert("L").resize((160, 120))
+                                anim_mask = None
+                                last_send_ts = time.time()
+                                log_msg(f"[关注点恢复] 已成功从私聊切回主群聊【{focus_chat}】，主群聊监控继续运行！")
+                            elif had_concurrent_msg:
                                 # 思考期间有人发了新消息！不覆盖 prev_crop，立即在下一轮触发视觉扫描把新消息排入队列
                                 force_rescan = True
                                 last_send_ts = 0.0
@@ -2270,6 +2429,10 @@ def monitor_loop():
                                 last_send_ts = time.time()
                         else:
                             log_msg("本次回复未成功，保持未标记已读状态，重置画面快照触发下轮重试")
+                            if target.get("is_private") or is_in_private_chat:
+                                log_msg(f"[关注点恢复] 私聊重试结束，切回主关注群聊【{focus_chat}】...")
+                                switch_to_chat(focus_chat, w)
+                                is_in_private_chat = False
                             prev_crop = None
                 else:
                     prev_crop = None

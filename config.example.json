@@ -6,6 +6,9 @@
   "amap_api_key": "your-amap-web-service-key-here",
   "auto_reply": true,
   "trigger_mode": "mention_only",
+  "focus_chat": "MAGA",
+  "admin_users": ["林明露", "枫"],
+  "auto_switch_private": true,
   "bot_names": [
     "@",
     "bot",
