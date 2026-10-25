@@ -40,6 +40,9 @@ os.environ["DISPLAY"] = ":99"
 BASE_DIR = os.environ.get("BOT_BASE_DIR", "/home/opc/wechat_bot" if os.path.exists("/home/opc/wechat_bot") else os.path.dirname(os.path.abspath(__file__)))
 CONFIG_PATH = os.path.join(BASE_DIR, "config.json")
 DB_PATH = os.path.join(BASE_DIR, "chat_memory.db")
+IMAGES_DIR = os.path.join(BASE_DIR, "data", "images")
+os.makedirs(IMAGES_DIR, exist_ok=True)
+recent_image_records = deque(maxlen=60)
 TZ_BJ = timezone(timedelta(hours=8))
 
 state_lock = threading.Lock()
@@ -751,10 +754,33 @@ def init_db():
                 sender TEXT,
                 content TEXT,
                 is_bot INTEGER,
-                is_mentioned INTEGER
+                is_mentioned INTEGER,
+                image_path TEXT
             )
         """)
         conn.commit()
+        try:
+            cur.execute("ALTER TABLE messages ADD COLUMN image_path TEXT")
+            conn.commit()
+        except Exception:
+            pass
+
+        # 预热本地图片持久化索引
+        try:
+            cur.execute("SELECT ts, sender, content, image_path FROM messages WHERE image_path IS NOT NULL AND image_path != '' ORDER BY id DESC LIMIT 30")
+            for r_ts, r_sender, r_content, r_img_path in reversed(cur.fetchall()):
+                if r_img_path and os.path.exists(r_img_path):
+                    recent_image_records.append({
+                        "ts": float(r_ts),
+                        "sender": r_sender,
+                        "content": r_content,
+                        "image_path": r_img_path,
+                    })
+            if recent_image_records:
+                log_msg(f"已从数据库预热 {len(recent_image_records)} 条本地图片持久化记录")
+        except Exception:
+            pass
+
         # 启动时按时间由旧到新预热最近 100 条历史消息时间戳列表与最新 bot 回复水位线
         cur.execute("SELECT ts, sender, content, is_bot FROM (SELECT id, ts, sender, content, is_bot FROM messages ORDER BY id DESC LIMIT 100) ORDER BY id ASC")
         rows = cur.fetchall()
@@ -774,7 +800,7 @@ def init_db():
         log_msg(f"Init DB error: {e}")
 
 
-def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None):
+def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None, image_path=None):
     global last_bot_db_ts
     content = (content or "").strip()
     if not content:
@@ -787,8 +813,8 @@ def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None):
             last_bot_db_ts = ts
         now_str = datetime.now(TZ_BJ).strftime("%H:%M:%S")
         cur.execute(
-            "INSERT INTO messages (ts, time_str, sender, content, is_bot, is_mentioned) VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, now_str, sender, content, 1 if is_bot else 0, 1 if is_mentioned else 0)
+            "INSERT INTO messages (ts, time_str, sender, content, is_bot, is_mentioned, image_path) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (ts, now_str, sender, content, 1 if is_bot else 0, 1 if is_mentioned else 0, image_path)
         )
         conn.commit()
         conn.close()
@@ -1329,6 +1355,111 @@ def extract_image_via_clipboard(px, py, save_path="/tmp/wechat_last_photo.png"):
                 d.close()
             except Exception:
                 pass
+
+
+def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
+    """
+    当接收到图片时，即刻将原始高清图片复制或截图保存到本地磁盘，并返回本地路径。
+    持久化命名: data/images/img_{int(ts)}_{clean_sender}.png
+    """
+    ts = float(msg_ts) if msg_ts is not None else time.time()
+    s_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '_', str(sender or "user"))[:20].strip('_') or "user"
+    local_path = os.path.join(IMAGES_DIR, f"img_{int(ts)}_{s_clean}.png")
+
+    saved = False
+    # 1. 首先尝试通过右键复制从 X11 剪贴板提取原始未压缩图片
+    if img_info.get("_screen_pos") and "表情" not in str(img_info.get("image_type", "")):
+        try:
+            spos = img_info["_screen_pos"]
+            saved = extract_image_via_clipboard(spos[0], spos[1], local_path)
+            if saved and os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
+                log_msg(f"【本地图片持久化】右键提取原图成功: {local_path} ({os.path.getsize(local_path)} 字节)")
+            else:
+                saved = False
+        except Exception as e:
+            log_msg(f"右键提取原图落盘异常: {e}")
+            saved = False
+
+    # 2. 若右键提取未就绪，使用当前气泡高保真切片作为双保险兜底
+    if not saved or not os.path.exists(local_path) or os.path.getsize(local_path) < 1000:
+        try:
+            if img_info.get("_img_bytes"):
+                with open(local_path, "wb") as f:
+                    f.write(img_info["_img_bytes"])
+                saved = True
+            elif img_info.get("_crop_box") and chat_img:
+                cb = tuple(img_info["_crop_box"])
+                chat_img.crop(cb).save(local_path, format="PNG")
+                saved = True
+            if saved:
+                log_msg(f"【本地图片持久化】切片兜底落盘成功: {local_path} ({os.path.getsize(local_path)} 字节)")
+        except Exception as ce:
+            log_msg(f"切片兜底落盘异常: {ce}")
+
+    if saved and os.path.exists(local_path):
+        record = {
+            "ts": ts,
+            "sender": sender,
+            "image_path": local_path,
+            "image_type": img_info.get("image_type", "图片"),
+            "ocr_and_detail": img_info.get("ocr_and_detail", ""),
+        }
+        recent_image_records.append(record)
+        return local_path
+    return None
+
+
+def find_image_for_query(query_text="", quote_info=None, session_key="", max_age_sec=3600):
+    """
+    根据微信‘引用’或语义提问精准溯源本地图片记录：
+    1. 引用溯源：若引用了某人且引用内容包含 [图片] 或图，精准对齐该人发送的历史本地图片
+    2. 语义问图：若提问涉及读图、看图、分析图，对齐会话最近一张本地图片
+    """
+    now = time.time()
+    # 1. 微信引用优先精准匹配
+    if quote_info and quote_info.get("has_quote"):
+        q_sender = str(quote_info.get("quoted_sender", "")).strip()
+        q_content = str(quote_info.get("quoted_content", "")).lower()
+        is_quote_img = any(kw in q_content for kw in ["[图片]", "图", "照片", "截图", "chart", "image"]) or not q_content
+        if is_quote_img:
+            # 从最近的图片记录倒序查找匹配的 sender
+            for rec in reversed(recent_image_records):
+                if now - rec["ts"] > max_age_sec:
+                    break
+                rec_sender = rec.get("sender", "")
+                if not q_sender or q_sender in rec_sender or rec_sender in q_sender:
+                    if os.path.exists(rec["image_path"]):
+                        log_msg(f"【本地图片精准引用命中】对齐引用 [{q_sender}: {q_content[:20]}] -> 本地图片: {rec['image_path']}")
+                        return rec
+
+    # 2. 语义问图匹配最近本地图片
+    c = (query_text or "").lower()
+    img_kws = ["图", "照片", "截图", "画", "识别", "提取", "看下", "看一看", "读", "辨认", "解析", "分析一下", "分析下", "表", "排名", "成绩", "分", "字", "信息", "内容", "数据"]
+    if any(kw in c for kw in img_kws):
+        for rec in reversed(recent_image_records):
+            if now - rec["ts"] > max_age_sec:
+                break
+            if os.path.exists(rec["image_path"]):
+                log_msg(f"【本地图片语义问图命中】对齐提问 '{c[:20]}' -> 会话最新本地图片: {rec['image_path']} (来自: {rec['sender']})")
+                return rec
+
+    return None
+
+
+def cleanup_old_images(max_days=7):
+    try:
+        now = time.time()
+        max_age = max_days * 86400
+        if os.path.exists(IMAGES_DIR):
+            for fname in os.listdir(IMAGES_DIR):
+                fpath = os.path.join(IMAGES_DIR, fname)
+                if os.path.isfile(fpath) and (now - os.path.getmtime(fpath) > max_age):
+                    try:
+                        os.remove(fpath)
+                    except Exception:
+                        pass
+    except Exception as e:
+        log_msg(f"清理旧图片异常: {e}")
 
 
 def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65, temperature: float = None, reasoning_effort: str = None):
@@ -2070,12 +2201,21 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     user_content_payload = user_query
     if provider == "gemini" and image_info and image_info.get("has_image"):
         img_data = None
-        if os.path.exists("/tmp/wechat_last_photo.png"):
+        # 1. 优先读取持久化本地图片记录 (零延迟、原分辨率)
+        if image_info.get("local_path") and os.path.exists(image_info["local_path"]):
+            try:
+                with open(image_info["local_path"], "rb") as f:
+                    img_data = f.read()
+            except Exception:
+                pass
+        # 2. 备用读取临时提取文件
+        if (not img_data or len(img_data) < 500) and os.path.exists("/tmp/wechat_last_photo.png"):
             try:
                 with open("/tmp/wechat_last_photo.png", "rb") as f:
                     img_data = f.read()
             except Exception:
                 pass
+        # 3. 兜底使用内存切片
         if (not img_data or len(img_data) < 500) and image_info.get("_img_bytes"):
             img_data = image_info["_img_bytes"]
         if img_data and len(img_data) > 500:
@@ -2085,7 +2225,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"type": "text", "text": user_query},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                 ]
-                log_msg(f"已将群聊图片 ({len(img_data)} 字节) 作为视觉多模态输入直接送入 {target_model}")
+                log_msg(f"已将本地持久化图片 ({len(img_data)} 字节) 作为视觉多模态输入直接送入 {target_model}")
             except Exception as e:
                 log_msg(f"组装图片多模态 payload 异常: {e}")
 
@@ -2330,8 +2470,8 @@ def find_unread_badge_in_sidebar(img, w):
 
 def switch_to_chat(chat_name, w=None):
     """
-    Switch WeChat window to a target chat/group by typing its name in the search box.
-    Fast, deterministic (approx 0.4s).
+    Switch WeChat window to a target chat/group.
+    If target is focus_chat (e.g. MAGA), directly click the top pinned item to avoid search box contamination.
     """
     if not chat_name:
         return False
@@ -2340,6 +2480,36 @@ def switch_to_chat(chat_name, w=None):
         if not wins:
             return False
         w = wins[0]
+
+    cfg = load_config()
+    focus_chat = cfg.get("focus_chat", "MAGA")
+    # 铁律：如果是切换回置顶主群聊（MAGA），直接按 Escape 退出任何搜索状态并点击置顶项第一行，绝不碰搜索框！
+    if chat_name == focus_chat:
+        d = display.Display(":99")
+        try:
+            esc_kc = d.keysym_to_keycode(XK.XK_Escape)
+            for _ in range(2):
+                xtest.fake_input(d, X.KeyPress, esc_kc)
+                xtest.fake_input(d, X.KeyRelease, esc_kc)
+            d.sync()
+        except Exception:
+            pass
+        finally:
+            d.close()
+        time.sleep(0.08)
+        # 点击左侧会话列表置顶第一项
+        pinned_x = w["x"] + 150
+        pinned_y = w["y"] + 105
+        x11_click(pinned_x, pinned_y)
+        log_msg(f"直接点击置顶会话切换回主关注群聊【{chat_name}】")
+        time.sleep(0.3)
+        return True
+
+    # 切换至私聊或其他非置顶会话：先清理残留 xclip
+    try:
+        subprocess.run(["pkill", "-f", "xclip"], stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
 
     search_x = w["x"] + 169
     search_y = w["y"] + 59
@@ -2353,6 +2523,7 @@ def switch_to_chat(chat_name, w=None):
         bs_kc = d.keysym_to_keycode(XK.XK_BackSpace)
         v_kc = d.keysym_to_keycode(XK.XK_v)
         ret_kc = d.keysym_to_keycode(XK.XK_Return)
+        esc_kc = d.keysym_to_keycode(XK.XK_Escape)
 
         # Clear existing search input
         xtest.fake_input(d, X.KeyPress, ctrl_kc)
@@ -2376,7 +2547,10 @@ def switch_to_chat(chat_name, w=None):
             stderr=subprocess.DEVNULL,
             env=env,
         )
-        p.communicate(input=chat_name.encode("utf-8"), timeout=2)
+        try:
+            p.communicate(input=chat_name.encode("utf-8"), timeout=0.8)
+        except Exception:
+            p.kill()
 
         xtest.fake_input(d, X.KeyPress, ctrl_kc)
         xtest.fake_input(d, X.KeyPress, v_kc)
@@ -2410,6 +2584,8 @@ def monitor_loop():
     is_in_private_chat = False
     private_chat_opened_ts = 0.0
     initial_focus_done = False
+    last_heal_check_ts = 0.0
+    last_cleanup_ts = 0.0
 
     def is_in_task_queue(sender, content):
         norm_c = normalize_dedup_text(content)
@@ -2469,6 +2645,38 @@ def monitor_loop():
                             force_rescan = True
                             prev_crop = None
                             anim_mask = None
+
+                    # UI 自愈守卫：若处于群聊状态且超过 8 秒未发消息，检查会话顶部是否处于无标题/搜索残留状态
+                    if not is_in_private_chat and not reply_task_queue and (time.time() - last_send_ts > 8.0):
+                        if time.time() - last_heal_check_ts > 15.0:
+                            last_heal_check_ts = time.time()
+                            hdr_box = (
+                                w["x"] + int(w["width"] * 0.35),
+                                w["y"] + 8,
+                                w["x"] + w["width"] - 120,
+                                w["y"] + 45
+                            )
+                            hdr_stat = ImageStat.Stat(img.crop(hdr_box).convert("L"))
+                            if hdr_stat.stddev[0] < 1.5:
+                                log_msg("[UI自愈守卫] 检测到会话标题区处于空白/搜索态，按 Escape 退出搜索并恢复置顶群聊...")
+                                d_h = display.Display(":99")
+                                try:
+                                    esc_k = d_h.keysym_to_keycode(XK.XK_Escape)
+                                    for _ in range(2):
+                                        xtest.fake_input(d_h, X.KeyPress, esc_k)
+                                        xtest.fake_input(d_h, X.KeyRelease, esc_k)
+                                    d_h.sync()
+                                except Exception:
+                                    pass
+                                finally:
+                                    d_h.close()
+                                time.sleep(0.1)
+                                x11_click(w["x"] + 150, w["y"] + 105)
+                                force_rescan = True
+
+                    if time.time() - last_cleanup_ts > 3600:
+                        last_cleanup_ts = time.time()
+                        cleanup_old_images(max_days=7)
 
                     rx1 = w["x"] + int(w["width"] * 0.33)
                     ry1 = w["y"] + int(w["height"] * 0.38)
@@ -2639,26 +2847,22 @@ def monitor_loop():
                                             rec_c = card_prefix + (" " + rec_c if rec_c and rec_c != c_title else "")
                                         if has_q and q_info.get("quoted_content"):
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
+                                        saved_img_path = None
                                         if has_img and img_info:
-                                            if img_info.get("_crop_box") and not img_info.get("_img_bytes"):
-                                                try:
-                                                    cb = tuple(img_info["_crop_box"])
-                                                    buf = io.BytesIO()
-                                                    chat_img.crop(cb).save(buf, format="PNG")
-                                                    img_info["_img_bytes"] = buf.getvalue()
-                                                except Exception:
-                                                    pass
+                                            # 立即执行本地图片持久化落盘 (原图提取 + 气泡切片双保险)
+                                            saved_img_path = save_incoming_image(s, img_info, chat_img, msg_ts=batch_ts)
+                                            if saved_img_path:
+                                                img_info["local_path"] = saved_img_path
                                             img_info["ts"] = time.time()
                                             img_info["sender"] = s
                                             last_received_images[session_key] = img_info
-                                            log_msg(f"记录会话最新图片: sender={s}, type={img_info.get('image_type')}, has_pos={bool(img_info.get('_screen_pos'))}")
                                             if img_info.get("image_type"):
                                                 rec_c = f"[附图: {img_info.get('image_type')}] " + rec_c
                                         if has_file and file_att.get("file_name"):
                                             rec_c = f"[文件: {file_att.get('file_name')}] " + (rec_c if rec_c and not rec_c.startswith("[发送文件") else "")
 
-                                        # 写入当前批次时间戳 batch_ts 并立即注册去重时间戳，防止重复纳入
-                                        save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m, msg_ts=batch_ts)
+                                        # 写入当前批次时间戳 batch_ts 并立即注册去重时间戳，持久化关联本地图片路径
+                                        save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m, msg_ts=batch_ts, image_path=saved_img_path)
                                         mark_seen(s, c, ts=batch_ts)
                                         last_processed_ts = batch_ts
 
@@ -2737,16 +2941,26 @@ def monitor_loop():
                                                         target_file_info = recent_f
                                                         log_msg(f"为用户提问关联最近上传的文件: {recent_f.get('file_name')}")
 
-                                            # 关联当前消息中的图片或该会话最近 10 分钟内接收的图片（例如用户引用图片、或者发送图片后追问“读这个图片/看下图片/图里写的啥”）
-                                            target_img_info = img_info
-                                            if (not target_img_info or not target_img_info.get("has_image")) and session_key in last_received_images:
-                                                recent_img = last_received_images[session_key]
-                                                if time.time() - recent_img.get("ts", 0) < 600:
-                                                    img_kws = ["图", "照片", "截图", "画", "识别", "提取", "看下", "看一看", "读", "辨认", "解析", "表", "排名", "成绩", "分", "字", "信息", "内容", "数据"]
-                                                    is_quote_img = has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["[图片]", "图", "照片", "截图"])
-                                                    if is_quote_img or any(kw in c.lower() for kw in img_kws) or is_in_private_chat:
-                                                        target_img_info = recent_img
-                                                        log_msg(f"为用户提问关联会话最近接收的图片: {recent_img.get('image_type')} (来自: {recent_img.get('sender')})")
+                                            # 关联当前消息中的图片或本地持久化历史图片
+                                            target_img_info = img_info if (img_info and img_info.get("has_image")) else None
+                                            if not target_img_info or not target_img_info.get("has_image"):
+                                                matched_rec = find_image_for_query(c, quote_info=q_info, session_key=session_key)
+                                                if matched_rec:
+                                                    target_img_info = {
+                                                        "has_image": True,
+                                                        "local_path": matched_rec["image_path"],
+                                                        "image_type": matched_rec.get("image_type", "图片"),
+                                                        "ocr_and_detail": matched_rec.get("ocr_and_detail", ""),
+                                                        "sender": matched_rec.get("sender", ""),
+                                                    }
+                                                elif session_key in last_received_images:
+                                                    recent_img = last_received_images[session_key]
+                                                    if time.time() - recent_img.get("ts", 0) < 600:
+                                                        img_kws = ["图", "照片", "截图", "画", "识别", "提取", "看下", "看一看", "读", "辨认", "解析", "表", "排名", "成绩", "分", "字", "信息", "内容", "数据"]
+                                                        is_quote_img = has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["[图片]", "图", "照片", "截图"])
+                                                        if is_quote_img or any(kw in c.lower() for kw in img_kws) or is_in_private_chat:
+                                                            target_img_info = recent_img
+                                                            log_msg(f"为用户提问关联会话最近接收的图片: {recent_img.get('image_type')} (来自: {recent_img.get('sender')})")
 
                                             reply_candidates.append({
                                                 "sender": s,
@@ -2828,11 +3042,13 @@ def monitor_loop():
                         t_img = target.get("image") or {}
                         if isinstance(t_img, dict) and t_img.get("has_image"):
                             try:
-                                if t_img.get("_img_bytes"):
+                                if t_img.get("local_path") and os.path.exists(t_img["local_path"]):
+                                    log_msg(f"直接使用本地持久化原图: {t_img['local_path']}")
+                                elif t_img.get("_img_bytes"):
                                     with open("/tmp/wechat_last_photo.png", "wb") as pf:
                                         pf.write(t_img["_img_bytes"])
                                     log_msg(f"已从队列缓存恢复待回复消息图片至 /tmp/wechat_last_photo.png ({len(t_img['_img_bytes'])} 字节)")
-                                if "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
+                                elif "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
                                     spos = t_img["_screen_pos"]
                                     extract_image_via_clipboard(spos[0], spos[1], "/tmp/wechat_last_photo.png")
                             except Exception as ie:
