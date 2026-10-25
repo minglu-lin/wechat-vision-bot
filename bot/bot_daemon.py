@@ -145,6 +145,8 @@ def is_trivial_or_reaction(content):
     if not content:
         return True
     s = content.strip()
+    if "[发送文件" in s or "[文件" in s:
+        return False
     if re.fullmatch(r'(?:\[[a-zA-Z0-9_\u4e00-\u9fa5]+\]|\s)+', s):
         return True
     s_clean = re.sub(r'^[\[\(\"\'\“\‘\s]+|[\]\)\"\'\”\’\s]+$', '', s).strip()
@@ -188,6 +190,255 @@ def is_stop_command(content):
         if p in c:
             return True
     return False
+
+
+# -------------------------------------------------------------
+# File Attachment Locator & Multi-Format Document Parsers
+# Supports:
+# 1. Plain text & code (.txt, .py, .json, .csv, .md, .sh, .yaml, etc.)
+# 2. PDF Documents (.pdf) via pypdf
+# 3. Excel Spreadsheets (.xlsx, .xls) via openpyxl & xlrd
+# 4. Word Documents (.docx) via python-docx
+# -------------------------------------------------------------
+last_received_files = {}  # session_key -> dict(file_name, file_size, file_path, file_content, ts)
+
+
+def find_received_file(file_name="", max_wait_sec=3.0):
+    """
+    在 WeChat Linux 文件缓存目录查找接收到的本地文件。
+    WeChat Linux 4.0 将接收的文件存储在:
+    /home/opc/xwechat_files/<wxid>/msg/file/YYYY-MM/<filename>
+    """
+    import glob
+    base_dirs = [
+        "/home/opc/xwechat_files",
+        os.path.expanduser("~/xwechat_files"),
+    ]
+    base_dir = "/home/opc/xwechat_files"
+    for b in base_dirs:
+        if os.path.exists(b):
+            base_dir = b
+            break
+
+    start_t = time.time()
+    while time.time() - start_t <= max_wait_sec:
+        # 1. 精确路径匹配
+        if file_name:
+            pattern = f"{base_dir}/*/msg/file/*/{file_name}"
+            matches = glob.glob(pattern)
+            if matches:
+                matches.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                return matches[0]
+
+            # 2. 忽略大小写精确匹配
+            all_files = glob.glob(f"{base_dir}/*/msg/file/*/*")
+            f_norm = file_name.strip().lower()
+            matches = [f for f in all_files if os.path.basename(f).strip().lower() == f_norm]
+            if matches:
+                matches.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                return matches[0]
+
+            # 3. 文件名主干与后缀模糊匹配 (如 report(1).pdf 匹配 report.pdf)
+            stem = os.path.splitext(file_name)[0].strip().lower()
+            ext = os.path.splitext(file_name)[1].strip().lower()
+            if stem and ext:
+                fuzzy = [
+                    f for f in all_files
+                    if stem in os.path.basename(f).lower() and f.lower().endswith(ext)
+                ]
+                if fuzzy:
+                    fuzzy.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                    return fuzzy[0]
+
+        # 4. 兜底策略：查找最近 30 秒内新生成或修改的文件
+        all_recent = glob.glob(f"{base_dir}/*/msg/file/*/*")
+        if all_recent:
+            all_recent.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            newest = all_recent[0]
+            if time.time() - os.path.getmtime(newest) < 30.0:
+                return newest
+
+        time.sleep(0.5)
+
+    return None
+
+
+def parse_file_content(file_path, max_chars=35000):
+    """
+    通用多格式本地文件解析器：
+    - 纯文本 / 代码（.txt / .py / .json / .csv / .md / .sh / .yaml 等）：直接读取
+    - PDF 文档（.pdf）：利用 pypdf 提取分页全文
+    - Excel 表格（.xlsx / .xls）：利用 openpyxl / xlrd 解析为结构化 Markdown 表格
+    - Word 文档（.docx）：利用 python-docx 提取段落与表格
+    """
+    if not file_path or not os.path.exists(file_path):
+        return f"[错误: 找不到本地文件 {file_path}]"
+
+    file_name = os.path.basename(file_path)
+    file_ext = os.path.splitext(file_name)[1].lower()
+    file_size_kb = os.path.getsize(file_path) / 1024.0
+
+    lines_out = [f"【文件名称】: {file_name} ({file_size_kb:.1f} KB)"]
+
+    try:
+        # 1. CSV 表格解析（专精格式化为 Markdown 表格）
+        if file_ext == ".csv":
+            import csv
+            enc = "utf-8"
+            for test_enc in ["utf-8-sig", "utf-8", "gb18030", "latin1"]:
+                try:
+                    with open(file_path, "r", encoding=test_enc) as f:
+                        f.read(2048)
+                    enc = test_enc
+                    break
+                except UnicodeDecodeError:
+                    continue
+            with open(file_path, "r", encoding=enc, errors="ignore") as f:
+                reader = csv.reader(f)
+                rows = [r for r in reader if any(field.strip() for field in r)]
+            if rows:
+                lines_out.append(f"【CSV 数据表格】(共 {len(rows)} 行):")
+                header = rows[0]
+                lines_out.append("| " + " | ".join(header) + " |")
+                lines_out.append("|" + "|".join(["---"] * len(header)) + "|")
+                for row in rows[1:101]:
+                    r_vals = [c.replace("\n", " ") for c in row]
+                    if len(r_vals) < len(header):
+                        r_vals.extend([""] * (len(header) - len(r_vals)))
+                    elif len(r_vals) > len(header):
+                        r_vals = r_vals[:len(header)]
+                    lines_out.append("| " + " | ".join(r_vals) + " |")
+                if len(rows) > 101:
+                    lines_out.append(f"... (CSV 共 {len(rows)} 行，已截取前 100 行供快速分析) ...")
+                return "\n".join(lines_out)
+
+        # 2. 纯文本与代码文件
+        text_exts = {
+            ".txt", ".py", ".json", ".md", ".sh", ".yaml", ".yml",
+            ".html", ".xml", ".log", ".js", ".ts", ".c", ".cpp", ".h",
+            ".java", ".go", ".rs", ".sql", ".ini", ".conf", ".bat", ".r",
+            ".css", ".env", ".toml"
+        }
+        if file_ext in text_exts:
+            content = None
+            for enc in ["utf-8", "gb18030", "latin1"]:
+                try:
+                    with open(file_path, "r", encoding=enc) as f:
+                        content = f.read(max_chars + 1000)
+                    break
+                except UnicodeDecodeError:
+                    continue
+            if content is None:
+                with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                    content = f.read(max_chars + 1000)
+
+            if len(content) > max_chars:
+                content = content[:max_chars] + f"\n... [文本过长，已截取前 {max_chars} 字符] ..."
+            lines_out.append("【文件正文内容】:")
+            lines_out.append(content)
+            return "\n".join(lines_out)
+
+        # 3. PDF 文档解析
+        elif file_ext == ".pdf":
+            import pypdf
+            reader = pypdf.PdfReader(file_path)
+            num_pages = len(reader.pages)
+            lines_out.append(f"【PDF 总页数】: {num_pages} 页")
+            extracted_text = []
+            curr_len = 0
+            for i, page in enumerate(reader.pages[:50]):  # 支持最多前 50 页长文/研报
+                p_text = (page.extract_text() or "").strip()
+                if p_text:
+                    extracted_text.append(f"--- 第 {i+1} 页 ---\n{p_text}")
+                    curr_len += len(p_text)
+                    if curr_len >= max_chars:
+                        extracted_text.append(f"\n... [PDF 内容过长，已截取前 {i+1} 页，约 {max_chars} 字符] ...")
+                        break
+            if not extracted_text:
+                lines_out.append("【提示】: 该 PDF 文件未能提取到可读文本层，可能为纯扫描图片版 PDF。")
+            else:
+                lines_out.append("【PDF 提取正文内容】:\n" + "\n\n".join(extracted_text))
+            return "\n".join(lines_out)
+
+        # 4. Excel 表格解析 (.xlsx, .xls)
+        elif file_ext in [".xlsx", ".xls"]:
+            if file_ext == ".xlsx":
+                import openpyxl
+                wb = openpyxl.load_workbook(file_path, data_only=True, read_only=True)
+                sheet_names = wb.sheetnames
+                lines_out.append(f"【Excel 工作表列表】: {', '.join(sheet_names)}")
+                for s_name in sheet_names[:5]:
+                    ws = wb[s_name]
+                    rows = list(ws.iter_rows(values_only=True))
+                    if not rows:
+                        continue
+                    lines_out.append(f"\n--- 工作表: {s_name} (共 {len(rows)} 行) ---")
+                    header = [str(c) if c is not None else "" for c in rows[0]]
+                    lines_out.append("| " + " | ".join(header) + " |")
+                    lines_out.append("|" + "|".join(["---"] * len(header)) + "|")
+                    for row in rows[1:101]:  # 前 100 行
+                        r_vals = [str(c).replace("\n", " ") if c is not None else "" for c in row]
+                        if len(r_vals) < len(header):
+                            r_vals.extend([""] * (len(header) - len(r_vals)))
+                        elif len(r_vals) > len(header):
+                            r_vals = r_vals[:len(header)]
+                        lines_out.append("| " + " | ".join(r_vals) + " |")
+                    if len(rows) > 101:
+                        lines_out.append(f"... (该工作表共 {len(rows)} 行，已截取前 100 行) ...")
+                wb.close()
+            else:
+                import xlrd
+                book = xlrd.open_workbook(file_path)
+                lines_out.append(f"【Excel (XLS) 工作表列表】: {', '.join(book.sheet_names())}")
+                for s_idx in range(min(5, book.nsheets)):
+                    sh = book.sheet_by_index(s_idx)
+                    if sh.nrows == 0:
+                        continue
+                    lines_out.append(f"\n--- 工作表: {sh.name} (共 {sh.nrows} 行, {sh.ncols} 列) ---")
+                    first_row = [str(sh.cell_value(0, c)) for c in range(sh.ncols)]
+                    lines_out.append("| " + " | ".join(first_row) + " |")
+                    lines_out.append("|" + "|".join(["---"] * len(first_row)) + "|")
+                    for r in range(1, min(sh.nrows, 101)):
+                        r_vals = [str(sh.cell_value(r, c)).replace("\n", " ") for c in range(sh.ncols)]
+                        lines_out.append("| " + " | ".join(r_vals) + " |")
+                    if sh.nrows > 101:
+                        lines_out.append(f"... (共 {sh.nrows} 行，已截取前 100 行) ...")
+            return "\n".join(lines_out)
+
+        # 5. Word 文档解析 (.docx)
+        elif file_ext == ".docx":
+            import docx
+            doc = docx.Document(file_path)
+            lines_out.append(f"【Word 文档解析】(共 {len(doc.paragraphs)} 个段落, {len(doc.tables)} 个表格):")
+            doc_content = []
+            curr_len = 0
+            for p in doc.paragraphs:
+                p_text = p.text.strip()
+                if p_text:
+                    doc_content.append(p_text)
+                    curr_len += len(p_text)
+                    if curr_len >= max_chars:
+                        doc_content.append(f"... [Word 文档过长，已截取前 {max_chars} 字符] ...")
+                        break
+            for t_idx, table in enumerate(doc.tables[:5]):
+                t_rows = []
+                for row in table.rows:
+                    t_rows.append([cell.text.strip().replace("\n", " ") for cell in row.cells])
+                if t_rows:
+                    doc_content.append(f"\n[文档表格 {t_idx+1}]:")
+                    header = t_rows[0]
+                    doc_content.append("| " + " | ".join(header) + " |")
+                    doc_content.append("|" + "|".join(["---"] * len(header)) + "|")
+                    for r in t_rows[1:30]:
+                        doc_content.append("| " + " | ".join(r) + " |")
+            lines_out.append("\n".join(doc_content))
+            return "\n".join(lines_out)
+
+        else:
+            return f"【文件名称】: {file_name} ({file_size_kb:.1f} KB)\n[提示: 当前暂不支持直接解析 {file_ext} 类型的二进制文件，支持的文件包括 .txt, .py, .json, .csv, .md, .pdf, .xlsx, .xls, .docx 等]"
+
+    except Exception as e:
+        return f"【文件解析异常】: 解析文件 {file_name} 失败: {e}"
 
 
 def is_explicit_bot_invocation(content):
@@ -1130,9 +1381,14 @@ class TaskModelRouter:
     ]
 
     @classmethod
-    def route(cls, content: str, quote_info: dict = None, image_info: dict = None) -> dict:
+    def route(cls, content: str, quote_info: dict = None, image_info: dict = None, file_info: dict = None) -> dict:
         c = (content or "").strip().lower()
         has_img = bool(image_info and image_info.get("has_image"))
+        has_code_file = False
+        if file_info and file_info.get("file_name"):
+            f_ext = os.path.splitext(file_info["file_name"])[1].lower()
+            if f_ext in [".py", ".ts", ".js", ".go", ".rs", ".cpp", ".c", ".java", ".sql"]:
+                has_code_file = True
 
         # 1. 多模态/附图解析诉求 -> 分流给 Gemini 3.8 Flash (Kimi 纯文本 API 无法接收图片数据)
         if has_img or any(re.search(p, c) for p in cls.MULTIMODAL_IMAGE_PATTERNS):
@@ -1143,8 +1399,8 @@ class TaskModelRouter:
                 "reason": "多模态视觉图文解析",
             }
 
-        # 2. 复杂编程/算法/数学证明/深度推理 -> 分流给 Gemini 4 Argon
-        if any(re.search(p, c) for p in cls.DEEP_REASONING_PATTERNS):
+        # 2. 复杂编程/算法/数学证明/深度推理/复杂代码分析 -> 分流给 Gemini 4 Argon
+        if (has_code_file and any(kw in c for kw in ["debug", "排查", "报错", "重构", "优化", "实现", "分析", "为什么", "bug"])) or any(re.search(p, c) for p in cls.DEEP_REASONING_PATTERNS):
             log_msg(f"【模型分流路由】高难度编程/数理推导/深度逻辑推理 -> 分流至 Gemini 4 Argon")
             return {
                 "provider": "gemini",
@@ -1152,9 +1408,9 @@ class TaskModelRouter:
                 "reason": "深度代码与数理逻辑推理",
             }
 
-        # 3. 主力日常对话、微信文章卡片阅读、长文本阅读、日常查询、生活工具调用 -> 分流给 Kimi
-        # （充分消耗充裕的 Kimi 额度，最大限度节约宝贵的 Gemini 额度）
-        log_msg(f"【模型分流路由】常规群聊文本问答/长文阅读/工具调用 -> 分流至 Kimi (充裕额度主力)")
+        # 3. 主力日常对话、文档/PDF/Excel/Word长文阅读总结、常规文本问答、生活工具调用 -> 分流给 Kimi
+        # （充分消耗充裕的 Kimi 128k 长文本额度，最大限度节约宝贵的 Gemini 额度）
+        log_msg(f"【模型分流路由】常规群聊文本问答/长文及文档阅读/工具调用 -> 分流至 Kimi (充裕额度主力)")
         return {
             "provider": "kimi",
             "model": "kimi-for-coding-highspeed",
@@ -1197,10 +1453,10 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         prompt = (
             f"这是一张微信【私聊窗口】（好友 1 对 1 对话）最新截图。\n"
             f"当前是好友与 bot 的私信单聊界面。\n"
-            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括对方发的白色气泡、我们自己发的绿色气泡以及图片消息）：\n\n"
+            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括对方发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
             f"针对每条消息，提取以下字段：\n"
             f"1. sender: 对方好友昵称（查看聊天窗口顶部标题所显示的名称，或者对方发送的白色气泡发送者）\n"
-            f"2. content: 消息主体文本内容（若是图片，简要描述图片类型与核心画面）\n"
+            f"2. content: 消息主体文本内容（若是文件卡片，提取文件名并格式化为 '[发送文件: 文件名]'；若是图片，简要描述图片类型与核心画面）\n"
             f"3. is_incoming: 是否是对方发送的左侧白色气泡（true 为对方发送，false 为右侧绿色气泡我们自己/bot 发送）\n"
             f"4. is_mentioned: 【私聊核心原则】：在 1 对 1 私聊中，对方发送的任何消息（is_incoming=True）都是直接对 bot 说的！因此只要对方发送了有效提问、指令或闲聊，is_mentioned 必须强制设为 true（无需 @bot 或 bot 关键字）！如果是敷衍附和或无意义标点，可设为 false。\n"
             f"5. is_followup: 是否是对上一轮回答的连续追问（若是追问设为 true，否则 false）\n"
@@ -1208,7 +1464,10 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
             f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
             f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
-            f"   - 若不是卡片：is_card=false\n\n"
+            f"   - 若不是卡片：is_card=false\n"
+            f"9. file_attachment: 该消息是否为发送的文件卡片（如 .pdf, .xlsx, .xls, .docx, .doc, .txt, .py, .csv, .md, .zip 等各类文件）？\n"
+            f"   - 若是文件卡片：has_file=true, file_name(完整文件名含扩展名), file_size(如 61B, 2.5MB), box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间\n"
+            f"   - 若不是文件卡片：has_file=false, file_name='', file_size='', box_2d: []\n\n"
             f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
             f'{{\n'
             f'  "messages": [\n'
@@ -1220,7 +1479,8 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f'      "is_followup": false,\n'
             f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
             f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
-            f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}}\n'
+            f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}},\n'
+            f'      "file_attachment": {{"has_file": false, "file_name": "", "file_size": "", "box_2d": []}}\n'
             f'    }}\n'
             f'  ]\n'
             f'}}\n'
@@ -1228,10 +1488,10 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
     else:
         prompt = (
             f"这是一张微信群聊窗口最新截图。\n"
-            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括群友发的白色气泡、我们自己发的绿色气泡以及图片消息）：\n\n"
+            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括群友发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
             f"针对每条消息，提取以下字段：\n"
             f"1. sender: 发送者群昵称（若是右侧绿色气泡，则为我们自己/bot）\n"
-            f"2. content: 消息主体文本内容（若是图片，简要描述图片类型与核心画面）\n"
+            f"2. content: 消息主体文本内容（若是文件卡片，提取文件名并格式化为 '[发送文件: 文件名]'；若是图片，简要描述图片类型与核心画面）\n"
             f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
             f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
             f"   - 【用户最高铁律】：只要消息开头包含 @AIbot、@Albot、@bot、@微信小号，或者以 bot、aibot 开头（如 'bot ...'、'@AIbot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
@@ -1242,7 +1502,10 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
             f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
             f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
-            f"   - 若不是卡片：is_card=false\n\n"
+            f"   - 若不是卡片：is_card=false\n"
+            f"9. file_attachment: 该消息是否为发送的文件卡片（如 .pdf, .xlsx, .xls, .docx, .doc, .txt, .py, .csv, .md, .zip 等各类文件）？\n"
+            f"   - 若是文件卡片：has_file=true, file_name(完整文件名含扩展名), file_size(如 61B, 2.5MB), box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间\n"
+            f"   - 若不是文件卡片：has_file=false, file_name='', file_size='', box_2d: []\n\n"
             f"{session_instruction}"
             f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
             f'{{\n'
@@ -1255,7 +1518,8 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f'      "is_followup": false,\n'
             f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
             f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
-            f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}}\n'
+            f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}},\n'
+            f'      "file_attachment": {{"has_file": false, "file_name": "", "file_size": "", "box_2d": []}}\n'
             f'    }}\n'
             f'  ]\n'
             f'}}\n'
@@ -1330,6 +1594,21 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
                                     ref_img["_screen_pos"] = [screen_cx, screen_cy]
                         except Exception as ce:
                             log_msg(f"计算图片坐标失败: {ce}")
+
+                file_att = m.get("file_attachment")
+                if file_att and file_att.get("has_file"):
+                    fn = file_att.get("file_name", "").strip()
+                    if not m.get("content") or m.get("content").strip() == "":
+                        m["content"] = f"[发送文件: {fn}]" if fn else "[发送文件]"
+                    box = file_att.get("box_2d")
+                    if isinstance(box, list) and len(box) == 4 and chat_box:
+                        try:
+                            ymin, xmin, ymax, xmax = box
+                            screen_cx = chat_box[0] + int(((xmin + xmax) / 2) * (chat_box[2] - chat_box[0]) / 1000)
+                            screen_cy = chat_box[1] + int(((ymin + ymax) / 2) * (chat_box[3] - chat_box[1]) / 1000)
+                            file_att["_screen_pos"] = [screen_cx, screen_cy]
+                        except Exception as ce:
+                            log_msg(f"计算文件卡片坐标失败: {ce}")
             if isinstance(msgs, list):
                 return msgs
             elif "content" in data:
@@ -1465,7 +1744,7 @@ def clean_bot_reply(text):
     return "\n".join(cleaned_lines).strip()
 
 
-def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None, force_provider=None):
+def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None, file_info=None, force_provider=None):
     # 0. Fast-Path Direct Execution (0 Token, <100ms ultra-low latency)
     if plugin_manager:
         matched, fast_reply = plugin_manager.match_fast_path(content)
@@ -1474,7 +1753,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             return fast_reply
 
     sys_prompt = cfg.get("system_prompt", "")
-    route_info = TaskModelRouter.route(content, quote_info=quote_info, image_info=image_info)
+    route_info = TaskModelRouter.route(content, quote_info=quote_info, image_info=image_info, file_info=file_info)
     provider = route_info["provider"]
     target_model = route_info["model"]
     route_reason = route_info["reason"]
@@ -1497,7 +1776,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     content_lower = content.lower()
     is_deep_eval = any(kw in content_lower for kw in [
         "评价", "分析", "解读", "怎么看", "如何看", "你怎么认为", "深度", "对比", "优缺点", "讲了什么", "研报", "总结", "详细说", "为什么"
-    ]) or (quote_info and any(kw in str(quote_info.get("quoted_content", "")).lower() for kw in ["《", "http", "mp.weixin.qq.com"]))
+    ]) or (quote_info and any(kw in str(quote_info.get("quoted_content", "")).lower() for kw in ["《", "http", "mp.weixin.qq.com"])) or bool(file_info)
 
     is_factual_lookup = any(kw in content_lower for kw in [
         "推荐", "哪家", "哪里", "买衣服", "商场", "餐馆", "美食", "攀岩", "酒吧", "健身房", "地铁", "路线", "怎么走", "多少钱", "汇率", "天气", "价格", "报错", "怎么解决", "怎么配", "代码"
@@ -1548,6 +1827,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
         f"- 如果群聊中分享了微信文章卡片、新闻卡片、或群友要求对刚刚分享的文章‘评价一下’、‘总结下’、‘分析下’、‘你怎么看’、‘讲了什么’等：你绝对不能只凭标题凭空推测或说‘光从标题看’！必须立即调用 $web_search 联网搜索工具获取该文章的完整正文和真实事实细节，以完整报道事实为基础进行客观、深刻、有理有据的分析评价！\n"
+        f"【文档与附件文件深度解析指引（核心能力）】：\n"
+        f"- 如果提问附带或关联了用户上传的附件文件（纯文本代码、PDF长论文/研报/合同、Excel结构化表格、Word文档等），系统已在下方将文件正文和结构化表格完整提取并注入到上下文中；\n"
+        f"- 你必须仔细研读文件内容，全面、准确、专业地结合用户提问进行解答、数据汇总、提炼或代码分析。严禁说‘无法读取文件’或‘请发送文件’，因为文件内容已经完整呈现给你！\n"
         f"【微信引用与群聊图片处理指引】：\n"
         f"- 如果群友在本次提问中使用了微信‘引用’，请特别针对被引用的历史内容进行针对性答复；\n"
         f"- 如果提问附带或关联了群聊中刚刚发送的图片/截图（如搜索结果截图、代码报错、报表、照片等），系统已通过视觉模型提取了图片中的文字、关键词、搜索列表和画面详情，请务必紧密结合图片中的实际文字与证据进行回答，万不可无视图片细节！\n"
@@ -1585,6 +1867,20 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         img_ocr = str(image_info.get("ocr_and_detail", "")).strip()
         if img_ocr:
             user_query += f"\n【群聊中关联/引用的图片识别详情（视觉OCR与画面解析）】：\n- 图片类别：{img_type}\n- 图片画面与文字详情：{img_ocr}"
+
+    if file_info and file_info.get("file_content"):
+        f_name = file_info.get("file_name", "未知文件")
+        f_content = file_info.get("file_content", "")
+        f_size = file_info.get("file_size", "")
+        size_str = f"（文件大小: {f_size}）" if f_size else ""
+        if not content or content.startswith("[发送文件") or content.strip() == f_name:
+            user_query = f"{sender}: 我发送了文件【{f_name}】，请帮我详细梳理总结该文件的核心内容、主要结构和关键要点。"
+
+        user_query += (
+            f"\n\n【用户上传附件/文档解析内容 (文件名: {f_name}{size_str})】:\n"
+            f"{f_content}\n\n"
+            f"【文件阅读与解答准则】：系统已自动读取并解析了上述文件的完整数据与内容！请仔细阅读上述文件内容，准确、专业、深入地结合用户的问题进行分析、提炼、计算或解答。"
+        )
 
     # 1. Automatic URL extraction & web page content fetching
     is_visual_query = False
@@ -1870,6 +2166,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
     c = target["content"]
     q_info = target.get("quote")
     img_info = target.get("image")
+    file_info = target.get("file")
     is_explicit = target.get("is_explicit", False)
 
     max_attempts = 3 if is_explicit else 2
@@ -1886,6 +2183,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
                 recent_history=recent_history,
                 quote_info=q_info,
                 image_info=img_info,
+                file_info=file_info,
                 force_provider="gemini" if attempt >= 2 else None,
             )
             if reply_content and reply_content.strip():
@@ -2200,6 +2498,7 @@ def monitor_loop():
                                         is_f = msg_item.get("is_followup", False)
                                         q_info = msg_item.get("quote", {})
                                         img_info = msg_item.get("referenced_image", {})
+                                        file_att = msg_item.get("file_attachment", {})
 
                                         if not c:
                                             continue
@@ -2216,11 +2515,34 @@ def monitor_loop():
                                             is_in = True
                                             is_m = True
 
-                                        # Format recorded text with card, quote and image tags
+                                        # Format recorded text with card, quote, image and file tags
                                         card_info = msg_item.get("article_card", {})
                                         has_card = card_info.get("is_card", False) if isinstance(card_info, dict) else False
                                         has_q = q_info.get("has_quote", False) if isinstance(q_info, dict) else False
                                         has_img = img_info.get("has_image", False) if isinstance(img_info, dict) else False
+                                        has_file = file_att.get("has_file", False) if isinstance(file_att, dict) else False
+
+                                        file_info = None
+                                        session_key = s if is_in_private_chat else focus_chat
+                                        if has_file and file_att.get("file_name"):
+                                            fn = file_att["file_name"].strip()
+                                            log_msg(f"检测到聊天中发送的文件附件: {fn} (大小: {file_att.get('file_size')})")
+                                            fp = find_received_file(fn)
+                                            if fp:
+                                                fc = parse_file_content(fp)
+                                                file_info = {
+                                                    "has_file": True,
+                                                    "file_name": fn,
+                                                    "file_size": file_att.get("file_size", ""),
+                                                    "file_path": fp,
+                                                    "file_content": fc,
+                                                    "ts": time.time(),
+                                                }
+                                                last_received_files[session_key] = file_info
+                                                log_msg(f"成功定位并解析文件 [{fn}] -> {fp} (提取正文长度: {len(fc)} 字)")
+                                            else:
+                                                log_msg(f"未能即时在磁盘定位文件 [{fn}]")
+
                                         rec_c = c
                                         if has_card and card_info.get("title"):
                                             c_title = card_info.get("title", "").strip()
@@ -2232,6 +2554,8 @@ def monitor_loop():
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
                                         if has_img and img_info.get("image_type"):
                                             rec_c = f"[附图: {img_info.get('image_type')}] " + rec_c
+                                        if has_file and file_att.get("file_name"):
+                                            rec_c = f"[文件: {file_att.get('file_name')}] " + (rec_c if rec_c and not rec_c.startswith("[发送文件") else "")
 
                                         # 写入当前批次时间戳 batch_ts 并立即注册去重时间戳，防止重复纳入
                                         save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m, msg_ts=batch_ts)
@@ -2250,8 +2574,8 @@ def monitor_loop():
                                             last_bot_reply_ts = 0.0
                                             continue
 
-                                        # 2. Trivial message / emoji reaction filter (显式呼叫指令绝对不拦截)
-                                        if is_trivial_or_reaction(c) and not is_explicit:
+                                        # 2. Trivial message / emoji reaction filter (显式呼叫指令和发送文件绝对不拦截)
+                                        if is_trivial_or_reaction(c) and not is_explicit and not has_file:
                                             log_msg(f"过滤非实质提问消息 (表情/标点/附和): '{c}'，不触发回复")
                                             mark_seen(s, c)
                                             continue
@@ -2302,13 +2626,25 @@ def monitor_loop():
                                                     img_info["_img_bytes"] = buf.getvalue()
                                                 except Exception:
                                                     pass
+
+                                            # 关联当前消息中的文件或该会话最近 10 分钟内上传的文件
+                                            target_file_info = file_info
+                                            if not target_file_info and session_key in last_received_files:
+                                                recent_f = last_received_files[session_key]
+                                                if time.time() - recent_f.get("ts", 0) < 600:
+                                                    f_kws = ["文件", "文档", "代码", "表格", "pdf", "excel", "word", "论文", "附件", "数据", "总结", "分析", "看下", "讲了什么", "bug", "报错", "算一下", "计算", "研报"]
+                                                    if any(kw in c.lower() for kw in f_kws) or is_in_private_chat:
+                                                        target_file_info = recent_f
+                                                        log_msg(f"为用户提问关联最近上传的文件: {recent_f.get('file_name')}")
+
                                             reply_candidates.append({
                                                 "sender": s,
                                                 "content": c,
                                                 "quote": q_info,
                                                 "image": img_info,
-                                                "is_explicit": is_explicit or is_in_private_chat,
-                                                "is_direct": bool(is_explicit or is_m or valid_quote_reply or is_in_private_chat),
+                                                "file": target_file_info,
+                                                "is_explicit": is_explicit or is_in_private_chat or has_file,
+                                                "is_direct": bool(is_explicit or is_m or valid_quote_reply or is_in_private_chat or has_file),
                                                 "is_private": is_in_private_chat,
                                             })
                                         else:

@@ -1,2 +1,6 @@
 Pillow>=9.0.0
 python-xlib>=0.30
+pypdf>=5.0.0
+openpyxl>=3.1.0
+python-docx>=1.1.0
+xlrd>=2.0.0
