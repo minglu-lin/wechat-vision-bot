@@ -29,10 +29,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from plugins import plugin_manager, register_image_sender
     from plugins.stock import StockQuantPlugin
+    from plugins.image_tools import set_last_webpage_info
 except Exception as _pie:
     plugin_manager = None
     register_image_sender = None
     StockQuantPlugin = None
+    set_last_webpage_info = None
 
 os.environ["DISPLAY"] = ":99"
 BASE_DIR = os.environ.get("BOT_BASE_DIR", "/home/opc/wechat_bot" if os.path.exists("/home/opc/wechat_bot") else os.path.dirname(os.path.abspath(__file__)))
@@ -691,20 +693,41 @@ def fetch_url_content(url, timeout=10, max_chars=3500):
         lines = [line.strip() for line in text.splitlines()]
         cleaned_body = "\n".join([line for line in lines if line])
 
-        if not title and len(cleaned_body) < 120:
+        # Extract content images from HTML
+        img_tags = re.findall(r'<img[^>]+(?:src|data-src|data-original|data-actualsrc)=[\'\"]([^\'\"]+)[\'\"]', html_str, re.IGNORECASE)
+        valid_images = []
+        bad_keywords = ["search-btn", "logo", "gototop", "ewm", "qrcode", "avatar", "icon", "button", "banner", ".svg", "blank.gif", "spacer.gif", "border"]
+        for img_src in img_tags:
+            src_clean = img_src.strip()
+            if not src_clean or src_clean.startswith("data:image"):
+                continue
+            if any(b in src_clean.lower() for b in bad_keywords):
+                continue
+            full_img_url = urllib.parse.urljoin(url, src_clean)
+            if full_img_url not in valid_images:
+                valid_images.append(full_img_url)
+
+        try:
+            if set_last_webpage_info:
+                set_last_webpage_info(url, title, valid_images)
+        except Exception:
+            pass
+
+        if not title and len(cleaned_body) < 120 and not valid_images:
             log_msg(f"抓取 URL 失败 ({url}): 无标题且正文过短或无效占位页面")
             return {"success": False, "url": url, "error": "Invalid or placeholder content"}
 
         if len(cleaned_body) > max_chars:
             cleaned_body = cleaned_body[:max_chars] + "\n...(正文较长，已截取前 3500 字)..."
 
-        log_msg(f"抓取网页链接正文成功 ({url}): 标题='{title}', 作者='{author}', 正文长度={len(cleaned_body)}")
+        log_msg(f"抓取网页链接正文成功 ({url}): 标题='{title}', 作者='{author}', 正文长度={len(cleaned_body)}, 提取配图={len(valid_images)} 张")
         return {
             "success": True,
             "url": url,
             "title": title,
             "author": author,
-            "body": cleaned_body
+            "body": cleaned_body,
+            "images": valid_images
         }
     except Exception as e:
         log_msg(f"抓取 URL 失败 ({url}): {e}")
@@ -1820,9 +1843,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"  • AI 绘画与图片重制 (generate_ai_image)：\n"
         f"    - 支持从零文生图（风景、人物、插画、动物、壁纸等）。\n"
         f"    - 特别支持【垫图重制与照片修改（图生图）】：当群友要求'重制一下这个照片'、'改一下这个图'、'把照片里的人变成...'、'仿照这张图'、'换成...'时，必须立即调用 generate_ai_image，并设置 use_ref_image=true！系统已将群聊中的照片作为高精度垫图，能保真重制背景与构图！\n"
-        f"  • 全网搜图与表情包 (search_image)：搜索真实高清照片、壁纸、萌宠摄影或指定主题表情包并直接发送到群聊\n"
-        f"- 当群友提出绘画、作图、生图、重制照片、改图等诉求时，请优先调用 generate_ai_image；当群友要求找真实照片、看图、要某类表情包或壁纸时，调用 search_image。\n"
-        f"- 调用生图或搜图工具后，系统已自动把图片发送到群聊中，你只需自然亲切地告知群友图片已发送，并用一两句生动的话介绍画面内容即可！\n"
+        f"  • 全网搜图与真实照片 (search_image)：搜索真实人物照片、名人、新闻事件图片、高清壁纸或表情包并直接发送到微信聊天中。当群友要求'搜索xxx的照片'、'看下xxx长啥样'、'发一张xxx的图'、'找一张xxx壁纸'时，必须立即调用 search_image！\n"
+        f"  • 网页图片提取与发送 (send_webpage_image)：从网页链接（HTTP/HTTPS/微信公众号文章）中提取真实正文照片、合影、配图并直接发送到微信聊天中！当群友询问'把网页里的图发出来'、'这个网页也有照片啊'、'你就不能发出来图片吗'、'发下照片'时，必须立即调用 send_webpage_image！\n"
+        f"- 当群友提出绘画、作图、生图、重制照片、改图等诉求时，请优先调用 generate_ai_image；当群友要求找真实照片、看图、要某类表情包或壁纸时，调用 search_image；当群友要求发送网页/文章内的照片时，调用 send_webpage_image。\n"
+        f"- 调用生图、搜图或网页发图工具后，系统已自动把图片发送到微信窗口中，你只需自然亲切地告知对方图片已发送，并用一两句话简要介绍画面内容即可，绝对严禁说'我发不了图片'！\n"
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
@@ -1931,13 +1955,16 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         fetch_res = fetch_url_content(u)
         if fetch_res.get("success"):
             fetched_any_article = True
+            img_count = len(fetch_res.get("images", []))
+            img_hint = f"- 该网页内包含真实正文照片/合影/配图: 共 {img_count} 张\n" if img_count > 0 else ""
             user_query += (
                 f"\n【系统已成功将该分享卡片/链接解析还原为真实链接并抓取了完整正文】（真实链接: {u}）：\n"
                 f"- 文章完整标题：《{fetch_res['title']}》\n"
                 f"- 作者/媒体来源：{fetch_res.get('author') or '媒体专栏'}\n"
+                f"{img_hint}"
                 f"- 网页报道全文正文内容：\n{fetch_res['body']}\n"
-                f"【极其重要的回答铁律】：你现在已经 100% 拿到了该链接/卡片文章的真实报道全文！\n"
-                f"当群友询问‘能看到里面的内容了吗’、‘评价一下’或询问文章讲了什么时，你必须明确回答【能看到完整内容】，并紧密围绕上面抓取到的真实正文细节（案情细节、来龙去脉、双方说法、法院裁判逻辑等）进行全面透彻的解答与评价！绝对严禁再说‘看不到完整内容’或‘只带了标题片段’！\n"
+                f"【极其重要的回答铁律】：你现在已经 100% 拿到了该链接/卡片文章的真实报道全文与图片！\n"
+                f"当群友询问‘能看到里面的内容了吗’、‘评价一下’或询问文章讲了什么时，你必须明确回答【能看到完整内容】，并紧密围绕上面抓取到的真实正文细节进行全面透彻的解答与评价；如果群友要求‘发网页照片’、‘把图发出来’、‘看看照片’，可直接调用 send_webpage_image 发送！绝对严禁再说‘看不到完整内容’或‘我发不了网页图片’！\n"
             )
 
     # 3. Fallback: If memory URL search failed, but title is present, trigger $web_search

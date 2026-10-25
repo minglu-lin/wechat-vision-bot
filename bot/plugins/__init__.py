@@ -19,7 +19,7 @@ from .network import NetworkPlugin, WebSearchPlugin
 from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
 from .map_service import FoodSearchPlugin, LocalPlaceSearchPlugin, TransitRoutePlugin
-from .image_tools import GenerateImagePlugin, SearchImagePlugin, register_image_sender
+from .image_tools import GenerateImagePlugin, SearchImagePlugin, SendWebpageImagePlugin, register_image_sender
 
 
 class PluginManager:
@@ -47,6 +47,7 @@ class PluginManager:
         self.register(TransitRoutePlugin())
         self.register(GenerateImagePlugin())
         self.register(SearchImagePlugin())
+        self.register(SendWebpageImagePlugin())
 
 
     def get_openai_tools(self) -> List[dict]:
