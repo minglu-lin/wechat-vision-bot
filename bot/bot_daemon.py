@@ -203,6 +203,7 @@ def is_stop_command(content):
 # 4. Word Documents (.docx) via python-docx
 # -------------------------------------------------------------
 last_received_files = {}  # session_key -> dict(file_name, file_size, file_path, file_content, ts)
+last_received_images = {}  # session_key -> dict(has_image, image_type, ocr_and_detail, _crop_box, _screen_pos, _img_bytes, sender, ts)
 
 
 def find_received_file(file_name="", max_wait_sec=3.0):
@@ -1235,7 +1236,7 @@ if register_image_sender:
     register_image_sender(x11_send_image)
 
 
-def extract_image_via_clipboard(px, py):
+def extract_image_via_clipboard(px, py, save_path="/tmp/wechat_last_photo.png"):
     """
     通过右键点击图片气泡 -> 触发菜单第一项‘复制’ -> 从 X11 剪贴板提取原始图片。
     【用户明确要求】：直接右键第一个选项就是复制，严禁双击展开大图！无需点开再去关闭。
@@ -1270,16 +1271,20 @@ def extract_image_via_clipboard(px, py):
         xclip_bin = "/usr/local/bin/xclip" if os.path.exists("/usr/local/bin/xclip") else "xclip"
 
         img_bytes = None
-        for target_fmt in ["image/png", "image/jpeg", "image/bmp", "image/x-MS-bmp"]:
-            res = subprocess.run(
-                [xclip_bin, "-selection", "clipboard", "-t", target_fmt, "-o"],
-                env=env,
-                capture_output=True,
-                timeout=2,
-            )
-            if len(res.stdout) > 2000:
-                img_bytes = res.stdout
+        for attempt_clip in range(3):
+            for target_fmt in ["image/png", "image/jpeg", "image/bmp", "image/x-MS-bmp"]:
+                res = subprocess.run(
+                    [xclip_bin, "-selection", "clipboard", "-t", target_fmt, "-o"],
+                    env=env,
+                    capture_output=True,
+                    timeout=2,
+                )
+                if len(res.stdout) > 2000:
+                    img_bytes = res.stdout
+                    break
+            if img_bytes:
                 break
+            time.sleep(0.1)
 
         # 如果直接读取为文件路径/URI
         if not img_bytes:
@@ -1308,9 +1313,9 @@ def extract_image_via_clipboard(px, py):
         # 4. 点击“复制”已由系统自动收回右键菜单，严禁补发 Escape 键（防止触发微信退出登录）
 
         if img_bytes and len(img_bytes) > 2000:
-            with open("/tmp/wechat_last_photo.png", "wb") as f:
+            with open(save_path, "wb") as f:
                 f.write(img_bytes)
-            log_msg(f"成功通过右键菜单直接复制提取图片 ({len(img_bytes)} 字节) -> /tmp/wechat_last_photo.png")
+            log_msg(f"成功通过右键菜单直接复制提取图片 ({len(img_bytes)} 字节) -> {save_path}")
             return True
         else:
             log_msg("右键未获取到剪贴板图片，保留聊天窗口高保真切图兜底")
@@ -1381,11 +1386,10 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
 class TaskModelRouter:
     """
     智能多模型分流路由引擎
-    用户配额特征：Kimi 额度充裕，Gemini 额度珍贵。
     1. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
-    2. Kimi (kimi-for-coding-highspeed): 主力文本对话、长文/文章卡片深度阅读总结、日常问答、生活工具查询 (承担 70%+ 主力日常流量，保护 Gemini 额度)
-    3. Gemini 4 Argon (gemini-4-argon): 深度推理、复杂编程、算法设计、数理推导与形式化证明 (高难度任务专精)
-    4. Gemini 3.8 Flash (gemini-3.8-flash): X11 屏幕后台视觉检测、群聊附图/截图等多模态读图、Kimi/Argon 的快速容灾降级
+    2. Gemini 4 Argon (gemini-4-argon): 全面接管主力对话、长文/文档/文章卡片深度阅读总结、日常问答、生活工具查询、高难度编程与数理推导
+    3. Gemini 3.8 Flash (gemini-3.8-flash): X11 屏幕后台视觉检测、群聊附图/截图等多模态读图、Argon 的快速容灾降级
+    4. Kimi (kimi-for-coding-highspeed): 充裕额度备用容灾通道
     """
 
     DEEP_REASONING_PATTERNS = [
@@ -1398,8 +1402,9 @@ class TaskModelRouter:
     ]
 
     MULTIMODAL_IMAGE_PATTERNS = [
-        r'(?:看下?|看一看|识别|分析|提取)(?:这张?|这个?|上面这个?|附件)?(?:图|照片|图片|截图)',
-        r'(?:图里|照片里|截图里)(?:写了什么|有什么|是啥|报错|文字)',
+        r'(?:看下?|看一看|识别|分析|提取|读|读一读|读下?|解释|说明)(?:这张?|这个?|上面这个?|附件)?(?:图|照片|图片|截图)',
+        r'(?:图里|照片里|截图里|图片里)(?:写了什么|有什么|是啥|报错|文字|内容|排名|数据|表格|信息)',
+        r'(?:能读|读这个|看这个|查这个|解析这个).*(?:图|照片|图片)',
         r'(?:gemini\s*3\.?8|flash)',
     ]
 
@@ -1413,13 +1418,13 @@ class TaskModelRouter:
             if f_ext in [".py", ".ts", ".js", ".go", ".rs", ".cpp", ".c", ".java", ".sql"]:
                 has_code_file = True
 
-        # 1. 多模态/附图解析诉求 -> 分流给 Gemini 3.8 Flash (Kimi 纯文本 API 无法接收图片数据)
+        # 1. 多模态/附图解析诉求 -> 分流给 Gemini 3.8 Flash (3.8 视觉解析场景保持不变)
         if has_img or any(re.search(p, c) for p in cls.MULTIMODAL_IMAGE_PATTERNS):
             log_msg(f"【模型分流路由】多模态视觉图文理解 -> 分流至 Gemini 3.8 Flash")
             return {
                 "provider": "gemini",
                 "model": "gemini-3.8-flash",
-                "reason": "多模态视觉图文解析",
+                "reason": "多模态视觉图文解析 (Gemini 3.8 Flash)",
             }
 
         # 2. 复杂编程/算法/数学证明/深度推理/复杂代码分析 -> 分流给 Gemini 4 Argon
@@ -1431,18 +1436,17 @@ class TaskModelRouter:
                 "reason": "深度代码与数理逻辑推理",
             }
 
-        # 3. 主力日常对话、文档/PDF/Excel/Word长文阅读总结、常规文本问答、生活工具调用 -> 分流给 Kimi
-        # （充分消耗充裕的 Kimi 128k 长文本额度，最大限度节约宝贵的 Gemini 额度）
-        log_msg(f"【模型分流路由】常规群聊文本问答/长文及文档阅读/工具调用 -> 分流至 Kimi (充裕额度主力)")
+        # 3. 主力日常对话、文档/PDF/Excel/Word长文阅读总结、常规文本问答、生活工具调用 -> 原 Kimi 场景全面接管为 Gemini 4 Argon
+        log_msg(f"【模型分流路由】主力日常问答/长文及文档阅读/工具调用 -> 分流至 Gemini 4 Argon")
         return {
-            "provider": "kimi",
-            "model": "kimi-for-coding-highspeed",
-            "reason": "主力日常问答与长文阅读 (Kimi 充裕额度)",
+            "provider": "gemini",
+            "model": "gemini-4-argon",
+            "reason": "主力日常问答与长文阅读 (Gemini 4 Argon)",
         }
 
 
 def call_llm_chat(messages, tools=None, timeout=75, override_model=None):
-    model = override_model or "gemini-3.8-flash"
+    model = override_model or "gemini-4-argon"
     provider = "kimi" if "kimi" in model.lower() else "gemini"
     return call_routed_llm(provider, model, messages, tools=tools, timeout=timeout)
 
@@ -1780,10 +1784,14 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     provider = route_info["provider"]
     target_model = route_info["model"]
     route_reason = route_info["reason"]
-    if force_provider == "gemini" and provider == "kimi":
-        provider = "gemini"
-        target_model = "gemini-3.8-flash"
-        route_reason = "重试强制切换 Gemini 3.8 Flash 兜底"
+    if force_provider == "gemini":
+        if provider == "kimi":
+            provider = "gemini"
+            target_model = "gemini-3.8-flash"
+            route_reason = "重试强制切换 Gemini 3.8 Flash 兜底"
+        elif target_model == "gemini-4-argon":
+            target_model = "gemini-3.8-flash"
+            route_reason = "重试降级至 Gemini 3.8 Flash 快速响应"
 
     plugin_tools = plugin_manager.get_openai_tools() if plugin_manager else []
     tools = plugin_tools
@@ -2060,19 +2068,26 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                         tools = None
 
     user_content_payload = user_query
-    if provider == "gemini" and image_info and image_info.get("has_image") and os.path.exists("/tmp/wechat_last_photo.png"):
-        try:
-            with open("/tmp/wechat_last_photo.png", "rb") as f:
-                img_data = f.read()
-            if img_data and len(img_data) > 1000:
+    if provider == "gemini" and image_info and image_info.get("has_image"):
+        img_data = None
+        if os.path.exists("/tmp/wechat_last_photo.png"):
+            try:
+                with open("/tmp/wechat_last_photo.png", "rb") as f:
+                    img_data = f.read()
+            except Exception:
+                pass
+        if (not img_data or len(img_data) < 500) and image_info.get("_img_bytes"):
+            img_data = image_info["_img_bytes"]
+        if img_data and len(img_data) > 500:
+            try:
                 img_b64 = base64.b64encode(img_data).decode("ascii")
                 user_content_payload = [
                     {"type": "text", "text": user_query},
                     {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
                 ]
-                log_msg(f"已将群聊原图 ({len(img_data)} 字节) 作为视觉多模态输入直接送入 Gemini 3.8 Flash")
-        except Exception as e:
-            log_msg(f"组装图片多模态 payload 异常: {e}")
+                log_msg(f"已将群聊图片 ({len(img_data)} 字节) 作为视觉多模态输入直接送入 {target_model}")
+            except Exception as e:
+                log_msg(f"组装图片多模态 payload 异常: {e}")
 
     messages = [
         {"role": "system", "content": system_instruction},
@@ -2104,7 +2119,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:120]}")
                     collected_tool_outputs.append(f"[{fn_name}({fn_args})]: {res_str}")
                 # 重要修复：第 2 轮禁用 tools 时，切勿在 messages 中保留 assistant.tool_calls 与 role='tool'，
-                # 否则 Kimi 在缺少 tools 定义时会发生模板解析错乱并把内部英文思考过程 (Execute search. Use tools...) 泄露进正文！
+                # 否则在缺少 tools 定义时会发生模板解析错乱并把内部思考过程泄露进正文！
                 # 直接将工具返回结果组装为干净的单轮 user 上下文交由第 2 轮直接整理输出：
                 synth_query = (
                     user_query
@@ -2121,8 +2136,22 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             final_reply = clean_bot_reply(content_text)
             if final_reply:
                 break
-            # 如果 Kimi 返回空内容，下一轮自动切 Gemini 兜底
-            if provider == "kimi":
+            # 如果 Gemini 4 Argon 返回空内容，自动切换 Gemini 3.8 Flash 兜底
+            if target_model == "gemini-4-argon":
+                log_msg("Gemini 4 Argon 返回空内容，自动切换备用 Gemini 3.8 Flash 直接生成回答...")
+                target_model = "gemini-3.8-flash"
+                route_reason = "Argon 空返回容灾降级"
+                fallback_query = user_query
+                if collected_tool_outputs:
+                    fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
+                tools = None
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": fallback_query},
+                ]
+                continue
+            # 如果 Kimi 返回空内容，自动切 Gemini 兜底
+            elif provider == "kimi":
                 log_msg("Kimi 返回空内容，自动切换备用 Gemini 3.8 Flash 直接生成回答...")
                 provider = "gemini"
                 target_model = "gemini-3.8-flash"
@@ -2138,12 +2167,11 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 continue
         except Exception as e:
             log_msg(f"模型 [{provider}/{target_model}] 请求异常 (第 {loop_idx+1} 轮): {e}")
-            # 容灾自动分流降级：如果 Kimi 超时或出错（含400内容过滤），无缝切换 Gemini 3.8 Flash 兜底
-            if provider == "kimi":
-                log_msg("Kimi 服务调用异常，重置干净上下文并自动切换备用 Gemini 3.8 Flash 进行快速容灾重试...")
-                provider = "gemini"
+            # 容灾自动分流降级：如果 Gemini 4 Argon 异常，降级至 Gemini 3.8 Flash
+            if target_model == "gemini-4-argon":
+                log_msg("Gemini 4 Argon 异常，重置上下文并降级至 Gemini 3.8 Flash 继续重试...")
                 target_model = "gemini-3.8-flash"
-                route_reason = "Kimi 异常容灾降级"
+                route_reason = "Argon 异常容灾降级"
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
@@ -2153,11 +2181,27 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"role": "user", "content": fallback_query},
                 ]
                 continue
-            # 如果 Gemini 4 Argon 异常，降级至 Gemini 3.8 Flash
-            elif target_model == "gemini-4-argon":
-                log_msg("Gemini 4 Argon 异常，重置上下文并降级至 Gemini 3.8 Flash 继续重试...")
+            # 如果 Gemini 3.8 Flash 发生异常，尝试切换 Kimi 兜底
+            elif provider == "gemini":
+                log_msg("Gemini 服务异常，尝试切换备用 Kimi 进行快速容灾重试...")
+                provider = "kimi"
+                target_model = "kimi-for-coding-highspeed"
+                route_reason = "Gemini 异常容灾降级至 Kimi"
+                fallback_query = user_query
+                if collected_tool_outputs:
+                    fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
+                tools = None
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": fallback_query},
+                ]
+                continue
+            # 如果 Kimi 超时或出错，无缝切换 Gemini 3.8 Flash 兜底
+            elif provider == "kimi":
+                log_msg("Kimi 服务调用异常，重置干净上下文并自动切换备用 Gemini 3.8 Flash 进行快速容灾重试...")
+                provider = "gemini"
                 target_model = "gemini-3.8-flash"
-                route_reason = "Argon 异常容灾降级"
+                route_reason = "Kimi 异常容灾降级"
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
@@ -2464,6 +2508,22 @@ def monitor_loop():
                                         chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active, chat_box=chat_box, is_private_chat=is_in_private_chat
                                     )
 
+                                    cur_session_key = focus_chat if not is_in_private_chat else (raw_msgs[0].get("sender", "好友") if raw_msgs else focus_chat)
+                                    for m_item in raw_msgs:
+                                        r_img = m_item.get("referenced_image")
+                                        if isinstance(r_img, dict) and r_img.get("has_image"):
+                                            if r_img.get("_crop_box") and not r_img.get("_img_bytes"):
+                                                try:
+                                                    cb = tuple(r_img["_crop_box"])
+                                                    buf = io.BytesIO()
+                                                    chat_img.crop(cb).save(buf, format="PNG")
+                                                    r_img["_img_bytes"] = buf.getvalue()
+                                                except Exception:
+                                                    pass
+                                            r_img["ts"] = time.time()
+                                            r_img["sender"] = m_item.get("sender", "群友")
+                                            last_received_images[cur_session_key] = r_img
+
                                     reply_candidates = []
                                     new_msg_count = 0
                                     batch_ts = time.time()
@@ -2579,8 +2639,21 @@ def monitor_loop():
                                             rec_c = card_prefix + (" " + rec_c if rec_c and rec_c != c_title else "")
                                         if has_q and q_info.get("quoted_content"):
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
-                                        if has_img and img_info.get("image_type"):
-                                            rec_c = f"[附图: {img_info.get('image_type')}] " + rec_c
+                                        if has_img and img_info:
+                                            if img_info.get("_crop_box") and not img_info.get("_img_bytes"):
+                                                try:
+                                                    cb = tuple(img_info["_crop_box"])
+                                                    buf = io.BytesIO()
+                                                    chat_img.crop(cb).save(buf, format="PNG")
+                                                    img_info["_img_bytes"] = buf.getvalue()
+                                                except Exception:
+                                                    pass
+                                            img_info["ts"] = time.time()
+                                            img_info["sender"] = s
+                                            last_received_images[session_key] = img_info
+                                            log_msg(f"记录会话最新图片: sender={s}, type={img_info.get('image_type')}, has_pos={bool(img_info.get('_screen_pos'))}")
+                                            if img_info.get("image_type"):
+                                                rec_c = f"[附图: {img_info.get('image_type')}] " + rec_c
                                         if has_file and file_att.get("file_name"):
                                             rec_c = f"[文件: {file_att.get('file_name')}] " + (rec_c if rec_c and not rec_c.startswith("[发送文件") else "")
 
@@ -2664,11 +2737,22 @@ def monitor_loop():
                                                         target_file_info = recent_f
                                                         log_msg(f"为用户提问关联最近上传的文件: {recent_f.get('file_name')}")
 
+                                            # 关联当前消息中的图片或该会话最近 10 分钟内接收的图片（例如用户引用图片、或者发送图片后追问“读这个图片/看下图片/图里写的啥”）
+                                            target_img_info = img_info
+                                            if (not target_img_info or not target_img_info.get("has_image")) and session_key in last_received_images:
+                                                recent_img = last_received_images[session_key]
+                                                if time.time() - recent_img.get("ts", 0) < 600:
+                                                    img_kws = ["图", "照片", "截图", "画", "识别", "提取", "看下", "看一看", "读", "辨认", "解析", "表", "排名", "成绩", "分", "字", "信息", "内容", "数据"]
+                                                    is_quote_img = has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["[图片]", "图", "照片", "截图"])
+                                                    if is_quote_img or any(kw in c.lower() for kw in img_kws) or is_in_private_chat:
+                                                        target_img_info = recent_img
+                                                        log_msg(f"为用户提问关联会话最近接收的图片: {recent_img.get('image_type')} (来自: {recent_img.get('sender')})")
+
                                             reply_candidates.append({
                                                 "sender": s,
                                                 "content": c,
                                                 "quote": q_info,
-                                                "image": img_info,
+                                                "image": target_img_info,
                                                 "file": target_file_info,
                                                 "is_explicit": is_explicit or is_in_private_chat or has_file,
                                                 "is_direct": bool(is_explicit or is_m or valid_quote_reply or is_in_private_chat or has_file),
@@ -2748,7 +2832,7 @@ def monitor_loop():
                                     with open("/tmp/wechat_last_photo.png", "wb") as pf:
                                         pf.write(t_img["_img_bytes"])
                                     log_msg(f"已从队列缓存恢复待回复消息图片至 /tmp/wechat_last_photo.png ({len(t_img['_img_bytes'])} 字节)")
-                                if not reply_task_queue and "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
+                                if "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
                                     spos = t_img["_screen_pos"]
                                     extract_image_via_clipboard(spos[0], spos[1], "/tmp/wechat_last_photo.png")
                             except Exception as ie:
