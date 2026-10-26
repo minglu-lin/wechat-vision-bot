@@ -2357,18 +2357,24 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
 def find_maga_sidebar_y(img, w):
     """
     动态判定 MAGA 在侧边栏的准确行坐标：
-    若第 1 行为文件传输助手（绿色文件夹图标），MAGA 在第 2 行 (w["y"] + 155)；
-    否则 MAGA 在第 1 行 (w["y"] + 95)。
+    若第 0 行为文件传输助手（绿色文件夹图标），MAGA 在第 1 行 (w["y"] + 185)；
+    否则 MAGA 在第 0 行 (w["y"] + 112)。
     """
     try:
-        for y in range(w["y"] + 75, w["y"] + 115, 2):
-            for x in range(w["x"] + 70, w["x"] + 110, 2):
+        has_file_helper = False
+        for y in range(w["y"] + 95, w["y"] + 140, 2):
+            for x in range(w["x"] + 76, w["x"] + 110, 2):
                 r, g, b = img.getpixel((x, y))[:3]
                 if g > 170 and r < 50 and b < 120:
-                    return w["y"] + 155
+                    has_file_helper = True
+                    break
+            if has_file_helper:
+                break
+        if has_file_helper:
+            return w["y"] + 185
     except Exception:
         pass
-    return w["y"] + 95
+    return w["y"] + 112
 
 
 def scroll_chat_to_bottom(w):
@@ -2406,16 +2412,35 @@ def find_sidebar_red_badges(img, w):
     全面扫描左侧会话列表中的未读红点（红点颜色 R>200, G<90, B<90，位于头像右上角区域）。
     返回字典:
     {
-        'active': (x, y) or None,   # 当前活跃群聊自身积压的未读红点（因查看历史消息导致未滚到底部）
-        'private': (x, y) or None,  # 其它非活跃会话（如私聊）的未读红点
+        'maga': (x, y) or None,    # 主群聊【MAGA】自身的未读红点
+        'active': (x, y) or None,  # 当前处于活跃绿色高亮状态的会话积压的未读红点
+        'private': (x, y) or None, # 其他非活跃会话（如管理员私聊）的未读红点
     }
     """
+    maga_badge = None
     active_badge = None
     private_badge = None
-    sx1 = w["x"] + 35
-    sy1 = w["y"] + 65
-    sx2 = w["x"] + 70
+
+    # 会话列表头像右上角红点扫描区域（避开最左侧导航栏图标）
+    sx1 = w["x"] + 95
+    sy1 = w["y"] + 70
+    sx2 = w["x"] + 130
     sy2 = min(w["y"] + w["height"] - 30, w["y"] + 450)
+
+    # 动态检测第 0 行是否为文件传输助手
+    has_file_helper = False
+    try:
+        for y_fh in range(w["y"] + 95, w["y"] + 140, 2):
+            for x_fh in range(w["x"] + 76, w["x"] + 110, 2):
+                r, g, b = img.getpixel((x_fh, y_fh))[:3]
+                if g > 170 and r < 50 and b < 120:
+                    has_file_helper = True
+                    break
+            if has_file_helper:
+                break
+    except Exception:
+        pass
+    maga_row_idx = 1 if has_file_helper else 0
 
     sub = img.crop((sx1, sy1, sx2, sy2))
     px = sub.load()
@@ -2424,26 +2449,42 @@ def find_sidebar_red_badges(img, w):
 
     visited_rows = set()
     for y in range(0, sh, 2):
-        row_idx = (sy1 + y) // 25
+        abs_y = sy1 + y
+        # 每个会话行高 68 像素，起点为 w["y"] + 73
+        row_idx = (abs_y - (w["y"] + 73)) // 68
+        if row_idx < 0:
+            continue
         if row_idx in visited_rows:
             continue
+
         for x in range(0, sw, 2):
             r, g, b = px[x, y][:3]
             if r > 200 and g < 90 and b < 90:
                 visited_rows.add(row_idx)
-                check_y = sy1 + y + 10
-                # 判定该行是否为当前活跃（绿色高亮）会话
-                sample_r, sample_g, sample_b = img_px[w["x"] + 170, check_y][:3]
+                row_center_y = w["y"] + 73 + row_idx * 68 + 36
+                target_pos = (w["x"] + 170, row_center_y)
+
+                # 判定该行背景是否为当前活跃（绿色高亮: g>140 and r<60）
+                sample_r, sample_g, sample_b = img_px[w["x"] + 170, row_center_y][:3]
                 is_active = (sample_g > 140 and sample_r < 60)
-                target_pos = (w["x"] + 150, check_y)
-                if is_active and not active_badge:
-                    active_badge = target_pos
-                elif not is_active and not private_badge:
-                    private_badge = target_pos
+
+                if row_idx == maga_row_idx:
+                    # 这是主群聊 MAGA 的红点！绝不可误认为私聊！
+                    maga_badge = target_pos
+                    if is_active:
+                        active_badge = target_pos
+                elif row_idx == 0 and has_file_helper:
+                    # 文件传输助手，忽略
+                    pass
+                else:
+                    # 其他会话行（私聊或其它群聊）
+                    if is_active:
+                        active_badge = target_pos
+                    elif not private_badge:
+                        private_badge = target_pos
                 break
-        if active_badge and private_badge:
-            break
-    return {"active": active_badge, "private": private_badge}
+
+    return {"maga": maga_badge, "active": active_badge, "private": private_badge}
 
 
 def switch_to_chat(chat_name, w=None):
@@ -2462,24 +2503,11 @@ def switch_to_chat(chat_name, w=None):
     cfg = load_config()
     focus_chat = cfg.get("focus_chat", "MAGA")
     if chat_name == focus_chat:
-        d = display.Display(":99")
-        try:
-            esc_kc = d.keysym_to_keycode(XK.XK_Escape)
-            for _ in range(2):
-                xtest.fake_input(d, X.KeyPress, esc_kc)
-                xtest.fake_input(d, X.KeyRelease, esc_kc)
-            d.sync()
-        except Exception:
-            pass
-        finally:
-            d.close()
-        time.sleep(0.08)
-
         img_now, _ = capture_screen_pil()
         maga_y = find_maga_sidebar_y(img_now, w)
-        pinned_x = w["x"] + 150
+        pinned_x = w["x"] + 170
         x11_click(pinned_x, maga_y)
-        log_msg(f"直接点击侧边栏会话行(y={maga_y})切换回主关注群聊【{chat_name}】并消除未读角标")
+        log_msg(f"直接点击侧边栏会话行(x={pinned_x}, y={maga_y})切换回主关注群聊【{chat_name}】并消除未读角标")
         time.sleep(0.3)
         scroll_chat_to_bottom(w)
         return True
@@ -2646,19 +2674,30 @@ def monitor_loop():
                     w = wins[0]
 
                 if w["width"] >= 550 and cfg.get("auto_reply", True):
-                    # 1. 自愈已读对齐：若当前主群聊自身存在未读红点（因停留在历史@处导致新消息积压），点击该会话消除红点并强制滚到底部
                     badges = find_sidebar_red_badges(img, w)
-                    if not is_in_private_chat and badges.get("active"):
-                        act_pos = badges["active"]
-                        log_msg(f"[自愈已读对齐] 检测到当前主群聊存在未读红点 (pos={act_pos})，点击消除未读并滚至最新底部...")
-                        x11_click(act_pos[0], act_pos[1])
-                        time.sleep(0.2)
+
+                    # 0. 主群聊未读对齐：若不在私聊状态，且检测到 MAGA 存在未读红点，点击 MAGA 消除红点并强制滚到底部
+                    if not is_in_private_chat and badges.get("maga"):
+                        maga_pos = badges["maga"]
+                        log_msg(f"[主群聊未读对齐] 检测到主群聊【{focus_chat}】存在未读角标 (pos={maga_pos})，点击消除未读并滚至最新底部...")
+                        x11_click(maga_pos[0], maga_pos[1])
+                        time.sleep(0.3)
                         scroll_chat_to_bottom(w)
                         force_rescan = True
                         prev_crop = None
 
-                    # 2. 关注点机制：主群聊闲置且私聊出现未读红点时，自动切入私聊
-                    if auto_switch_private and not reply_task_queue and not is_in_private_chat and (time.time() - last_send_ts > 2.5):
+                    # 1. 自愈已读对齐：若当前活跃会话自身存在未读红点（因停留在历史@处导致新消息积压），点击该会话消除红点并强制滚到底部
+                    elif not is_in_private_chat and badges.get("active"):
+                        act_pos = badges["active"]
+                        log_msg(f"[自愈已读对齐] 检测到当前主群聊存在未读红点 (pos={act_pos})，点击消除未读并滚至最新底部...")
+                        x11_click(act_pos[0], act_pos[1])
+                        time.sleep(0.3)
+                        scroll_chat_to_bottom(w)
+                        force_rescan = True
+                        prev_crop = None
+
+                    # 2. 关注点机制：主群聊闲置、无待回复队列且主群无未读红点时，若侧边栏检测到私聊未读红点，自动切入私聊
+                    if auto_switch_private and not reply_task_queue and not is_in_private_chat and not badges.get("maga") and (time.time() - last_send_ts > 2.5):
                         priv_pos = badges.get("private")
                         if priv_pos:
                             log_msg(f"[关注点调度] 主群聊【{focus_chat}】当前闲置，检测到侧边栏私聊未读红点: {priv_pos}，切换私聊会话...")
@@ -2671,33 +2710,20 @@ def monitor_loop():
                             prev_crop = None
                             anim_mask = None
 
-                    # UI 自愈守卫：若处于群聊状态且超过 8 秒未发消息，检查会话顶部是否处于无标题/搜索残留状态
+                    # 3. UI 自愈守卫：若处于群聊状态且超过 8 秒未发消息，检查 MAGA 是否处于绿色高亮激活状态
                     if not is_in_private_chat and not reply_task_queue and (time.time() - last_send_ts > 8.0):
                         if time.time() - last_heal_check_ts > 15.0:
                             last_heal_check_ts = time.time()
-                            hdr_box = (
-                                w["x"] + int(w["width"] * 0.35),
-                                w["y"] + 8,
-                                w["x"] + w["width"] - 120,
-                                w["y"] + 45
-                            )
-                            hdr_stat = ImageStat.Stat(img.crop(hdr_box).convert("L"))
-                            if hdr_stat.stddev[0] < 1.5:
-                                log_msg("[UI自愈守卫] 检测到会话标题区处于空白/搜索态，按 Escape 退出搜索并恢复置顶群聊...")
-                                d_h = display.Display(":99")
-                                try:
-                                    esc_k = d_h.keysym_to_keycode(XK.XK_Escape)
-                                    for _ in range(2):
-                                        xtest.fake_input(d_h, X.KeyPress, esc_k)
-                                        xtest.fake_input(d_h, X.KeyRelease, esc_k)
-                                    d_h.sync()
-                                except Exception:
-                                    pass
-                                finally:
-                                    d_h.close()
-                                time.sleep(0.1)
-                                x11_click(w["x"] + 150, w["y"] + 105)
+                            maga_y = find_maga_sidebar_y(img, w)
+                            sr, sg, sb = img.getpixel((w["x"] + 170, maga_y))[:3]
+                            maga_is_active = (sg > 140 and sr < 60)
+                            if not maga_is_active:
+                                log_msg(f"[UI自愈守卫] 检测到当前主关注群聊【{focus_chat}】未处于激活高亮状态，点击(x={w['x'] + 170}, y={maga_y})恢复置顶群聊...")
+                                x11_click(w["x"] + 170, maga_y)
+                                time.sleep(0.3)
+                                scroll_chat_to_bottom(w)
                                 force_rescan = True
+                                prev_crop = None
 
                     if time.time() - last_cleanup_ts > 3600:
                         last_cleanup_ts = time.time()
