@@ -52,11 +52,58 @@ last_reply_text = ""
 last_recorded_text = ""
 last_bot_reply_ts = 0.0
 last_replied_user = ""
+import difflib
 import unicodedata
 
 seen_msg_timestamps = {}
 seen_content_timestamps = {}
 last_bot_db_ts = 0.0
+
+
+def edit_distance(s1: str, s2: str) -> int:
+    """计算两短字符串之间的 Levenshtein 编辑距离（带长度差提前截断）。"""
+    if s1 == s2:
+        return 0
+    if len(s1) > len(s2):
+        s1, s2 = s2, s1
+    if len(s2) - len(s1) > 2:
+        return len(s2) - len(s1)
+    prev_row = list(range(len(s1) + 1))
+    for i, c2 in enumerate(s2):
+        curr_row = [i + 1] * (len(s1) + 1)
+        for j, c1 in enumerate(s1):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row[j + 1] = min(insertions, deletions, substitutions)
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def is_fuzzy_match(s1: str, s2: str) -> bool:
+    """
+    判断两个 OCR 提取的文本是否为采样抖动下的极度相似文本：
+    - 短文本相似度 > 85%
+    - 或编辑距离 <= 2（且字数 >= 4，防单字语义相反误判）
+    """
+    if s1 == s2:
+        return True
+    l1, l2 = len(s1), len(s2)
+    if abs(l1 - l2) > 3:
+        return False
+    # 极短词（<=3 字符，如 '好的'、'ok'、'1'）不参与模糊比对，防误伤
+    if max(l1, l2) <= 3:
+        return False
+    # 1. 相似度比对 > 85%
+    sim = difflib.SequenceMatcher(None, s1, s2).ratio()
+    if sim >= 0.85:
+        return True
+    # 2. 编辑距离 <= 2
+    if max(l1, l2) >= 4 and abs(l1 - l2) <= 2:
+        ed = edit_distance(s1, s2)
+        if ed <= 2 and sim >= 0.70:
+            return True
+    return False
 
 
 def normalize_dedup_sender(sender):
@@ -93,11 +140,24 @@ def match_and_consume_seen_ts(sender, content, min_ts, consumed_counts):
         if t >= min_ts - 1.5:
             consumed_counts[key_full] = j + 1
             return t
+    # 模糊匹配同一发送者 60s 内的 OCR 抖动记录，协助对齐时间戳水位线
+    now = time.time()
+    prefix = f"{s_clean}:::"
+    for k, f_ts_list in seen_msg_timestamps.items():
+        if not k.startswith(prefix) or not f_ts_list:
+            continue
+        past_c = k[len(prefix):]
+        if is_fuzzy_match(c_clean, past_c):
+            f_used_idx = consumed_counts.get(k, 0)
+            for j in range(f_used_idx, len(f_ts_list)):
+                t = f_ts_list[j]
+                if (now - t < 60) and (t >= min_ts - 1.5):
+                    consumed_counts[k] = j + 1
+                    return t
     # 兼容同一句话发送者昵称轻微 OCR 抖动（1小时内）
     c_list = seen_content_timestamps.get(c_clean, [])
     c_key = f"__content__:::{c_clean}"
     used_c_idx = consumed_counts.get(c_key, 0)
-    now = time.time()
     for j in range(used_c_idx, len(c_list)):
         t = c_list[j]
         if (now - t < 3600) and (t >= min_ts - 1.5):
@@ -119,6 +179,30 @@ def is_recent_duplicate(sender, content, window=86400, min_ts=0.0):
     c_list = seen_content_timestamps.get(c_clean, [])
     if c_list and (now - c_list[-1] < 3600) and (c_list[-1] >= min_ts - 1.5):
         return True
+
+    # 短时提问模糊相似度比对（短文本相似度 > 85% 或编辑距离 <= 2）：
+    # 若检测到同一发送者在短时间内（60 秒内）发送了相似度极高的文本，判定为 OCR 采样抖动，自动去重丢弃
+    prefix = f"{s_clean}:::"
+    for k, past_ts_list in seen_msg_timestamps.items():
+        if not k.startswith(prefix) or not past_ts_list:
+            continue
+        last_t = past_ts_list[-1]
+        if (now - last_t < 60) and (last_t >= min_ts - 1.5):
+            past_c = k[len(prefix):]
+            if is_fuzzy_match(c_clean, past_c):
+                log_msg(f"【模糊去重命中】同一发送者 [{s_clean}] 60s 内相似文本 (OCR抖动) 自动去重丢弃: '{c_clean}' ~ '{past_c}' (时间差={now - last_t:.1f}s)")
+                return True
+
+    # 全局内容 60 秒内模糊去重兜底（防发送者昵称 OCR 微小抖动）
+    for past_c, past_c_list in seen_content_timestamps.items():
+        if not past_c_list:
+            continue
+        last_t = past_c_list[-1]
+        if (now - last_t < 60) and (last_t >= min_ts - 1.5):
+            if is_fuzzy_match(c_clean, past_c):
+                log_msg(f"【模糊去重命中】群内 60s 内相似内容 (OCR抖动) 自动去重丢弃: '{c_clean}' ~ '{past_c}' (时间差={now - last_t:.1f}s)")
+                return True
+
     return False
 
 
@@ -2850,8 +2934,7 @@ def monitor_loop():
                                             if idx == last_bot_idx and last_bot_db_ts > 0:
                                                 running_min_ts = max(running_min_ts, last_bot_db_ts)
                                             mark_seen("bot", m_c, ts=running_min_ts or last_processed_ts, only_if_missing=True)
-                                            if not was_force_rescan:
-                                                cutoff_idx = max(cutoff_idx, idx)
+                                            cutoff_idx = max(cutoff_idx, idx)
                                         else:
                                             matched_t = match_and_consume_seen_ts(m_s, m_c, running_min_ts, consumed_counts)
                                             if matched_t is not None or is_in_task_queue(m_s, m_c):
