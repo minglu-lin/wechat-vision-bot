@@ -2354,34 +2354,102 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
     return False, "", concurrent_arrival
 
 
-def find_unread_badge_in_sidebar(img, w):
-    """Scan the left conversation list for a red unread notification badge (R>215, G<85, B<85) on non-active sessions."""
-    sx1 = w["x"] + 65
-    sy1 = w["y"] + 80
-    sx2 = w["x"] + 140
-    sy2 = w["y"] + w["height"] - 30
+def find_maga_sidebar_y(img, w):
+    """
+    动态判定 MAGA 在侧边栏的准确行坐标：
+    若第 1 行为文件传输助手（绿色文件夹图标），MAGA 在第 2 行 (w["y"] + 155)；
+    否则 MAGA 在第 1 行 (w["y"] + 95)。
+    """
+    try:
+        for y in range(w["y"] + 75, w["y"] + 115, 2):
+            for x in range(w["x"] + 70, w["x"] + 110, 2):
+                r, g, b = img.getpixel((x, y))[:3]
+                if g > 170 and r < 50 and b < 120:
+                    return w["y"] + 155
+    except Exception:
+        pass
+    return w["y"] + 95
+
+
+def scroll_chat_to_bottom(w):
+    """向右侧聊天记录区域发送 End 键，确保视野绝对对齐至最底部最新消息并消除悬停。"""
+    if not display or not xtest:
+        return
+    d = None
+    try:
+        d = display.Display(":99")
+        chat_x = w["x"] + int(w["width"] * 0.55)
+        chat_y = w["y"] + int(w["height"] * 0.50)
+        xtest.fake_input(d, X.MotionNotify, x=chat_x, y=chat_y)
+        d.sync()
+        time.sleep(0.03)
+        xtest.fake_input(d, X.ButtonPress, 1)
+        xtest.fake_input(d, X.ButtonRelease, 1)
+        d.sync()
+        time.sleep(0.03)
+        end_kc = d.keysym_to_keycode(XK.XK_End)
+        xtest.fake_input(d, X.KeyPress, end_kc)
+        xtest.fake_input(d, X.KeyRelease, end_kc)
+        d.sync()
+    except Exception as e:
+        pass
+    finally:
+        if d:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+
+def find_sidebar_red_badges(img, w):
+    """
+    全面扫描左侧会话列表中的未读红点（红点颜色 R>200, G<90, B<90，位于头像右上角区域）。
+    返回字典:
+    {
+        'active': (x, y) or None,   # 当前活跃群聊自身积压的未读红点（因查看历史消息导致未滚到底部）
+        'private': (x, y) or None,  # 其它非活跃会话（如私聊）的未读红点
+    }
+    """
+    active_badge = None
+    private_badge = None
+    sx1 = w["x"] + 35
+    sy1 = w["y"] + 65
+    sx2 = w["x"] + 70
+    sy2 = min(w["y"] + w["height"] - 30, w["y"] + 450)
+
     sub = img.crop((sx1, sy1, sx2, sy2))
     px = sub.load()
     img_px = img.load()
     sw, sh = sub.size
+
+    visited_rows = set()
     for y in range(0, sh, 2):
+        row_idx = (sy1 + y) // 25
+        if row_idx in visited_rows:
+            continue
         for x in range(0, sw, 2):
             r, g, b = px[x, y][:3]
-            if r > 215 and g < 85 and b < 85:
-                # Target click: horizontal center of session item, vertical center of session item
-                check_y = sy1 + y + 12
-                # Check if this row is currently the active (green-highlighted) session
+            if r > 200 and g < 90 and b < 90:
+                visited_rows.add(row_idx)
+                check_y = sy1 + y + 10
+                # 判定该行是否为当前活跃（绿色高亮）会话
                 sample_r, sample_g, sample_b = img_px[w["x"] + 170, check_y][:3]
-                if sample_g > 140 and sample_r < 60:
-                    continue
-                return w["x"] + 170, check_y
-    return None
+                is_active = (sample_g > 140 and sample_r < 60)
+                target_pos = (w["x"] + 150, check_y)
+                if is_active and not active_badge:
+                    active_badge = target_pos
+                elif not is_active and not private_badge:
+                    private_badge = target_pos
+                break
+        if active_badge and private_badge:
+            break
+    return {"active": active_badge, "private": private_badge}
 
 
 def switch_to_chat(chat_name, w=None):
     """
     Switch WeChat window to a target chat/group.
-    If target is focus_chat (e.g. MAGA), directly click the top pinned item to avoid search box contamination.
+    If target is focus_chat (e.g. MAGA), dynamically click MAGA's session row and scroll to bottom.
     """
     if not chat_name:
         return False
@@ -2393,7 +2461,6 @@ def switch_to_chat(chat_name, w=None):
 
     cfg = load_config()
     focus_chat = cfg.get("focus_chat", "MAGA")
-    # 铁律：如果是切换回置顶主群聊（MAGA），直接按 Escape 退出任何搜索状态并点击置顶项第一行，绝不碰搜索框！
     if chat_name == focus_chat:
         d = display.Display(":99")
         try:
@@ -2407,12 +2474,14 @@ def switch_to_chat(chat_name, w=None):
         finally:
             d.close()
         time.sleep(0.08)
-        # 点击左侧会话列表置顶第一项
+
+        img_now, _ = capture_screen_pil()
+        maga_y = find_maga_sidebar_y(img_now, w)
         pinned_x = w["x"] + 150
-        pinned_y = w["y"] + 105
-        x11_click(pinned_x, pinned_y)
-        log_msg(f"直接点击置顶会话切换回主关注群聊【{chat_name}】")
+        x11_click(pinned_x, maga_y)
+        log_msg(f"直接点击侧边栏会话行(y={maga_y})切换回主关注群聊【{chat_name}】并消除未读角标")
         time.sleep(0.3)
+        scroll_chat_to_bottom(w)
         return True
 
     # 切换至私聊或其他非置顶会话：先清理残留 xclip
@@ -2577,12 +2646,23 @@ def monitor_loop():
                     w = wins[0]
 
                 if w["width"] >= 550 and cfg.get("auto_reply", True):
-                    # 关注点机制：主群聊闲置且未读红点出现时，自动切入私聊
+                    # 1. 自愈已读对齐：若当前主群聊自身存在未读红点（因停留在历史@处导致新消息积压），点击该会话消除红点并强制滚到底部
+                    badges = find_sidebar_red_badges(img, w)
+                    if not is_in_private_chat and badges.get("active"):
+                        act_pos = badges["active"]
+                        log_msg(f"[自愈已读对齐] 检测到当前主群聊存在未读红点 (pos={act_pos})，点击消除未读并滚至最新底部...")
+                        x11_click(act_pos[0], act_pos[1])
+                        time.sleep(0.2)
+                        scroll_chat_to_bottom(w)
+                        force_rescan = True
+                        prev_crop = None
+
+                    # 2. 关注点机制：主群聊闲置且私聊出现未读红点时，自动切入私聊
                     if auto_switch_private and not reply_task_queue and not is_in_private_chat and (time.time() - last_send_ts > 2.5):
-                        badge_pos = find_unread_badge_in_sidebar(img, w)
-                        if badge_pos:
-                            log_msg(f"[关注点调度] 主群聊【{focus_chat}】当前闲置，检测到侧边栏未读红点: {badge_pos}，切换私聊会话...")
-                            x11_click(badge_pos[0], badge_pos[1])
+                        priv_pos = badges.get("private")
+                        if priv_pos:
+                            log_msg(f"[关注点调度] 主群聊【{focus_chat}】当前闲置，检测到侧边栏私聊未读红点: {priv_pos}，切换私聊会话...")
+                            x11_click(priv_pos[0], priv_pos[1])
                             time.sleep(0.5)
                             img, wins = capture_screen_pil()
                             is_in_private_chat = True
