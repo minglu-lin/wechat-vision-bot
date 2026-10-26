@@ -2919,6 +2919,7 @@ def monitor_loop():
                                     cutoff_idx = -1
                                     running_min_ts = 0.0
                                     consumed_counts = {}
+                                    hit_unseen = False
                                     for idx, m_item in enumerate(raw_msgs):
                                         m_in = m_item.get("is_incoming", True)
                                         m_s = m_item.get("sender", "群友")
@@ -2929,18 +2930,25 @@ def monitor_loop():
                                             m_in = True
                                         if not m_in:
                                             matched_bot_t = match_and_consume_seen_ts("bot", m_c, running_min_ts, consumed_counts)
-                                            if matched_bot_t is not None:
-                                                running_min_ts = max(running_min_ts, matched_bot_t)
-                                            if idx == last_bot_idx and last_bot_db_ts > 0:
-                                                running_min_ts = max(running_min_ts, last_bot_db_ts)
+                                            # 防丢单核心铁律：若同屏上方已出现未处理的新消息 (hit_unseen=True)，
+                                            # 严禁将 cutoff_idx 和 running_min_ts 越过新消息推进到下方的机器人回复气泡！
+                                            # 否则该未处理消息会被错误切入旧消息区，被静默吞掉丢弃。
+                                            if not hit_unseen:
+                                                if matched_bot_t is not None:
+                                                    running_min_ts = max(running_min_ts, matched_bot_t)
+                                                if idx == last_bot_idx and last_bot_db_ts > 0:
+                                                    running_min_ts = max(running_min_ts, last_bot_db_ts)
+                                                cutoff_idx = max(cutoff_idx, idx)
                                             mark_seen("bot", m_c, ts=running_min_ts or last_processed_ts, only_if_missing=True)
-                                            cutoff_idx = max(cutoff_idx, idx)
                                         else:
                                             matched_t = match_and_consume_seen_ts(m_s, m_c, running_min_ts, consumed_counts)
                                             if matched_t is not None or is_in_task_queue(m_s, m_c):
-                                                if matched_t is not None:
-                                                    running_min_ts = max(running_min_ts, matched_t)
-                                                cutoff_idx = max(cutoff_idx, idx)
+                                                if not hit_unseen:
+                                                    if matched_t is not None:
+                                                        running_min_ts = max(running_min_ts, matched_t)
+                                                    cutoff_idx = max(cutoff_idx, idx)
+                                            else:
+                                                hit_unseen = True
 
                                     # 将水位线及上方所有旧消息的当前 OCR 文本变体静默补充至去重表（only_if_missing=True 不覆盖原历史时间戳）
                                     for idx in range(0, cutoff_idx + 1):
