@@ -1287,6 +1287,8 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
     持久化命名: data/images/img_{int(ts)}_{clean_sender}.png
     采用纯内存/视觉切片落盘，零鼠标点击，杜绝触发微信图片查看器遮挡。
     """
+    if sender in ["我们自己", "bot", "AIbot", "Albot", "aibot"] or not sender:
+        return None
     ts = float(msg_ts) if msg_ts is not None else time.time()
     s_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '_', str(sender or "user"))[:20].strip('_') or "user"
     local_path = os.path.join(IMAGES_DIR, f"img_{int(ts)}_{s_clean}.png")
@@ -1323,13 +1325,16 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
     """
     根据微信‘引用’或语义提问精准溯源本地图片记录：
     1. 引用溯源：若引用了某人且引用内容包含 [图片] 或图，精准对齐该人发送的历史本地图片
-    2. 语义问图：若提问涉及读图、看图、分析图，对齐会话最近一张本地图片
+    2. 语义问图：若提问显式涉及读图、看图、分析图，对齐会话最近一张本地图片
     """
     now = time.time()
     # 1. 微信引用优先精准匹配
     if quote_info and quote_info.get("has_quote"):
         q_sender = str(quote_info.get("quoted_sender", "")).strip()
         q_content = str(quote_info.get("quoted_content", "")).lower()
+        # 若引用内容为文章卡片/链接，绝不误认为图片引用！
+        if any(kw in q_content for kw in ["🔗", "《", "http", "mp.weixin.qq.com", "分享文章卡片"]):
+            return None
         is_quote_img = any(kw in q_content for kw in ["[图片]", "图", "照片", "截图", "chart", "image"]) or not q_content
         if is_quote_img:
             # 从最近的图片记录倒序查找匹配的 sender
@@ -1342,9 +1347,9 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
                         log_msg(f"【本地图片精准引用命中】对齐引用 [{q_sender}: {q_content[:20]}] -> 本地图片: {rec['image_path']}")
                         return rec
 
-    # 2. 语义问图匹配最近本地图片
+    # 2. 语义问图匹配最近本地图片（必须显式包含看图/读图/图片类词汇，严禁分析/数据/内容等泛化词）
     c = (query_text or "").lower()
-    img_kws = ["图", "照片", "截图", "画", "识别", "提取", "看下", "看一看", "读", "辨认", "解析", "分析一下", "分析下", "表", "排名", "成绩", "分", "字", "信息", "内容", "数据"]
+    img_kws = ["看图", "读图", "这张图", "这个图", "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中", "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图"]
     if any(kw in c for kw in img_kws):
         for rec in reversed(recent_image_records):
             if now - rec["ts"] > max_age_sec:
@@ -1450,7 +1455,7 @@ class TaskModelRouter:
     ]
 
     @classmethod
-    def route(cls, content: str, quote_info: dict = None, image_info: dict = None, file_info: dict = None) -> dict:
+    def route(cls, content: str, quote_info: dict = None, image_info: dict = None, file_info: dict = None, card_info: dict = None) -> dict:
         c = (content or "").strip().lower()
         has_img = bool(image_info and image_info.get("has_image"))
         has_code_file = False
@@ -1459,8 +1464,15 @@ class TaskModelRouter:
             if f_ext in [".py", ".ts", ".js", ".go", ".rs", ".cpp", ".c", ".java", ".sql"]:
                 has_code_file = True
 
+        is_article_task = bool(
+            (card_info and card_info.get("title")) or
+            (quote_info and any(kw in str(quote_info.get("quoted_content", "")).lower() for kw in ["《", "http", "mp.weixin.qq.com", "🔗", "分享文章卡片"])) or
+            any(kw in c for kw in ["文章", "链接", "公众号", "推文", "卡片", "新闻", "研报"])
+        )
+
         # 1. 多模态/附图解析诉求 -> 分流给 Gemini 3.8 Flash (3.8 视觉解析场景保持不变)
-        if has_img or any(re.search(p, c) for p in cls.MULTIMODAL_IMAGE_PATTERNS):
+        # 核心保护：若属于公众号文章/卡片/链接的深度阅读总结与分析，即使附带缩略图，也由深度分析主力 Gemini 4 Argon 处理！
+        if (has_img or any(re.search(p, c) for p in cls.MULTIMODAL_IMAGE_PATTERNS)) and not is_article_task:
             log_msg(f"【模型分流路由】多模态视觉图文理解 -> 分流至 Gemini 3.8 Flash")
             return {
                 "provider": "gemini",
@@ -1477,7 +1489,7 @@ class TaskModelRouter:
                 "reason": "深度代码与数理逻辑推理",
             }
 
-        # 3. 主力日常对话、文档/PDF/Excel/Word长文阅读总结、常规文本问答、生活工具调用 -> 原 Kimi 场景全面接管为 Gemini 4 Argon
+        # 3. 主力日常对话、文档/PDF/Excel/Word长文阅读总结、文章卡片分析、常规文本问答、生活工具调用 -> 原 Kimi 场景全面接管为 Gemini 4 Argon
         log_msg(f"【模型分流路由】主力日常问答/长文及文档阅读/工具调用 -> 分流至 Gemini 4 Argon")
         return {
             "provider": "gemini",
@@ -1812,7 +1824,7 @@ def clean_bot_reply(text):
     return "\n".join(cleaned_lines).strip()
 
 
-def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None, file_info=None, force_provider=None):
+def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None, file_info=None, card_info=None, force_provider=None):
     # 0. Fast-Path Direct Execution (0 Token, <100ms ultra-low latency)
     if plugin_manager:
         matched, fast_reply = plugin_manager.match_fast_path(content)
@@ -1821,7 +1833,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             return fast_reply
 
     sys_prompt = cfg.get("system_prompt", "")
-    route_info = TaskModelRouter.route(content, quote_info=quote_info, image_info=image_info, file_info=file_info)
+    route_info = TaskModelRouter.route(content, quote_info=quote_info, image_info=image_info, file_info=file_info, card_info=card_info)
     provider = route_info["provider"]
     target_model = route_info["model"]
     route_reason = route_info["reason"]
@@ -1956,48 +1968,75 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         )
 
     # 1. Automatic URL extraction & web page content fetching
-    is_visual_query = False
-    if image_info and image_info.get("has_image"):
-        is_visual_query = True
-    elif any(k in content for k in ["图", "图片", "这图", "看图", "走势图", "截图", "照片", "k线"]):
-        is_visual_query = True
-
+    found_urls = []
     candidate_texts = [content]
     if quote_info and quote_info.get("has_quote"):
         candidate_texts.append(str(quote_info.get("quoted_content", "")))
 
-    found_urls = []
     for ct in candidate_texts:
         for u in extract_urls(ct):
             if is_valid_mp_url(u) and u not in found_urls:
                 found_urls.append(u)
 
-    # 2. If no explicit HTTP link found in text, check for WeChat Article Card or quote with 🔗
-    # ONLY scan memory if this is NOT a visual/image query, AND the user explicitly provided or quoted an article card!
-    if not found_urls and not is_visual_query:
-        card_kw = ""
-        for ct in candidate_texts:
-            if "🔗" in ct:
-                card_kw = re.sub(r'.*?🔗\s*', '', ct).strip()
-                break
-            m = re.search(r'\[分享文章卡片:\s*《(.*?)》', ct)
-            if m:
-                card_kw = m.group(1).strip()
-                break
+    # 2. 文章卡片识别与微信内存真实链接扫描 (公众号文章/新闻卡片/分享链接)
+    card_keywords = []
 
-        # Only allow explicit article references (e.g. user mentions 文章/链接/公众号)
-        if not card_kw and any(k in content for k in ["链接", "文章", "公众号", "卡片", "推文"]):
-            for ct in candidate_texts:
-                m = re.search(r'《(.*?)》', ct)
-                if m and len(m.group(1).strip()) >= 4:
-                    card_kw = m.group(1).strip()
+    # 1) Direct card info from target message
+    if isinstance(card_info, dict) and card_info.get("title"):
+        card_keywords.append(card_info["title"].strip())
+
+    # 2) Extract from quote_info
+    if quote_info and quote_info.get("has_quote"):
+        qc = str(quote_info.get("quoted_content", "")).strip()
+        m_card = re.search(r'\[分享文章卡片:\s*《(.*?)》', qc)
+        if m_card:
+            card_keywords.append(m_card.group(1).strip())
+        elif "🔗" in qc:
+            clean_qc = re.sub(r'.*?🔗\s*', '', qc).strip()
+            clean_qc = re.sub(r'\s*\[.*?\]$', '', clean_qc).strip()
+            if clean_qc:
+                card_keywords.append(clean_qc)
+        elif qc and not any(k in qc for k in ["[图片]", "[表情]", "[视频]", "[文件"]):
+            card_keywords.append(qc)
+
+    # 3) Extract from content
+    for ct in candidate_texts:
+        m = re.search(r'\[分享文章卡片:\s*《(.*?)》', ct)
+        if m:
+            card_keywords.append(m.group(1).strip())
+        for mb in re.findall(r'《(.*?)》', ct):
+            if len(mb.strip()) >= 3:
+                card_keywords.append(mb.strip())
+
+    # 4) Extract from recent_history (if user asks for evaluation/analysis/summary/what it says)
+    is_evaluating = any(kw in content for kw in [
+        "锐评", "分析", "评价", "怎么看", "如何看", "解读", "讲了什么", "说了什么",
+        "总结", "详细说", "说说", "看下", "看看", "链接", "文章", "公众号", "推文", "卡片", "新闻", "报道"
+    ])
+    if recent_history:
+        for h in reversed(recent_history[:6]):
+            hc = h.get("content", "")
+            mh = re.search(r'\[分享文章卡片:\s*《(.*?)》', hc)
+            if mh:
+                h_title = mh.group(1).strip()
+                if h_title not in card_keywords:
+                    card_keywords.append(h_title)
+                break
+            for u in extract_urls(hc):
+                if is_valid_mp_url(u) and u not in found_urls:
+                    found_urls.append(u)
                     break
 
-        if card_kw:
-            mem_url = find_article_link_in_memory(card_kw)
+    # 3. 针对收集到的文章标题，深入微信内存检索真实 URL
+    if not found_urls:
+        for kw in card_keywords:
+            if not kw or len(kw.strip()) < 2:
+                continue
+            mem_url = find_article_link_in_memory(kw)
             if mem_url and is_valid_mp_url(mem_url):
-                log_msg(f"微信内存成功解析出真实链接: {mem_url}")
+                log_msg(f"微信内存成功解析出真实文章链接 (关键词: '{kw}'): {mem_url}")
                 found_urls.append(mem_url)
+                break
 
     fetched_any_article = False
     for u in found_urls[:2]:
@@ -2016,39 +2055,25 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 f"当群友询问‘能看到里面的内容了吗’、‘评价一下’或询问文章讲了什么时，你必须明确回答【能看到完整内容】，并紧密围绕上面抓取到的真实正文细节进行全面透彻的解答与评价；如果群友要求‘发网页照片’、‘把图发出来’、‘看看照片’，可直接调用 send_webpage_image 发送！绝对严禁再说‘看不到完整内容’或‘我发不了网页图片’！\n"
             )
 
-    # 3. Fallback: If memory URL search failed, but title is present, trigger $web_search
-    if not fetched_any_article and not is_visual_query:
-        card_title = ""
-        card_source = ""
-        for ct in candidate_texts:
-            m = re.search(r'\[分享文章卡片:\s*《(.*?)》(?:[ \t]*来源:[ \t]*([^\]]+))?', ct)
-            if m:
-                card_title = m.group(1).strip()
-                card_source = (m.group(2) or "").strip()
-                break
-            m_book = re.search(r'《(.*?)》', ct)
-            if m_book and len(m_book.group(1).strip()) >= 4 and any(k in content for k in ["文章", "新闻", "报道", "链接"]):
-                card_title = m_book.group(1).strip()
-                break
-
-        if card_title:
-            if plugin_manager:
-                log_msg(f"【前置联网搜索】检测到分享卡片《{card_title}》，先调用 Serper Google 搜索 API 获取全文报道再交由 AI 整理判断...")
-                pre_res = plugin_manager.execute_tool("web_search", {"query": f"{card_title} {card_source}".strip()})
-                if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
-                    user_query += (
-                        f"\n\n【系统已预先通过 Google (Serper API) 检索到该分享文章《{card_title}》的权威报道摘要】：\n"
-                        f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
-                        f"【核心要求】：请直接结合上述检索到的真实事件细节进行全面、客观、深入的分析评价，无需再次调用搜索工具！\n"
-                    )
-                    tools = None
-            if tools is not None:
+    # 4. Fallback: If memory URL search failed, but title is present, trigger $web_search
+    if not fetched_any_article and card_keywords:
+        card_title = card_keywords[0]
+        if plugin_manager:
+            log_msg(f"【前置联网搜索】检测到分享卡片《{card_title}》，先调用 Serper Google 搜索 API 获取全文报道再交由 AI 整理判断...")
+            pre_res = plugin_manager.execute_tool("web_search", {"query": f"{card_title}".strip()})
+            if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
                 user_query += (
-                    f"\n【重要任务：群友正在要求阅读与评价/分析分享的文章】：\n"
-                    f"- 分享文章标题：《{card_title}》\n"
-                    f"- 媒体/发布来源：{card_source or '权威新闻媒体'}\n"
-                    f"- 核心要求：请使用 web_search 检索该文章的真实事件细节后再进行分析评价。\n"
+                    f"\n\n【系统已预先通过 Google (Serper API) 检索到该分享文章《{card_title}》的权威报道摘要】：\n"
+                    f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
+                    f"【核心要求】：请直接结合上述检索到的真实事件细节进行全面、客观、深入的分析评价，无需再次调用搜索工具！\n"
                 )
+                tools = None
+        if tools is not None:
+            user_query += (
+                f"\n【重要任务：群友正在要求阅读与评价/分析分享的文章】：\n"
+                f"- 分享文章标题：《{card_title}》\n"
+                f"- 核心要求：请使用 web_search 检索该文章的真实事件细节后再进行分析评价。\n"
+            )
         else:
             # 3.5 针对股票量化诊断与技术面分析：调用 StockQuantPlugin 极速拉取盘口及日K指标，由 AI 专业操盘手一轮直出！
             stock_sym = None
@@ -2288,6 +2313,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
     q_info = target.get("quote")
     img_info = target.get("image")
     file_info = target.get("file")
+    card_info = target.get("card")
     is_explicit = target.get("is_explicit", False)
 
     max_attempts = 3 if is_explicit else 2
@@ -2305,6 +2331,7 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
                 quote_info=q_info,
                 image_info=img_info,
                 file_info=file_info,
+                card_info=card_info,
                 force_provider="gemini" if attempt >= 2 else None,
             )
             if reply_content and reply_content.strip():
@@ -2904,7 +2931,7 @@ def monitor_loop():
                                         if has_q and q_info.get("quoted_content"):
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
                                         saved_img_path = None
-                                        if has_img and img_info:
+                                        if is_in and has_img and img_info and s not in ["我们自己", "bot", "AIbot", "Albot", "aibot"]:
                                             # 立即执行本地图片持久化落盘 (原图提取 + 气泡切片双保险)
                                             saved_img_path = save_incoming_image(s, img_info, chat_img, msg_ts=batch_ts)
                                             if saved_img_path:
@@ -2999,7 +3026,11 @@ def monitor_loop():
 
                                             # 关联当前消息中的图片或本地持久化历史图片
                                             target_img_info = img_info if (img_info and img_info.get("has_image")) else None
-                                            if not target_img_info or not target_img_info.get("has_image"):
+                                            is_card_context = has_card or (has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["🔗", "《", "http", "mp.weixin.qq.com", "分享文章卡片"]))
+                                            if is_card_context:
+                                                # 如果当前会话处于分享文章/卡片上下文中，绝不错误绑定过去的不相关历史图片
+                                                target_img_info = None
+                                            elif not target_img_info or not target_img_info.get("has_image"):
                                                 matched_rec = find_image_for_query(c, quote_info=q_info, session_key=session_key)
                                                 if matched_rec:
                                                     target_img_info = {
@@ -3012,7 +3043,7 @@ def monitor_loop():
                                                 elif session_key in last_received_images:
                                                     recent_img = last_received_images[session_key]
                                                     if time.time() - recent_img.get("ts", 0) < 600:
-                                                        img_kws = ["图", "照片", "截图", "画", "识别", "提取", "看下", "看一看", "读", "辨认", "解析", "表", "排名", "成绩", "分", "字", "信息", "内容", "数据"]
+                                                        img_kws = ["看图", "读图", "这张图", "这个图", "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中", "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图"]
                                                         is_quote_img = has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["[图片]", "图", "照片", "截图"])
                                                         if is_quote_img or any(kw in c.lower() for kw in img_kws) or is_in_private_chat:
                                                             target_img_info = recent_img
@@ -3024,6 +3055,7 @@ def monitor_loop():
                                                 "quote": q_info,
                                                 "image": target_img_info,
                                                 "file": target_file_info,
+                                                "card": card_info if has_card else None,
                                                 "is_explicit": is_explicit or is_in_private_chat or has_file,
                                                 "is_direct": bool(is_explicit or is_m or valid_quote_reply or is_in_private_chat or has_file),
                                                 "is_private": is_in_private_chat,
