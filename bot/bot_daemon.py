@@ -918,8 +918,19 @@ def find_wechat_windows(d):
                         except Exception:
                             pass
 
+                    name = ""
                     if any("wechat" in c for c in cls_lowers):
                         name = w.get_wm_name() or ""
+                        # 自动检测并销毁微信内部独立的图片查看器/媒体预览/编辑等遮挡弹窗 (如 813x640 窗口或非主窗口大弹窗)
+                        is_main_win = (name.strip().lower() in ["wechat", "微信"])
+                        if not is_main_win and ((geom.width == 813 and geom.height == 640) or (geom.width >= 400 and geom.height >= 300)):
+                            try:
+                                log_msg(f"【自愈守护】自动关闭微信图片/媒体预览遮挡弹窗: id={hex(w.id)}, size={geom.width}x{geom.height}")
+                                w.destroy()
+                                d.sync()
+                                return
+                            except Exception:
+                                pass
 
                     if geom.width >= 150 and geom.height >= 150:
                         coords = root.translate_coords(w, 0, 0)
@@ -1264,137 +1275,36 @@ if register_image_sender:
 
 def extract_image_via_clipboard(px, py, save_path="/tmp/wechat_last_photo.png"):
     """
-    通过右键点击图片气泡 -> 触发菜单第一项‘复制’ -> 从 X11 剪贴板提取原始图片。
-    【用户明确要求】：直接右键第一个选项就是复制，严禁双击展开大图！无需点开再去关闭。
+    安全模式：杜绝在图片气泡上模拟鼠标点击（防止触发微信内置图片查看器 813x640 弹窗遮挡聊天界面）。
+    图片持久化由聊天窗口高保真气泡切片直接安全完成。
     """
-    if not display or not xtest:
-        return False
-    d = None
-    try:
-        d = display.Display(":99")
-
-        # 1. 鼠标移动到图片气泡中心，右键点击弹出菜单
-        xtest.fake_input(d, X.MotionNotify, x=int(px), y=int(py))
-        d.sync()
-        time.sleep(0.08)
-        xtest.fake_input(d, X.ButtonPress, 3)
-        xtest.fake_input(d, X.ButtonRelease, 3)
-        d.sync()
-        time.sleep(0.18)
-
-        # 2. 点击右键菜单中的第一项“复制”（位于右键点偏右下约 35px, 16px）
-        xtest.fake_input(d, X.MotionNotify, x=int(px + 35), y=int(py + 16))
-        d.sync()
-        time.sleep(0.06)
-        xtest.fake_input(d, X.ButtonPress, 1)
-        xtest.fake_input(d, X.ButtonRelease, 1)
-        d.sync()
-        time.sleep(0.2)
-
-        # 3. 检查剪贴板是否成功提取到图片数据
-        env = os.environ.copy()
-        env["DISPLAY"] = ":99"
-        xclip_bin = "/usr/local/bin/xclip" if os.path.exists("/usr/local/bin/xclip") else "xclip"
-
-        img_bytes = None
-        for attempt_clip in range(3):
-            for target_fmt in ["image/png", "image/jpeg", "image/bmp", "image/x-MS-bmp"]:
-                res = subprocess.run(
-                    [xclip_bin, "-selection", "clipboard", "-t", target_fmt, "-o"],
-                    env=env,
-                    capture_output=True,
-                    timeout=2,
-                )
-                if len(res.stdout) > 2000:
-                    img_bytes = res.stdout
-                    break
-            if img_bytes:
-                break
-            time.sleep(0.1)
-
-        # 如果直接读取为文件路径/URI
-        if not img_bytes:
-            res_uri = subprocess.run(
-                [xclip_bin, "-selection", "clipboard", "-o"],
-                env=env,
-                capture_output=True,
-                timeout=2,
-            )
-            uri_text = res_uri.stdout.decode("utf-8", errors="ignore").strip()
-            if uri_text.startswith("file://"):
-                local_file = uri_text.replace("file://", "").strip()
-                if os.path.exists(local_file):
-                    try:
-                        with open(local_file, "rb") as lf:
-                            img_bytes = lf.read()
-                    except Exception:
-                        pass
-            elif os.path.exists(uri_text) and (uri_text.endswith(".png") or uri_text.endswith(".jpg") or uri_text.endswith(".dat")):
-                try:
-                    with open(uri_text, "rb") as lf:
-                        img_bytes = lf.read()
-                except Exception:
-                    pass
-
-        # 4. 点击“复制”已由系统自动收回右键菜单，严禁补发 Escape 键（防止触发微信退出登录）
-
-        if img_bytes and len(img_bytes) > 2000:
-            with open(save_path, "wb") as f:
-                f.write(img_bytes)
-            log_msg(f"成功通过右键菜单直接复制提取图片 ({len(img_bytes)} 字节) -> {save_path}")
-            return True
-        else:
-            log_msg("右键未获取到剪贴板图片，保留聊天窗口高保真切图兜底")
-            return False
-    except Exception as e:
-        log_msg(f"右键复制图片异常: {e}")
-        return False
-    finally:
-        if d:
-            try:
-                d.close()
-            except Exception:
-                pass
+    return False
 
 
 def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
     """
-    当接收到图片时，即刻将原始高清图片复制或截图保存到本地磁盘，并返回本地路径。
+    当接收到图片时，即刻将高清图片切片保存到本地磁盘，并返回本地路径。
     持久化命名: data/images/img_{int(ts)}_{clean_sender}.png
+    采用纯内存/视觉切片落盘，零鼠标点击，杜绝触发微信图片查看器遮挡。
     """
     ts = float(msg_ts) if msg_ts is not None else time.time()
     s_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '_', str(sender or "user"))[:20].strip('_') or "user"
     local_path = os.path.join(IMAGES_DIR, f"img_{int(ts)}_{s_clean}.png")
 
     saved = False
-    # 1. 首先尝试通过右键复制从 X11 剪贴板提取原始未压缩图片
-    if img_info.get("_screen_pos") and "表情" not in str(img_info.get("image_type", "")):
-        try:
-            spos = img_info["_screen_pos"]
-            saved = extract_image_via_clipboard(spos[0], spos[1], local_path)
-            if saved and os.path.exists(local_path) and os.path.getsize(local_path) > 2000:
-                log_msg(f"【本地图片持久化】右键提取原图成功: {local_path} ({os.path.getsize(local_path)} 字节)")
-            else:
-                saved = False
-        except Exception as e:
-            log_msg(f"右键提取原图落盘异常: {e}")
-            saved = False
-
-    # 2. 若右键提取未就绪，使用当前气泡高保真切片作为双保险兜底
-    if not saved or not os.path.exists(local_path) or os.path.getsize(local_path) < 1000:
-        try:
-            if img_info.get("_img_bytes"):
-                with open(local_path, "wb") as f:
-                    f.write(img_info["_img_bytes"])
-                saved = True
-            elif img_info.get("_crop_box") and chat_img:
-                cb = tuple(img_info["_crop_box"])
-                chat_img.crop(cb).save(local_path, format="PNG")
-                saved = True
-            if saved:
-                log_msg(f"【本地图片持久化】切片兜底落盘成功: {local_path} ({os.path.getsize(local_path)} 字节)")
-        except Exception as ce:
-            log_msg(f"切片兜底落盘异常: {ce}")
+    try:
+        if img_info.get("_img_bytes"):
+            with open(local_path, "wb") as f:
+                f.write(img_info["_img_bytes"])
+            saved = True
+        elif img_info.get("_crop_box") and chat_img:
+            cb = tuple(img_info["_crop_box"])
+            chat_img.crop(cb).save(local_path, format="PNG")
+            saved = True
+        if saved:
+            log_msg(f"【本地图片持久化】气泡切片落盘成功: {local_path} ({os.path.getsize(local_path)} 字节)")
+    except Exception as ce:
+        log_msg(f"切片落盘异常: {ce}")
 
     if saved and os.path.exists(local_path):
         record = {
@@ -2572,6 +2482,41 @@ def switch_to_chat(chat_name, w=None):
         d.close()
 
 
+
+def check_and_click_floating_pill(img, w):
+    """
+    自动检测并点击微信聊天区域右上方的绿色浮动跳转胶囊
+    （如 '林明露提到了你' 或 'x条新消息'），确保聊天窗口实时对齐至最新消息位置。
+    """
+    try:
+        px1 = w["x"] + int(w["width"] * 0.70)
+        py1 = w["y"] + 70
+        px2 = w["x"] + w["width"] - 15
+        py2 = w["y"] + 155
+        crop = img.crop((px1, py1, px2, py2))
+        cw, ch = crop.size
+        found_green = False
+        target_x, target_y = None, None
+        for y in range(0, ch, 2):
+            for x in range(0, cw, 2):
+                r, g, b, *a = crop.getpixel((x, y))
+                if g > 150 and r < 80 and b < 120:
+                    found_green = True
+                    target_x = px1 + x
+                    target_y = py1 + y
+                    break
+            if found_green:
+                break
+        if found_green and target_x and target_y:
+            log_msg(f"【自愈对齐】检测到聊天区域浮动提示胶囊，正在点击归位: ({target_x}, {target_y})")
+            x11_click(target_x, target_y)
+            time.sleep(0.35)
+            return True
+    except Exception as e:
+        pass
+    return False
+
+
 def monitor_loop():
     prev_crop = Image.new("L", (160, 120), 0)
     anim_mask = None
@@ -2677,6 +2622,11 @@ def monitor_loop():
                     if time.time() - last_cleanup_ts > 3600:
                         last_cleanup_ts = time.time()
                         cleanup_old_images(max_days=7)
+
+                    # 自愈对齐：检测是否有浮动跳转胶囊（如 'xx提到了你' 或 'x条新消息'）
+                    if check_and_click_floating_pill(img, w):
+                        force_rescan = True
+                        prev_crop = None
 
                     rx1 = w["x"] + int(w["width"] * 0.33)
                     ry1 = w["y"] + int(w["height"] * 0.38)
@@ -3048,9 +2998,6 @@ def monitor_loop():
                                     with open("/tmp/wechat_last_photo.png", "wb") as pf:
                                         pf.write(t_img["_img_bytes"])
                                     log_msg(f"已从队列缓存恢复待回复消息图片至 /tmp/wechat_last_photo.png ({len(t_img['_img_bytes'])} 字节)")
-                                elif "表情" not in str(t_img.get("image_type", "")) and t_img.get("_screen_pos"):
-                                    spos = t_img["_screen_pos"]
-                                    extract_image_via_clipboard(spos[0], spos[1], "/tmp/wechat_last_photo.png")
                             except Exception as ie:
                                 log_msg(f"按需提取消息图片异常: {ie}")
 
