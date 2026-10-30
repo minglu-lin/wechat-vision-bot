@@ -1002,6 +1002,27 @@ def find_wechat_windows(d):
                         except Exception:
                             pass
 
+                    # 自动关闭与销毁所有 XDG Desktop Portal / 文件选择器 / 外部遮挡弹窗，防止遮挡卡死
+                    if any(k in c for k in ("portal", "filechooser", "file-chooser", "dialog") for c in cls_lowers):
+                        try:
+                            log_msg(f"【自愈守护】自动关闭并销毁遮挡的文件选择器/Portal弹窗: {cls} (id={hex(w.id)})")
+                            w.destroy()
+                            d.sync()
+                            return
+                        except Exception:
+                            pass
+
+                    # 严格判定：若非微信官方客户端进程窗口，绝不作为微信主窗口返回
+                    if not any("wechat" in c for c in cls_lowers):
+                        if geom.width >= 400 and geom.height >= 300:
+                            try:
+                                log_msg(f"【自愈守护】检测并销毁遮挡屏幕的非微信第三方弹窗: {cls} (id={hex(w.id)}, size={geom.width}x{geom.height})")
+                                w.destroy()
+                                d.sync()
+                            except Exception:
+                                pass
+                        return
+
                     name = ""
                     if any("wechat" in c for c in cls_lowers):
                         name = w.get_wm_name() or ""
@@ -1076,12 +1097,28 @@ def check_and_dismiss_logout_modal(img=None):
     1. 通过 X11 窗口检测退出登录确认弹窗 (180 < width < 450, 100 < height < 300)；
        若检测到，根据弹窗实际几何坐标精准点击【取消】按钮 (cx, cy) 予以关闭。
        【核心铁律】：绝不发送 Escape 键！在 WeChat 4.x Linux 中，按 Escape 会触发退出登录或重新打开确认弹窗。
-    2. 检测是否存在残留全屏图片查看器 (width > 1000, height > 600, 非主窗口)，
-       点击右上角关闭按钮将其安全关闭。
+    2. 检测是否存在残留全屏图片查看器或遮挡窗口 (width > 1000, height > 600, 非主窗口)，
+       执行关闭与强制销毁，杜绝死循环卡死。
     """
     try:
         d = display.Display(":99")
         try:
+            root = d.screen().root
+            # 先扫描所有 viewable 的顶层窗口，查杀 portal / filechooser 残留
+            for c in root.query_tree().children:
+                try:
+                    attrs = c.get_attributes()
+                    if attrs.map_state == X.IsViewable:
+                        cls = c.get_wm_class()
+                        if cls:
+                            cls_str = " ".join(cls).lower()
+                            if any(k in cls_str for k in ("portal", "filechooser", "file-chooser")):
+                                log_msg(f"【自愈守护】check_and_dismiss 自动销毁文件选择器/Portal弹窗: {cls} (id={hex(c.id)})")
+                                c.destroy()
+                                d.sync()
+                except Exception:
+                    pass
+
             wins = find_wechat_windows(d)
             modal_win = None
             viewer_win = None
@@ -1111,22 +1148,33 @@ def check_and_dismiss_logout_modal(img=None):
                 if not remaining:
                     log_msg("✅ 微信退出登录模态弹窗已点击【取消】顺利关闭！")
                 else:
-                    log_msg(f"⚠️ 点击取消后弹窗仍存在: {remaining[0]['id']}")
+                    log_msg(f"⚠️ 点击取消后弹窗仍存在: {remaining[0]['id']}，强制销毁...")
+                    try:
+                        modal_win["win"].destroy()
+                        d.sync()
+                    except Exception:
+                        pass
                 return True
 
             if viewer_win:
                 close_x = viewer_win["x"] + viewer_win["width"] - 25
                 close_y = viewer_win["y"] + 20
-                log_msg(f"⚠️ 自动检测到微信大图查看器残留窗口 (id={viewer_win['id']})，正在点击右上角关闭 ({close_x}, {close_y})...")
+                log_msg(f"⚠️ 自动检测到微信大图查看器残留窗口 (id={viewer_win['id']})，正在关闭并强制销毁 ({close_x}, {close_y})...")
                 xtest.fake_input(d, X.MotionNotify, x=close_x, y=close_y)
                 d.sync()
-                time.sleep(0.08)
+                time.sleep(0.05)
                 xtest.fake_input(d, X.ButtonPress, 1)
                 d.sync()
-                time.sleep(0.12)
+                time.sleep(0.05)
                 xtest.fake_input(d, X.ButtonRelease, 1)
                 d.sync()
-                time.sleep(0.2)
+                time.sleep(0.1)
+                try:
+                    viewer_win["win"].destroy()
+                    d.sync()
+                except Exception:
+                    pass
+                time.sleep(0.15)
                 return True
         finally:
             d.close()
@@ -1139,7 +1187,7 @@ def recover_wechat_ui_state():
     """
     微信 UI 排错与防卡顿自愈机制：
     1. 检查并关闭微信退出登录确认模态弹窗（点击取消，严禁发送 Escape）
-    2. 关闭所有残留的非主窗口（如 WeChatAppEx 网页、弹窗、图片浏览）
+    2. 关闭所有残留的非主窗口（如 WeChatAppEx 网页、弹窗、图片浏览、Portal/文件选择器等）
     3. 点击主聊天窗口输入框以重新获取焦点
     4. 清空输入框内残留的异常或半截输入 (Ctrl+A -> Backspace)
     """
@@ -1148,16 +1196,22 @@ def recover_wechat_ui_state():
         d = display.Display(":99")
         try:
             root = d.screen().root
-            # 1. 查找并销毁所有可能遮挡的 WeChatAppEx / 辅助窗口
+            # 1. 查找并销毁所有可能遮挡的 WeChatAppEx / portal / 文件选择器 / 辅助遮挡窗口
             for c in root.query_tree().children:
                 try:
+                    attrs = c.get_attributes()
+                    if attrs.map_state != X.IsViewable:
+                        continue
                     cls = c.get_wm_class()
                     if cls:
                         cls_str = " ".join(cls).lower()
-                        if "wechatappex" in cls_str:
-                            log_msg(f"排错自愈: 关闭残留 WeChatAppEx 窗口 {hex(c.id)}")
-                            c.destroy()
-                            d.sync()
+                        name = (c.get_wm_name() or "").strip().lower()
+                        is_main = (any("wechat" in x for x in cls) and name in ("wechat", "微信"))
+                        if not is_main:
+                            if any(k in cls_str for k in ("wechatappex", "portal", "filechooser", "file-chooser", "dialog")) or not any("wechat" in x for x in cls):
+                                log_msg(f"排错自愈: 关闭残留/遮挡窗口 {hex(c.id)} (class={cls}, name={name})")
+                                c.destroy()
+                                d.sync()
                 except Exception:
                     pass
 
@@ -4131,8 +4185,9 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             dismissed = check_and_dismiss_logout_modal()
             if not dismissed:
                 x11_click(702, 437)
-            log_msg("控制台指令: 执行解除退出模态弹窗")
-            self._send_json({"ok": True, "message": "已触发关闭退出登录弹窗"})
+            recover_wechat_ui_state()
+            log_msg("控制台指令: 执行解除退出模态与遮挡弹窗")
+            self._send_json({"ok": True, "message": "已成功关闭所有遮挡弹窗并恢复聊天窗口"})
         elif parsed.path == "/api/key":
             key_name = body.get("key", "")
             d = display.Display(":99")
