@@ -58,6 +58,7 @@ import unicodedata
 seen_msg_timestamps = {}
 seen_content_timestamps = {}
 last_bot_db_ts = 0.0
+_last_loop_heartbeat = time.time()
 
 
 def edit_distance(s1: str, s2: str) -> int:
@@ -946,8 +947,8 @@ def save_config(cfg):
 
 def ensure_processes():
     try:
-        out = subprocess.check_output(["pgrep", "-f", "Xvfb :99"]).decode().strip()
-    except subprocess.CalledProcessError:
+        out = subprocess.check_output(["pgrep", "-f", "Xvfb :99"], timeout=5).decode().strip()
+    except Exception:
         out = ""
     if not out:
         log_msg("Starting Xvfb :99...")
@@ -960,8 +961,8 @@ def ensure_processes():
         time.sleep(1.5)
 
     try:
-        out = subprocess.check_output(["pgrep", "-f", "/opt/wechat/wechat|/usr/bin/wechat"]).decode().strip()
-    except subprocess.CalledProcessError:
+        out = subprocess.check_output(["pgrep", "-f", "/opt/wechat/wechat|/usr/bin/wechat"], timeout=5).decode().strip()
+    except Exception:
         out = ""
     if not out:
         log_msg("Starting WeChat 4.1...")
@@ -977,6 +978,32 @@ def ensure_processes():
             stdin=subprocess.DEVNULL,
         )
         time.sleep(4.0)
+
+
+def restart_wechat_client():
+    """强制重启微信客户端进程，自愈严重的黑屏、卡死或窗口丢失。"""
+    log_msg("【应急自愈】正在强制重启微信 Linux 客户端...")
+    try:
+        subprocess.run(["pkill", "-9", "-f", "/opt/wechat/wechat|/usr/bin/wechat"], timeout=5)
+    except Exception:
+        pass
+    time.sleep(2.0)
+    env = os.environ.copy()
+    env["DISPLAY"] = ":99"
+    env["LANG"] = "zh_CN.UTF-8"
+    env["LC_ALL"] = "zh_CN.UTF-8"
+    try:
+        subprocess.Popen(
+            ["dbus-run-session", "/usr/bin/wechat"],
+            env=env,
+            stdout=open("/tmp/wechat.log", "a"),
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        log_msg(f"拉起微信失败: {e}")
+    time.sleep(5.0)
+    log_msg("【应急自愈】微信客户端已重新拉起")
 
 
 def find_wechat_windows(d):
@@ -1215,10 +1242,32 @@ def recover_wechat_ui_state():
                 except Exception:
                     pass
 
-            # 2. 聚焦输入框并清理输入内容（无需发送 Escape，防止触发全局快捷键）
+            # 2. 检查微信可见主窗口，若未发现则尝试唤醒与重映射被最小化/隐藏的 WeChat 窗口
             wins = find_wechat_windows(d)
+            if not wins:
+                for c in root.query_tree().children:
+                    try:
+                        cls = c.get_wm_class()
+                        if cls and any("wechat" in x.lower() for x in cls):
+                            c.map()
+                            c.configure(stack_mode=X.Above)
+                            d.sync()
+                            time.sleep(0.1)
+                    except Exception:
+                        pass
+                wins = find_wechat_windows(d)
+
+            # 3. 校正微信主窗口几何尺寸并聚焦输入框
             if wins:
                 main_w = wins[0]
+                if main_w["x"] < 0 or main_w["y"] < 0 or main_w["width"] < 600 or main_w["height"] < 450:
+                    try:
+                        main_w["win"].configure(x=181, y=67, width=917, height=667)
+                        d.sync()
+                        time.sleep(0.1)
+                    except Exception:
+                        pass
+
                 click_x = main_w["x"] + int(main_w["width"] * 0.65)
                 click_y = main_w["y"] + main_w["height"] - 75
                 xtest.fake_input(d, X.MotionNotify, x=click_x, y=click_y)
@@ -1239,6 +1288,12 @@ def recover_wechat_ui_state():
                 xtest.fake_input(d, X.KeyPress, bs_kc)
                 xtest.fake_input(d, X.KeyRelease, bs_kc)
                 d.sync()
+
+            # 4. 清理可能残留的后台悬挂 xclip 进程
+            try:
+                subprocess.run(["pkill", "-f", "xclip"], stderr=subprocess.DEVNULL, timeout=2)
+            except Exception:
+                pass
         finally:
             d.close()
         log_msg("已完成微信 UI 状态排错与自愈重置")
@@ -2745,11 +2800,19 @@ def switch_to_chat(chat_name, w=None):
 
 
 
+_last_floating_click_ts = 0.0
+_last_floating_click_pos = (0, 0)
+
+
 def check_and_click_floating_pill(img, w):
     """
     自动检测并点击微信聊天区域右上方的绿色浮动跳转胶囊
     （如 '林明露提到了你' 或 'x条新消息'），确保聊天窗口实时对齐至最新消息位置。
     """
+    global _last_floating_click_ts, _last_floating_click_pos
+    now = time.time()
+    if now - _last_floating_click_ts < 2.5:
+        return False
     try:
         px1 = w["x"] + int(w["width"] * 0.70)
         py1 = w["y"] + 70
@@ -2770,6 +2833,8 @@ def check_and_click_floating_pill(img, w):
             if found_green:
                 break
         if found_green and target_x and target_y:
+            _last_floating_click_ts = now
+            _last_floating_click_pos = (target_x, target_y)
             log_msg(f"【自愈对齐】检测到聊天区域浮动提示胶囊，正在点击归位: ({target_x}, {target_y})")
             x11_click(target_x, target_y)
             time.sleep(0.35)
@@ -2785,7 +2850,7 @@ def monitor_loop():
     force_rescan = False
     reply_task_queue = deque()
     last_check_reply_ts = 0.0
-    global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text, last_send_ts
+    global last_recorded_text, last_bot_reply_ts, last_replied_user, last_reply_text, last_send_ts, _last_loop_heartbeat
     log_msg("监控循环已启动 (WeChat 4.1 + Kimi Vision + FIFO 任务队列 + Local Memory + 关注点机制)")
 
     is_in_private_chat = False
@@ -2793,6 +2858,8 @@ def monitor_loop():
     initial_focus_done = False
     last_heal_check_ts = 0.0
     last_cleanup_ts = 0.0
+    no_wechat_win_streak = 0
+    modal_dismiss_streak = 0
 
     def is_in_task_queue(sender, content):
         norm_c = normalize_dedup_text(content)
@@ -2804,6 +2871,7 @@ def monitor_loop():
 
     while True:
         try:
+            _last_loop_heartbeat = time.time()
             ensure_processes()
             cfg = load_config()
             focus_chat = cfg.get("focus_chat", "MAGA")
@@ -2814,11 +2882,22 @@ def monitor_loop():
             img.save("/tmp/screen.png")
 
             if check_and_dismiss_logout_modal(img):
+                modal_dismiss_streak += 1
+                if modal_dismiss_streak >= 3:
+                    log_msg(f"⚠️ 弹窗连续触发关闭 {modal_dismiss_streak} 次，执行高级排错自愈...")
+                    recover_wechat_ui_state()
+                if modal_dismiss_streak >= 6:
+                    log_msg("🚨 弹窗连续触发 6 次仍未解除，执行微信客户端深度自愈重启...")
+                    restart_wechat_client()
+                    modal_dismiss_streak = 0
                 time.sleep(0.3)
                 img, wins = capture_screen_pil()
                 img.save("/tmp/screen.png")
+            else:
+                modal_dismiss_streak = max(0, modal_dismiss_streak - 1)
 
             if wins:
+                no_wechat_win_streak = 0
                 w = wins[0]
                 pad = 12
                 box = (
@@ -3351,6 +3430,17 @@ def monitor_loop():
                 else:
                     prev_crop = None
                     anim_mask = None
+            else:
+                no_wechat_win_streak += 1
+                prev_crop = None
+                anim_mask = None
+                if no_wechat_win_streak == 3:
+                    log_msg("⚠️ 连续 3 次未找到微信可见主窗口，执行 UI 排错与窗口唤醒...")
+                    recover_wechat_ui_state()
+                elif no_wechat_win_streak >= 12:
+                    log_msg("🚨 连续超过 15 秒丢失微信窗口，执行微信客户端自动重启拉起！")
+                    restart_wechat_client()
+                    no_wechat_win_streak = 0
         except Exception as e:
             log_msg(f"Monitor error: {e}")
 
@@ -4221,16 +4311,9 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             recover_wechat_ui_state()
             self._send_json({"ok": True, "message": "UI 排错自愈机制已执行完毕"})
         elif parsed.path == "/api/restart_wechat":
-            def _restart_wc():
-                time.sleep(0.5)
-                subprocess.call(["killall", "-9", "wechat"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                time.sleep(2.0)
-                env = os.environ.copy()
-                env["DISPLAY"] = ":99"
-                subprocess.Popen(["/usr/bin/wechat"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            threading.Thread(target=_restart_wc, daemon=True).start()
+            threading.Thread(target=restart_wechat_client, daemon=True).start()
             log_msg("控制台指令: 触发重启微信客户端")
-            self._send_json({"ok": True, "message": "微信正在重启中..."})
+            self._send_json({"ok": True, "message": "微信正在重启中，请稍候 5 秒..."})
         elif parsed.path == "/api/restart_daemon":
             def _restart_dm():
                 time.sleep(0.8)
@@ -4263,9 +4346,50 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
 
+def start_system_watchdog():
+    """独立看门狗后台线程：监控主循环心跳与系统状态，防止死锁与失联。"""
+    def _watchdog_runner():
+        log_msg("【系统看门狗】守护线程已启动 (主循环停滞超时: 90s, 硬重置超时: 180s)")
+        while True:
+            time.sleep(10)
+            try:
+                now = time.time()
+                elapsed = now - _last_loop_heartbeat
+                if elapsed > 90.0:
+                    log_msg(f"🚨【系统看门狗报警】主监控循环停滞超过 {int(elapsed)} 秒！触发一级应急自愈恢复...")
+                    try:
+                        subprocess.run(["pkill", "-9", "-f", "xclip"], timeout=3)
+                        subprocess.run(["pkill", "-9", "-f", "xdotool"], timeout=3)
+                        recover_wechat_ui_state()
+                    except Exception as e:
+                        log_msg(f"看门狗应急处置异常: {e}")
+                if elapsed > 180.0:
+                    log_msg(f"🚨【系统看门狗硬重置】主监控循环停滞超过 {int(elapsed)} 秒，强制重启微信主进程！")
+                    try:
+                        restart_wechat_client()
+                    except Exception as ex:
+                        log_msg(f"看门狗硬重置异常: {ex}")
+            except Exception:
+                pass
+
+    t = threading.Thread(target=_watchdog_runner, daemon=True)
+    t.start()
+
+
+def supervised_monitor_loop():
+    """监督者线程：确保 monitor_loop 永不退出，意外崩溃时自动拉起。"""
+    while True:
+        try:
+            monitor_loop()
+        except BaseException as e:
+            log_msg(f"🚨 监控主线程意外退出: {e}，将在 3 秒后自动重新拉起...")
+            time.sleep(3.0)
+
+
 if __name__ == "__main__":
     init_db()
-    t = threading.Thread(target=monitor_loop, daemon=True)
+    start_system_watchdog()
+    t = threading.Thread(target=supervised_monitor_loop, daemon=True)
     t.start()
     server = ThreadingHTTPServer(("0.0.0.0", 18890), BotHTTPHandler)
     log_msg("HTTP 控制台已启动: http://0.0.0.0:18890 (外网端口 18890)")
