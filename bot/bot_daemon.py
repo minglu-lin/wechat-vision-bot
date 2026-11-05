@@ -1570,9 +1570,9 @@ def cleanup_old_images(max_days=7):
         log_msg(f"清理旧图片异常: {e}")
 
 
-def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65, temperature: float = None, reasoning_effort: str = None):
+def call_routed_llm(provider: str, model_name: str, messages: list, tools: list = None, timeout: int = 65, temperature: float = None, reasoning_effort: str = None, response_format: dict = None):
     """
-    通用多模型分流调用引擎，统一调度 Kimi 与 Gemini 两大服务商，原生支持 temperature 与 reasoning_effort。
+    通用多模型分流调用引擎，统一调度 OpenAI, Kimi 与 Gemini 三大服务商，原生支持 temperature, reasoning_effort 与 response_format。
     """
     cfg = load_config()
     if provider == "kimi":
@@ -1582,6 +1582,13 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}",
             "User-Agent": "KimiCLI/0.77",
+        }
+    elif provider in ("openai", "gpt"):
+        api_key = cfg.get("openai_api_key") or cfg.get("gpt_api_key", "")
+        base_url = cfg.get("openai_base_url", "https://api.openai.com/v1/chat/completions")
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
         }
     else:  # gemini
         api_key = cfg.get("gemini_api_key") or cfg.get("api_key", "")
@@ -1601,6 +1608,18 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
         # passing other values returns HTTP 400: 'invalid temperature: only 1 is allowed for this model'.
         # Disable internal thinking/CoT to prevent raw English/Chinese reasoning from leaking into content and cut latency by 50%.
         payload["thinking"] = {"type": "disabled"}
+    elif provider in ("openai", "gpt"):
+        is_fixed_temp_model = any(model_name.lower().startswith(p) for p in ["gpt-6", "o1", "o3", "o4"])
+        if not is_fixed_temp_model:
+            target_temp = temperature if temperature is not None else cfg.get("temperature", 0.75)
+            try:
+                payload["temperature"] = float(target_temp)
+            except (ValueError, TypeError):
+                payload["temperature"] = 0.75
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
+        if response_format:
+            payload["response_format"] = response_format
     else:
         target_temp = temperature if temperature is not None else cfg.get("temperature", 0.75)
         try:
@@ -1609,6 +1628,8 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
             payload["temperature"] = 0.75
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
+        if response_format:
+            payload["response_format"] = response_format
 
     if tools:
         payload["tools"] = tools
@@ -1625,10 +1646,11 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
 class TaskModelRouter:
     """
     智能多模型分流路由引擎
-    1. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
+    1. GPT-6 Luna (gpt-6-luna): X11 微信窗口后台截屏视觉 OCR 感知、消息边界与多模态元素精准提取（自动降级备选 Gemini Flash）
     2. Gemini 4 Argon (gemini-4-argon): 全面接管主力对话、长文/文档/文章卡片深度阅读总结、日常问答、生活工具查询、高难度编程与数理推导
-    3. Gemini 3.8 Flash (gemini-3.8-flash): X11 屏幕后台视觉检测、群聊附图/截图等多模态读图、Argon 的快速容灾降级
-    4. Kimi (kimi-for-coding-highspeed): 充裕额度备用容灾通道
+    3. Gemini 3.8 Flash (gemini-3.8-flash): 群聊附图/截图等多模态读图、Argon 的快速容灾降级
+    4. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
+    5. Kimi (kimi-for-coding-highspeed): 充裕额度备用容灾通道
     """
 
     DEEP_REASONING_PATTERNS = [
@@ -1809,25 +1831,41 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
     ]
     res = None
     last_v_err = None
-    vision_models = [
-        ("gemini-3.1-flash-lite", None),
-        ("gemini-3.8-flash", "low"),
-    ]
-    for v_attempt, (v_model, v_effort) in enumerate(vision_models):
+    cfg = load_config()
+    ocr_provider = cfg.get("ocr_provider", "openai" if cfg.get("openai_api_key") else "gemini")
+    ocr_model = cfg.get("ocr_model", "gpt-6-luna" if ocr_provider in ("openai", "gpt") else "gemini-3.1-flash-lite")
+
+    if ocr_provider in ("openai", "gpt"):
+        vision_models = [
+            ("openai", ocr_model, "low"),
+            ("gemini", "gemini-3.1-flash-lite", None),
+            ("gemini", "gemini-3.8-flash", "low"),
+        ]
+    else:
+        vision_models = [
+            ("gemini", ocr_model, None),
+            ("gemini", "gemini-3.8-flash", "low"),
+        ]
+
+    for v_attempt, (v_provider, v_model, v_effort) in enumerate(vision_models):
         try:
+            v_timeout = 30 if v_provider in ("openai", "gpt") else 15
+            v_temp = None if (v_provider in ("openai", "gpt") and any(v_model.lower().startswith(p) for p in ["gpt-6", "o1", "o3", "o4"])) else 0.1
+            v_format = {"type": "json_object"} if v_provider in ("openai", "gpt") else None
             res = call_routed_llm(
-                "gemini",
+                v_provider,
                 v_model,
                 messages,
-                timeout=15,
-                temperature=0.1,
+                timeout=v_timeout,
+                temperature=v_temp,
                 reasoning_effort=v_effort,
+                response_format=v_format,
             )
             break
         except Exception as ve:
             last_v_err = ve
-            log_msg(f"视觉读图请求异常 [{v_model}] (第 {v_attempt+1}/2 次): {ve}")
-            if v_attempt == 0:
+            log_msg(f"视觉读图请求异常 [{v_provider}/{v_model}] (第 {v_attempt+1}/{len(vision_models)} 次): {ve}")
+            if v_attempt < len(vision_models) - 1:
                 time.sleep(0.4)
     if res is None:
         raise last_v_err
