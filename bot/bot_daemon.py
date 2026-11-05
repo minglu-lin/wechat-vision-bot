@@ -1486,6 +1486,15 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
     s_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '_', str(sender or "user"))[:20].strip('_') or "user"
     local_path = os.path.join(IMAGES_DIR, f"img_{int(ts)}_{s_clean}.png")
 
+    if img_info.get("is_thumbnail"):
+        log_msg("【图片过滤】跳过引用微缩缩略图落盘，避免污染覆盖原图")
+        return None
+    if img_info.get("_crop_box"):
+        cb = tuple(img_info["_crop_box"])
+        if (cb[2] - cb[0] < 70) or (cb[3] - cb[1] < 70):
+            log_msg(f"【图片过滤】尺寸过小 ({(cb[2]-cb[0])}x{(cb[3]-cb[1])} < 70x70)，判定为引用微缩图或图标，忽略落盘")
+            return None
+
     saved = False
     try:
         if img_info.get("_img_bytes"):
@@ -1897,12 +1906,16 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
                                 min(cw, int(xmax * cw / 1000)),
                                 min(ch, int(ymax * ch / 1000))
                             )
-                            if crop_box[2] - crop_box[0] > 20 and crop_box[3] - crop_box[1] > 20:
+                            if (crop_box[2] - crop_box[0] >= 70) and (crop_box[3] - crop_box[1] >= 70):
                                 ref_img["_crop_box"] = list(crop_box)
                                 if chat_box:
                                     screen_cx = chat_box[0] + int(((xmin + xmax) / 2) * (chat_box[2] - chat_box[0]) / 1000)
                                     screen_cy = chat_box[1] + int(((ymin + ymax) / 2) * (chat_box[3] - chat_box[1]) / 1000)
                                     ref_img["_screen_pos"] = [screen_cx, screen_cy]
+                            else:
+                                # 尺寸过小 (< 70x70)，判定为引用气泡右侧微缩图、小头像或小表情，严禁作为独立大图
+                                ref_img["has_image"] = False
+                                ref_img["is_thumbnail"] = True
                         except Exception as ce:
                             log_msg(f"计算图片坐标失败: {ce}")
 
@@ -2227,8 +2240,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             clean_qc = re.sub(r'\s*\[.*?\]$', '', clean_qc).strip()
             if clean_qc:
                 card_keywords.append(clean_qc)
-        elif qc and not any(k in qc for k in ["[图片]", "[表情]", "[视频]", "[文件"]):
-            card_keywords.append(qc)
+        elif qc and not any(k in qc for k in ["[图片]", "[表情]", "[视频]", "[文件]", "截图", "照片", "图片", "场景", "缩略图"]):
+            if not any(v in qc for v in ["发送了", "引用了", "包含中文", "一张", "黑白"]):
+                card_keywords.append(qc)
 
     # 3) Extract from content
     for ct in candidate_texts:
@@ -3287,7 +3301,26 @@ def monitor_loop():
                                                         log_msg(f"为用户提问关联最近上传的文件: {recent_f.get('file_name')}")
 
                                             # 关联当前消息中的图片或本地持久化历史图片
-                                            target_img_info = img_info if (img_info and img_info.get("has_image")) else None
+                                            target_img_info = None
+
+                                            # 1. 微信“引用看图”首要原则：如果消息带引用 (has_q=True)，优先通过引用溯源被引用的真实高清大图！
+                                            # 绝不使用本条消息气泡自带的 28x42 微型缩略图
+                                            if has_q:
+                                                matched_rec = find_image_for_query(c, quote_info=q_info, session_key=session_key)
+                                                if matched_rec:
+                                                    log_msg(f"【引用看图命中】成功溯源被引用的真实高清大图: {matched_rec['image_path']} (来自: {matched_rec.get('sender')})")
+                                                    target_img_info = {
+                                                        "has_image": True,
+                                                        "local_path": matched_rec["image_path"],
+                                                        "image_type": matched_rec.get("image_type", "图片"),
+                                                        "ocr_and_detail": matched_rec.get("ocr_and_detail", ""),
+                                                        "sender": matched_rec.get("sender", ""),
+                                                    }
+
+                                            # 2. 若不是引用或者引用未匹配到，且当前消息本身是真实附图（且非微缩缩略图）
+                                            if not target_img_info and img_info and img_info.get("has_image") and not img_info.get("is_thumbnail"):
+                                                target_img_info = img_info
+
                                             is_card_context = has_card or (has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["🔗", "《", "http", "mp.weixin.qq.com", "分享文章卡片"]))
                                             if is_card_context:
                                                 # 如果当前会话处于分享文章/卡片上下文中，绝不错误绑定过去的不相关历史图片
@@ -3305,7 +3338,7 @@ def monitor_loop():
                                                 elif session_key in last_received_images:
                                                     recent_img = last_received_images[session_key]
                                                     if time.time() - recent_img.get("ts", 0) < 600:
-                                                        img_kws = ["看图", "读图", "这张图", "这个图", "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中", "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图"]
+                                                        img_kws = ["看图", "读图", "这张图", "这个图", "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中", "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图", "解释", "什么意思", "这是啥", "写的啥"]
                                                         is_quote_img = has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["[图片]", "图", "照片", "截图"])
                                                         if is_quote_img or any(kw in c.lower() for kw in img_kws) or is_in_private_chat:
                                                             target_img_info = recent_img
