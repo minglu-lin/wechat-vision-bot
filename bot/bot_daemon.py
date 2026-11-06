@@ -534,8 +534,8 @@ def parse_file_content(file_path, max_chars=35000):
 
 def is_explicit_bot_invocation(content):
     """
-    检查消息是否以 @AIbot 或 bot 开头。
-    【用户最高铁律】：@AIbot 或者 bot 开头的句子都必须回应，禁止任何拦截、降级或过滤。
+    检查消息是否显式呼叫 bot（无论 @ 位于句首、句中还是句尾，或以 bot 开头）。
+    【用户最高铁律】：只要显式呼叫 bot，都必须回应，禁止任何拦截、降级或过滤。
     """
     if not content:
         return False
@@ -543,8 +543,8 @@ def is_explicit_bot_invocation(content):
     if re.fullmatch(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', c):
         return False
 
-    # 1. 以 @ 呼叫 bot: @aibot, @albot, @bot, @微信小号 等，兼容各类 unicode 空格 (\u2005, \u00a0, \u3000)
-    if re.match(r'^@\s*(?:aibot|albot|bot|微信小号)', c):
+    # 1. 显式 @ 呼叫 bot: @aibot, @albot, @bot, @微信小号 等（句首、句中、句尾均可），兼容各类 unicode 空格
+    if re.search(r'(?<![a-zA-Z0-9_.+-])@\s*(?:aibot|albot|bot|微信小号)(?:[\s\u2005\u00a0\u3000,，:：、?!？！]|$|[\u4e00-\u9fa5])', c):
         return True
 
     # 2. 句首以 bot, aibot, albot 开头 (支持后接空格、标点、全角符号、中文或直接字符)
@@ -1798,7 +1798,7 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"2. content: 消息主体文本内容（若是文件卡片，提取文件名并格式化为 '[发送文件: 文件名]'；若是图片，简要描述图片类型与核心画面）\n"
             f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
             f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
-            f"   - 【用户最高铁律】：只要消息开头包含 @AIbot、@Albot、@bot、@微信小号，或者以 bot、aibot 开头（如 'bot ...'、'@AIbot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
+            f"   - 【用户最高铁律】：只要消息中显式包含 @AIbot、@Albot、@bot、@微信小号（无论位于句首、句中还是句尾，如 'xxx @Albot' 或 '@AIbot xxx'），或者以 bot、aibot 开头（如 'bot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
             f"   - 【严格禁忌1】：如果群友是在 @其他群成员（例如 '@张三 ...'、'@黄嘉诚 ...'，@后面跟的不是 AIbot/Albot/bot），绝对不属于呼叫 bot，is_mentioned 必须为 false！\n"
             f"   - 【严格禁忌2】：当群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊而非指令时，is_mentioned 必须为 false！\n"
             f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
