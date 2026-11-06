@@ -1655,7 +1655,7 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
 class TaskModelRouter:
     """
     智能多模型分流路由引擎
-    1. GPT-6 Luna (gpt-6-luna): X11 微信窗口后台截屏视觉 OCR 感知、消息边界与多模态元素精准提取（自动降级备选 Gemini Flash）
+    1. Gemini 3.1 Flash Lite (gemini-3.1-flash-lite): X11 微信窗口后台截屏视觉 OCR 感知、消息边界与多模态元素精准提取（自动降级备选 Gemini 3.8 Flash）
     2. Gemini 4 Argon (gemini-4-argon): 全面接管主力对话、长文/文档/文章卡片深度阅读总结、日常问答、生活工具查询、高难度编程与数理推导
     3. Gemini 3.8 Flash (gemini-3.8-flash): 群聊附图/截图等多模态读图、Argon 的快速容灾降级
     4. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
@@ -1841,8 +1841,8 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
     res = None
     last_v_err = None
     cfg = load_config()
-    ocr_provider = cfg.get("ocr_provider", "openai" if cfg.get("openai_api_key") else "gemini")
-    ocr_model = cfg.get("ocr_model", "gpt-6-luna" if ocr_provider in ("openai", "gpt") else "gemini-3.1-flash-lite")
+    ocr_provider = cfg.get("ocr_provider", "gemini")
+    ocr_model = cfg.get("ocr_model", "gemini-3.1-flash-lite")
 
     if ocr_provider in ("openai", "gpt"):
         vision_models = [
