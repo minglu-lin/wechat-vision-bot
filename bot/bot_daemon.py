@@ -1619,6 +1619,93 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
         payload["thinking"] = {"type": "disabled"}
     elif provider in ("openai", "gpt"):
         is_fixed_temp_model = any(model_name.lower().startswith(p) for p in ["gpt-6", "o1", "o3", "o4"])
+        # OpenAI gpt-6.1-sol / gpt-6 models do not support function tools with reasoning_effort in /v1/chat/completions;
+        # transparently route tool-enabled requests through /v1/responses and normalize back to chat.completions format.
+        if tools and is_fixed_temp_model:
+            resp_url = re.sub(r'/chat/completions/?$', '/responses', base_url)
+            if resp_url == base_url:
+                resp_url = "https://api.openai.com/v1/responses"
+            resp_tools = []
+            for t in tools:
+                if t.get("type") == "function" and "function" in t:
+                    fn = t["function"]
+                    resp_tools.append({
+                        "type": "function",
+                        "name": fn.get("name"),
+                        "description": fn.get("description", ""),
+                        "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
+                    })
+                else:
+                    resp_tools.append(t)
+            resp_input = []
+            for m in messages:
+                role = m.get("role", "user")
+                m_content = m.get("content", "")
+                if isinstance(m_content, list):
+                    new_c = []
+                    for part in m_content:
+                        if part.get("type") == "text":
+                            new_c.append({"type": "input_text", "text": part.get("text", "")})
+                        elif part.get("type") == "image_url":
+                            img_url = part.get("image_url", {}).get("url", "")
+                            if img_url:
+                                new_c.append({"type": "input_image", "image_url": img_url})
+                    resp_input.append({"role": role, "content": new_c})
+                else:
+                    resp_input.append({"role": role, "content": str(m_content)})
+            eff = reasoning_effort if reasoning_effort in ("low", "medium", "high", "xhigh") else "low"
+            resp_payload = {
+                "model": model_name,
+                "input": resp_input,
+                "tools": resp_tools,
+                "reasoning": {"effort": eff},
+            }
+            req = urllib.request.Request(
+                resp_url,
+                data=json.dumps(resp_payload).encode("utf-8"),
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw_res = json.loads(r.read().decode("utf-8"))
+            tool_calls = []
+            text_parts = []
+            for item in raw_res.get("output", []):
+                itype = item.get("type")
+                if itype == "function_call":
+                    tool_calls.append({
+                        "id": item.get("call_id") or item.get("id", "call_1"),
+                        "type": "function",
+                        "function": {
+                            "name": item.get("name", ""),
+                            "arguments": item.get("arguments", "{}"),
+                        }
+                    })
+                elif itype == "message":
+                    for c_item in item.get("content", []):
+                        if c_item.get("type") in ("output_text", "text"):
+                            text_parts.append(c_item.get("text", ""))
+            final_text = "\n".join(t for t in text_parts if t).strip()
+            if tool_calls:
+                return {
+                    "choices": [{
+                        "finish_reason": "tool_calls",
+                        "message": {
+                            "role": "assistant",
+                            "content": final_text or None,
+                            "tool_calls": tool_calls,
+                        }
+                    }]
+                }
+            return {
+                "choices": [{
+                    "finish_reason": "stop",
+                    "message": {
+                        "role": "assistant",
+                        "content": final_text,
+                    }
+                }]
+            }
+
         if not is_fixed_temp_model:
             target_temp = temperature if temperature is not None else cfg.get("temperature", 0.75)
             try:
@@ -1627,6 +1714,8 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
                 payload["temperature"] = 0.75
         if reasoning_effort:
             payload["reasoning_effort"] = reasoning_effort
+        elif is_fixed_temp_model:
+            payload["reasoning_effort"] = "low"
         if response_format:
             payload["response_format"] = response_format
     else:
@@ -1656,19 +1745,23 @@ class TaskModelRouter:
     """
     智能多模型分流路由引擎
     1. Gemini 3.1 Flash Lite (gemini-3.1-flash-lite): X11 微信窗口后台截屏视觉 OCR 感知、消息边界与多模态元素精准提取（自动降级备选 Gemini 3.8 Flash）
-    2. Gemini 4 Argon (gemini-4-argon): 全面接管主力对话、长文/文档/文章卡片深度阅读总结、日常问答、生活工具查询、高难度编程与数理推导
-    3. Gemini 3.8 Flash (gemini-3.8-flash): 群聊附图/截图等多模态读图、Argon 的快速容灾降级
+    2. 主力回答问题五五分流 (50% / 50% 负载均衡):
+       - OpenAI GPT-6.1 Sol (gpt-6.1-sol): 承担 50% 主力问答及全部深度思考推理任务
+       - Gemini 4 Argon (gemini-4-argon): 承担 50% 主力问答、长文阅读与工具查询
+    3. Gemini 3.8 Flash (gemini-3.8-flash): 群聊附图/截图等多模态读图、快速容灾降级
     4. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
     5. Kimi (kimi-for-coding-highspeed): 充裕额度备用容灾通道
     """
+
+    _rr_counter = 0
 
     DEEP_REASONING_PATTERNS = [
         r'(?:写一段?|编写|实现|手写|设计)(?:个|一个)?(?:代码|程序|脚本|算法|函数|类|模块)',
         r'(?:代码|程序|算法)(?:重构|优化|调试|排查|分析|实现)',
         r'(?:leetcode|动态规划|二叉树|红黑树|快速排序|递归|贪心|图论)',
         r'(?:数学证明|公式推导|求导|微积分|拉格朗日|矩阵|线性代数|特征值|傅里叶|偏微分)',
-        r'(?:深度思考|深度分析|底层原理|架构设计|形式化验证|博弈论)',
-        r'(?:gemini\s*4|argon|4-argon)',
+        r'(?:深度思考|深度分析|底层原理|架构设计|形式化验证|博弈论|深度解读|底层逻辑|推演)',
+        r'(?:gpt|6\.1\s*sol|sol模型)',
     ]
 
     MULTIMODAL_IMAGE_PATTERNS = [
@@ -1681,6 +1774,10 @@ class TaskModelRouter:
     @classmethod
     def route(cls, content: str, quote_info: dict = None, image_info: dict = None, file_info: dict = None, card_info: dict = None) -> dict:
         c = (content or "").strip().lower()
+        cfg = load_config()
+        gpt_think_model = cfg.get("gpt_think_model", "gpt-6.1-sol")
+        has_openai_key = bool(cfg.get("openai_api_key") or cfg.get("gpt_api_key"))
+
         has_img = bool(image_info and image_info.get("has_image"))
         has_code_file = False
         if file_info and file_info.get("file_name"):
@@ -1695,30 +1792,53 @@ class TaskModelRouter:
         )
 
         # 1. 多模态/附图解析诉求 -> 分流给 Gemini 3.8 Flash (3.8 视觉解析场景保持不变)
-        # 核心保护：若属于公众号文章/卡片/链接的深度阅读总结与分析，即使附带缩略图，也由深度分析主力 Gemini 4 Argon 处理！
         if (has_img or any(re.search(p, c) for p in cls.MULTIMODAL_IMAGE_PATTERNS)) and not is_article_task:
             log_msg(f"【模型分流路由】多模态视觉图文理解 -> 分流至 Gemini 3.8 Flash")
             return {
                 "provider": "gemini",
                 "model": "gemini-3.8-flash",
                 "reason": "多模态视觉图文解析 (Gemini 3.8 Flash)",
+                "reasoning_effort": None,
             }
 
-        # 2. 复杂编程/算法/数学证明/深度推理/复杂代码分析 -> 分流给 Gemini 4 Argon
-        if (has_code_file and any(kw in c for kw in ["debug", "排查", "报错", "重构", "优化", "实现", "分析", "为什么", "bug"])) or any(re.search(p, c) for p in cls.DEEP_REASONING_PATTERNS):
-            log_msg(f"【模型分流路由】高难度编程/数理推导/深度逻辑推理 -> 分流至 Gemini 4 Argon")
+        # 显式指定 Gemini 4 Argon
+        if re.search(r'(?:gemini\s*4|argon|4-argon)', c):
+            log_msg(f"【模型分流路由】用户显式指定 -> 分流至 Gemini 4 Argon")
             return {
                 "provider": "gemini",
                 "model": "gemini-4-argon",
-                "reason": "深度代码与数理逻辑推理",
+                "reason": "显式指定 (Gemini 4 Argon)",
+                "reasoning_effort": None,
             }
 
-        # 3. 主力日常对话、文档/PDF/Excel/Word长文阅读总结、文章卡片分析、常规文本问答、生活工具调用 -> 原 Kimi 场景全面接管为 Gemini 4 Argon
-        log_msg(f"【模型分流路由】主力日常问答/长文及文档阅读/工具调用 -> 分流至 Gemini 4 Argon")
+        # 2. 思考问题：复杂编程/算法/数学证明/深度推理/复杂代码分析 -> 采用 GPT-6.1 Sol 模型
+        if has_openai_key and ((has_code_file and any(kw in c for kw in ["debug", "排查", "报错", "重构", "优化", "实现", "分析", "为什么", "bug"])) or any(re.search(p, c) for p in cls.DEEP_REASONING_PATTERNS)):
+            log_msg(f"【模型分流路由】深度思考/高难度编程/数理逻辑推理 -> 分流至 OpenAI {gpt_think_model} (effort=medium)")
+            return {
+                "provider": "openai",
+                "model": gpt_think_model,
+                "reason": f"深度思考与逻辑推理 ({gpt_think_model})",
+                "reasoning_effort": "medium",
+            }
+
+        # 3. 主力回答问题：五五分流 (50% OpenAI gpt-6.1-sol / 50% Gemini 4 Argon)
+        if has_openai_key:
+            cls._rr_counter = (cls._rr_counter + 1) % 2
+            if cls._rr_counter == 1:
+                log_msg(f"【模型分流路由】主力问答五五分流 [50% GPT] -> 分流至 OpenAI {gpt_think_model} (effort=low)")
+                return {
+                    "provider": "openai",
+                    "model": gpt_think_model,
+                    "reason": f"主力问答五五分流 ({gpt_think_model})",
+                    "reasoning_effort": "low",
+                }
+
+        log_msg(f"【模型分流路由】主力问答五五分流 [50% Gemini] -> 分流至 Gemini 4 Argon")
         return {
             "provider": "gemini",
             "model": "gemini-4-argon",
-            "reason": "主力日常问答与长文阅读 (Gemini 4 Argon)",
+            "reason": "主力问答五五分流 (Gemini 4 Argon)",
+            "reasoning_effort": None,
         }
 
 
@@ -2081,14 +2201,17 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     provider = route_info["provider"]
     target_model = route_info["model"]
     route_reason = route_info["reason"]
+    route_effort = route_info.get("reasoning_effort")
     if force_provider == "gemini":
-        if provider == "kimi":
+        if provider in ("kimi", "openai", "gpt"):
             provider = "gemini"
-            target_model = "gemini-3.8-flash"
-            route_reason = "重试强制切换 Gemini 3.8 Flash 兜底"
+            target_model = "gemini-4-argon"
+            route_reason = "重试切换 Gemini 4 Argon 兜底"
+            route_effort = None
         elif target_model == "gemini-4-argon":
             target_model = "gemini-3.8-flash"
             route_reason = "重试降级至 Gemini 3.8 Flash 快速响应"
+            route_effort = None
 
     plugin_tools = plugin_manager.get_openai_tools() if plugin_manager else []
     tools = plugin_tools
@@ -2379,7 +2502,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                         tools = None
 
     user_content_payload = user_query
-    if provider == "gemini" and image_info and image_info.get("has_image"):
+    if provider in ("gemini", "openai", "gpt") and image_info and image_info.get("has_image"):
         img_data = None
         # 1. 优先读取持久化本地图片记录 (零延迟、原分辨率)
         if image_info.get("local_path") and os.path.exists(image_info["local_path"]):
@@ -2421,7 +2544,8 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             # 严格限制最多只允许第 1 轮 (loop_idx == 0) 触发工具调用；第 2 轮起强制 tools=None 直接根据已有信息+自身知识作答，彻底杜绝无限连环搜！
             active_tools = tools if (loop_idx == 0 and not collected_tool_outputs) else None
             log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮 (tools={'开' if active_tools else '关-强制总结'})...")
-            res = call_routed_llm(provider, target_model, messages, tools=active_tools, timeout=32)
+            req_timeout = 45 if provider in ("openai", "gpt") else 32
+            res = call_routed_llm(provider, target_model, messages, tools=active_tools, timeout=req_timeout, reasoning_effort=route_effort)
             choice = res["choices"][0]
             msg = choice["message"]
 
@@ -2456,8 +2580,24 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             final_reply = clean_bot_reply(content_text)
             if final_reply:
                 break
+            # 如果 OpenAI (gpt-6.1-sol) 返回空内容，自动切换 Gemini 4 Argon 兜底
+            if provider in ("openai", "gpt"):
+                log_msg(f"OpenAI ({target_model}) 返回空内容，自动切换备用 Gemini 4 Argon 直接生成回答...")
+                provider = "gemini"
+                target_model = "gemini-4-argon"
+                route_reason = "OpenAI 空返回容灾切换至 Gemini 4 Argon"
+                route_effort = None
+                fallback_query = user_query
+                if collected_tool_outputs:
+                    fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
+                tools = None
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": fallback_query},
+                ]
+                continue
             # 如果 Gemini 4 Argon 返回空内容，自动切换 Gemini 3.8 Flash 兜底
-            if target_model == "gemini-4-argon":
+            elif target_model == "gemini-4-argon":
                 log_msg("Gemini 4 Argon 返回空内容，自动切换备用 Gemini 3.8 Flash 直接生成回答...")
                 target_model = "gemini-3.8-flash"
                 route_reason = "Argon 空返回容灾降级"
@@ -2487,8 +2627,24 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 continue
         except Exception as e:
             log_msg(f"模型 [{provider}/{target_model}] 请求异常 (第 {loop_idx+1} 轮): {e}")
-            # 容灾自动分流降级：如果 Gemini 4 Argon 异常，降级至 Gemini 3.8 Flash
-            if target_model == "gemini-4-argon":
+            # 容灾自动分流降级：如果 OpenAI (gpt-6.1-sol) 异常，无缝切换至 Gemini 4 Argon
+            if provider in ("openai", "gpt"):
+                log_msg(f"OpenAI ({target_model}) 异常，重置上下文并切换至 Gemini 4 Argon 继续重试...")
+                provider = "gemini"
+                target_model = "gemini-4-argon"
+                route_reason = "OpenAI 异常容灾切换至 Gemini 4 Argon"
+                route_effort = None
+                fallback_query = user_query
+                if collected_tool_outputs:
+                    fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
+                tools = None
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": fallback_query},
+                ]
+                continue
+            # 如果 Gemini 4 Argon 异常，优先切换至 OpenAI gpt-6.1-sol 或降级至 Gemini 3.8 Flash
+            elif target_model == "gemini-4-argon":
                 log_msg("Gemini 4 Argon 异常，重置上下文并降级至 Gemini 3.8 Flash 继续重试...")
                 target_model = "gemini-3.8-flash"
                 route_reason = "Argon 异常容灾降级"
