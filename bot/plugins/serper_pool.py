@@ -6,14 +6,24 @@ Manages multiple backup Serper API keys, automatic failover upon credit exhausti
 and persistence to config.json.
 """
 
+import hashlib
 import json
 import os
 import re
 import threading
 from datetime import datetime, timezone, timedelta
+from .base import atomic_write_json
 
 TZ_BJ = timezone(timedelta(hours=8))
 _lock = threading.Lock()
+
+
+def _key_id(k: str) -> str:
+    return hashlib.sha256(k.encode("utf-8")).hexdigest()[:12]
+
+
+def _mask_key(k: str) -> str:
+    return f"{k[:6]}...{k[-4:]}" if len(k) >= 10 else "***"
 
 
 def get_config_path() -> str:
@@ -108,8 +118,7 @@ def add_serper_keys(new_keys_input) -> tuple:
             cfg["serper_api_key"] = current_keys[0]
 
         try:
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            atomic_write_json(cfg_path, cfg, mode=0o600)
         except Exception as e:
             print(f"[SerperPool] 保存配置文件异常: {e}")
 
@@ -117,7 +126,7 @@ def add_serper_keys(new_keys_input) -> tuple:
 
 
 def remove_serper_key(target_key: str) -> tuple:
-    """手动从池中移除指定的 Key"""
+    """手动从池中移除指定的 Key (支持传入 key_id / 掩码 / 完整 key)"""
     t_clean = (target_key or "").strip()
     if not t_clean:
         return False, get_serper_keys()
@@ -139,16 +148,20 @@ def remove_serper_key(target_key: str) -> tuple:
             if len(k_orig) >= 20:
                 current_keys = [k_orig]
 
-        if t_clean in current_keys:
-            current_keys.remove(t_clean)
+        matched_key = None
+        for k in current_keys:
+            if t_clean in (k, _key_id(k), _mask_key(k)):
+                matched_key = k
+                break
+        if matched_key is not None:
+            current_keys.remove(matched_key)
             removed = True
 
         cfg["serper_api_keys"] = current_keys
         cfg["serper_api_key"] = current_keys[0] if current_keys else ""
 
         try:
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            atomic_write_json(cfg_path, cfg, mode=0o600)
         except Exception as e:
             print(f"[SerperPool] 移除 Key 异常: {e}")
 
@@ -190,11 +203,12 @@ def discard_exhausted_serper_key(exhausted_key: str, reason: str = ""):
 
         exhausted_list = list(cfg.get("exhausted_serper_keys", []))
         now_str = datetime.now(TZ_BJ).strftime("%Y-%m-%d %H:%M:%S")
-        masked = f"{t_clean[:6]}...{t_clean[-4:]}"
-        # 避免重复记录相同废弃 key
-        if not any(e.get("key") == t_clean for e in exhausted_list):
+        masked = _mask_key(t_clean)
+        kid = _key_id(t_clean)
+        # 避免重复记录相同废弃 key (同时不落盘明文 key)
+        if not any(e.get("id") == kid or e.get("key") == t_clean or e.get("masked") == masked for e in exhausted_list):
             exhausted_list.append({
-                "key": t_clean,
+                "id": kid,
                 "masked": masked,
                 "discarded_at": now_str,
                 "reason": reason or "Credits exhausted (403)"
@@ -202,15 +216,14 @@ def discard_exhausted_serper_key(exhausted_key: str, reason: str = ""):
         cfg["exhausted_serper_keys"] = exhausted_list[-20:]  # 保留最近20条废弃记录
 
         try:
-            with open(cfg_path, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            atomic_write_json(cfg_path, cfg, mode=0o600)
             print(f"[SerperPool] ⚠️ Key [{masked}] 额度已耗尽/失效 ({reason})，已自动废弃！剩余后备 Key 数量: {len(current_keys)}")
         except Exception as e:
             print(f"[SerperPool] 保存废弃 Key 异常: {e}")
 
 
 def get_serper_pool_status() -> dict:
-    """返回 Key 池完整状态 (供 Web 界面和 API 读取)"""
+    """返回脱敏后的 Key 池状态 (供 Web 界面和 API 安全读取，严禁暴露完整明文 Key)"""
     cfg_path = get_config_path()
     cfg = {}
     if os.path.exists(cfg_path):
@@ -228,15 +241,23 @@ def get_serper_pool_status() -> dict:
 
     active_items = []
     for i, k in enumerate(current_keys):
-        masked = f"{k[:6]}...{k[-4:]}" if len(k) >= 10 else k
         active_items.append({
             "index": i,
-            "key": k,
-            "masked": masked,
+            "id": _key_id(k),
+            "masked": _mask_key(k),
             "is_primary": (i == 0),
         })
 
-    exhausted_items = cfg.get("exhausted_serper_keys", [])
+    raw_exhausted = cfg.get("exhausted_serper_keys", [])
+    exhausted_items = []
+    for e in raw_exhausted:
+        if isinstance(e, dict):
+            raw_k = str(e.get("key", ""))
+            exhausted_items.append({
+                "masked": e.get("masked") or (_mask_key(raw_k) if raw_k else "***"),
+                "discarded_at": e.get("discarded_at", ""),
+                "reason": e.get("reason", "额度用完"),
+            })
     return {
         "ok": True,
         "total_active": len(active_items),

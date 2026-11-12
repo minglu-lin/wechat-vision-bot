@@ -76,14 +76,24 @@ echo "=== [5/6] 部署配置文件与脚本 ==="
 if [ ! -f "$INSTALL_DIR/config.json" ]; then
     if [ -f "config.example.json" ]; then
         cp config.example.json "$INSTALL_DIR/config.json"
-        echo "已从 config.example.json 创建 $INSTALL_DIR/config.json"
-        echo "⚠️ 请记得编辑 $INSTALL_DIR/config.json 填入你的 kimi_api_key！"
+        chmod 600 "$INSTALL_DIR/config.json"
+        echo "已从 config.example.json 创建 $INSTALL_DIR/config.json (权限 0600)"
+        echo "⚠️ 请记得编辑 $INSTALL_DIR/config.json 修改 admin_password 与 API Keys！"
     fi
+else
+    chmod 600 "$INSTALL_DIR/config.json" || true
 fi
 
 if [ -f "bot/bot_daemon.py" ]; then
     cp bot/bot_daemon.py "$INSTALL_DIR/bot_daemon.py"
-    chmod +x "$INSTALL_DIR/bot_daemon.py"
+    chmod 755 "$INSTALL_DIR/bot_daemon.py"
+fi
+
+if [ -d "bot/plugins" ]; then
+    mkdir -p "$INSTALL_DIR/plugins"
+    cp -r bot/plugins/*.py "$INSTALL_DIR/plugins/"
+    chmod 755 "$INSTALL_DIR/plugins"
+    chmod 644 "$INSTALL_DIR/plugins/"*.py
 fi
 
 echo "=== [6/6] 配置 Systemd 守护进程服务 ==="

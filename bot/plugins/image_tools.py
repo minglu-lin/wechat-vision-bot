@@ -21,7 +21,7 @@ import base64
 import io
 import time
 from PIL import Image
-from .base import BasePlugin
+from .base import BasePlugin, safe_http_get_bytes
 
 # Global image sender hook registered by daemon
 _IMAGE_SENDER = None
@@ -57,13 +57,11 @@ def extract_images_from_url(url: str, html_str: str = None) -> list:
     if not html_str:
         try:
             headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Referer": url,
             }
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=10) as r:
-                html_str = r.read().decode("utf-8", errors="ignore")
+            raw_html, _, _ = safe_http_get_bytes(url, headers=headers, timeout=10, max_bytes=4 * 1024 * 1024)
+            html_str = raw_html.decode("utf-8", errors="ignore")
         except Exception:
             return []
 
@@ -153,13 +151,34 @@ class GenerateImagePlugin(BasePlugin):
         # Check if user intent is image remixing (图生图)
         is_remix = use_ref_image or any(k in p for k in ["重制", "改图", "修改", "换成", "变成", "参考", "仿照", "垫图", "照片里", "图里", "里面的人"])
 
-        # Determine reference image (ONLY use clean cropped photos, NEVER whole UI screenshots!)
-        ref_path = ref_image_path
-        if not ref_path or not os.path.exists(ref_path):
-            for candidate in ["/tmp/wechat_last_photo.png", "/home/opc/user_lake_photo.png"]:
-                if os.path.exists(candidate):
-                    ref_path = candidate
-                    break
+        # Determine reference image (ONLY use clean cropped recent photos, NEVER whole UI screenshots or stale files!)
+        ref_path = ref_image_path if (ref_image_path and os.path.exists(ref_image_path)) else None
+        if not ref_path:
+            now_ts = time.time()
+            last_photo = "/tmp/wechat_last_photo.png"
+            if os.path.exists(last_photo) and (now_ts - os.path.getmtime(last_photo) < 86400):
+                ref_path = last_photo
+            else:
+                # Fallback: check newest persisted incoming image in data/images within last 6 hours
+                img_dirs = [
+                    "/home/opc/wechat_bot/data/images",
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data", "images"),
+                ]
+                for idir in img_dirs:
+                    if os.path.isdir(idir):
+                        try:
+                            entries = [
+                                os.path.join(idir, fn)
+                                for fn in os.listdir(idir)
+                                if fn.startswith("img_") and fn.endswith(".png")
+                            ]
+                            if entries:
+                                newest = max(entries, key=lambda x: os.path.getmtime(x))
+                                if now_ts - os.path.getmtime(newest) < 21600:
+                                    ref_path = newest
+                                    break
+                        except Exception:
+                            pass
 
         cfg = _get_config()
         api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", "")
@@ -476,9 +495,7 @@ class SendWebpageImagePlugin(BasePlugin):
         for item in to_try:
             u = item["url"]
             try:
-                req = urllib.request.Request(u, headers=headers)
-                with urllib.request.urlopen(req, timeout=10) as r:
-                    data = r.read()
+                data, _, _ = safe_http_get_bytes(u, headers=headers, timeout=10, max_bytes=10 * 1024 * 1024)
                 if len(data) >= 5000:
                     with open(local_raw, "wb") as f:
                         f.write(data)
@@ -490,6 +507,12 @@ class SendWebpageImagePlugin(BasePlugin):
                         break
             except Exception:
                 continue
+            finally:
+                if os.path.exists(local_raw):
+                    try:
+                        os.remove(local_raw)
+                    except Exception:
+                        pass
 
         if not downloaded:
             return {"error": "网页图片下载失败或源地址拒绝访问"}

@@ -5,6 +5,7 @@ Finance Plugin: Currency Exchange & Crypto Prices
 Provides real-time currency conversion and cryptocurrency prices with zero API key requirement.
 """
 
+import urllib.parse
 import urllib.request
 import json
 import re
@@ -175,32 +176,76 @@ class CryptoPlugin(BasePlugin):
 
     def execute(self, symbol: str, **kwargs) -> dict:
         coin_id, display_name = self._normalize_crypto(symbol)
+        raw_sym = (symbol or "").strip().upper()
 
-        # Uses CoinCap public API
-        url = f"https://api.coincap.io/v2/assets/{coin_id}"
-        try:
-            req = urllib.request.Request(url, headers={"User-Agent": "WeChatBot/2.0"})
-            with urllib.request.urlopen(req, timeout=6) as r:
-                data = json.loads(r.read().decode("utf-8")).get("data", {})
-        except Exception:
-            # Fallback to secondary source or simple search
-            return {"error": f"加密货币行情接口暂无法访问或找不到代码‘{symbol}’"}
-
-        if not data:
-            return {"error": f"未查询到币种 {symbol} 的数据"}
-
-        price_usd = float(data.get("priceUsd", 0))
-        change_24h = float(data.get("changePercent24Hr", 0))
-        symbol_code = data.get("symbol", symbol.upper())
-        name = data.get("name", symbol)
-
-        return {
-            "symbol": symbol_code,
-            "name": name,
-            "price_usd": round(price_usd, 2 if price_usd > 1 else 4),
-            "change_24h_percent": round(change_24h, 2),
-            "market_cap_usd": round(float(data.get("marketCapUsd", 0)) / 1e8, 2),
+        # Map coin_id back to standard ticker symbol for Binance primary feed
+        id_to_ticker = {
+            "bitcoin": "BTC",
+            "ethereum": "ETH",
+            "solana": "SOL",
+            "binancecoin": "BNB",
+            "ripple": "XRP",
+            "dogecoin": "DOGE",
+            "cardano": "ADA",
+            "tron": "TRX",
+            "avalanche-2": "AVAX",
+            "polkadot": "DOT",
+            "chainlink": "LINK",
+            "litecoin": "LTC",
+            "sui": "SUI",
+            "pepe": "PEPE",
         }
+        ticker = id_to_ticker.get(coin_id) or (raw_sym if raw_sym.isalpha() and 2 <= len(raw_sym) <= 8 else "")
+
+        # 1. Primary source: Binance Spot 24hr Ticker API (fast, keyless, reliable in SG)
+        if ticker and ticker not in ("USDT", "USDC"):
+            b_url = f"https://api.binance.com/api/v3/ticker/24hr?symbol={ticker}USDT"
+            try:
+                req = urllib.request.Request(b_url, headers={"User-Agent": "WeChatBot/2.1"})
+                with urllib.request.urlopen(req, timeout=6) as r:
+                    b_data = json.loads(r.read(65536).decode("utf-8"))
+                if b_data and "lastPrice" in b_data:
+                    price_usd = float(b_data["lastPrice"])
+                    change_24h = float(b_data.get("priceChangePercent", 0.0))
+                    high_24h = float(b_data.get("highPrice", 0.0))
+                    low_24h = float(b_data.get("lowPrice", 0.0))
+                    quote_vol_yi = round(float(b_data.get("quoteVolume", 0.0)) / 1e8, 2)
+                    return {
+                        "symbol": ticker,
+                        "name": coin_id.capitalize() if coin_id != ticker.lower() else ticker,
+                        "price_usd": round(price_usd, 2 if price_usd >= 1 else 6),
+                        "change_24h_percent": round(change_24h, 2),
+                        "high_24h_usd": round(high_24h, 2 if high_24h >= 1 else 6),
+                        "low_24h_usd": round(low_24h, 2 if low_24h >= 1 else 6),
+                        "volume_24h_usd_100m": quote_vol_yi,
+                        "source": "Binance",
+                    }
+            except Exception:
+                pass
+
+        # 2. Secondary fallback: CoinGecko public markets endpoint
+        cg_url = f"https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids={urllib.parse.quote(coin_id)}"
+        try:
+            req = urllib.request.Request(cg_url, headers={"User-Agent": "WeChatBot/2.1", "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                arr = json.loads(r.read(131072).decode("utf-8"))
+            if isinstance(arr, list) and arr:
+                item = arr[0]
+                price_usd = float(item.get("current_price") or 0.0)
+                change_24h = float(item.get("price_change_percentage_24h") or 0.0)
+                mcap_yi = round(float(item.get("market_cap") or 0.0) / 1e8, 2)
+                return {
+                    "symbol": str(item.get("symbol") or symbol).upper(),
+                    "name": item.get("name") or coin_id.capitalize(),
+                    "price_usd": round(price_usd, 2 if price_usd >= 1 else 6),
+                    "change_24h_percent": round(change_24h, 2),
+                    "market_cap_usd": mcap_yi,
+                    "source": "CoinGecko",
+                }
+        except Exception:
+            pass
+
+        return {"error": f"加密货币行情接口暂无法访问或找不到代码 '{symbol}'"}
 
     def format_fast_reply(self, result: dict) -> str:
         if "error" in result:
@@ -211,10 +256,21 @@ class CryptoPlugin(BasePlugin):
         price = result["price_usd"]
         chg = result["change_24h_percent"]
         chg_sign = "+" if chg > 0 else ""
+        price_fmt = f"{price:,.2f}" if price >= 1 else f"{price:.6f}"
 
-        return (
-            f"🪙 【{name} ({sym}) 实时行情】\n"
-            f"• 当前价格：${price:,.2f} USD\n"
-            f"• 24小时涨跌：{chg_sign}{chg:.2f}%\n"
-            f"• 总市值：约 ${result['market_cap_usd']} 亿美元"
-        )
+        extra_line = ""
+        if "high_24h_usd" in result and "low_24h_usd" in result:
+            h_fmt = f"{result['high_24h_usd']:,.2f}" if result["high_24h_usd"] >= 1 else f"{result['high_24h_usd']:.6f}"
+            l_fmt = f"{result['low_24h_usd']:,.2f}" if result["low_24h_usd"] >= 1 else f"{result['low_24h_usd']:.6f}"
+            extra_line = f"• 24h 高/低：${h_fmt} / ${l_fmt} USD（24h 成交额约 ${result.get('volume_24h_usd_100m', 0)} 亿）"
+        elif "market_cap_usd" in result:
+            extra_line = f"• 总市值：约 ${result['market_cap_usd']} 亿美元"
+
+        lines = [
+            f"🪙 【{name} ({sym}) 实时行情】",
+            f"• 当前价格：${price_fmt} USD",
+            f"• 24小时涨跌：{chg_sign}{chg:.2f}%",
+        ]
+        if extra_line:
+            lines.append(extra_line)
+        return "\n".join(lines)

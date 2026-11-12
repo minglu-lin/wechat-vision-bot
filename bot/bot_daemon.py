@@ -7,8 +7,10 @@ import io
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.request
@@ -30,11 +32,14 @@ try:
     from plugins import plugin_manager, register_image_sender
     from plugins.stock import StockQuantPlugin
     from plugins.image_tools import set_last_webpage_info
+    from plugins.base import safe_http_get_bytes, atomic_write_json
 except Exception as _pie:
     plugin_manager = None
     register_image_sender = None
     StockQuantPlugin = None
     set_last_webpage_info = None
+    safe_http_get_bytes = None
+    atomic_write_json = None
 
 os.environ["DISPLAY"] = ":99"
 BASE_DIR = os.environ.get("BOT_BASE_DIR", "/home/opc/wechat_bot" if os.path.exists("/home/opc/wechat_bot") else os.path.dirname(os.path.abspath(__file__)))
@@ -46,6 +51,19 @@ recent_image_records = deque(maxlen=60)
 TZ_BJ = timezone(timedelta(hours=8))
 
 state_lock = threading.Lock()
+config_io_lock = threading.Lock()
+_screen_cache_lock = threading.Lock()
+_latest_screen_pil = None
+_latest_win_box = None
+_png_cache = {
+    "screen": (0.0, b""),
+    "win": (0.0, b""),
+}
+_SESSION_SECRET = os.urandom(32)
+_login_lock = threading.Lock()
+_login_failures = {}  # client_ip -> list[float]
+_argon_fail_streak = 0
+_argon_cooldown_until = 0.0
 recent_logs = []
 last_send_ts = 0.0
 last_reply_text = ""
@@ -84,18 +102,19 @@ def edit_distance(s1: str, s2: str) -> int:
 def is_fuzzy_match(s1: str, s2: str) -> bool:
     """
     判断两个 OCR 提取的文本是否为采样抖动下的极度相似文本：
-    - 短文本相似度 > 85%
+    - 相似度 >= 85%（按文本长度动态放宽长度差上限，兼容长消息尾部微裁切与表情占位符抖动）
     - 或编辑距离 <= 2（且字数 >= 4，防单字语义相反误判）
     """
     if s1 == s2:
         return True
     l1, l2 = len(s1), len(s2)
-    if abs(l1 - l2) > 3:
+    max_len_diff = max(5, int(max(l1, l2) * 0.15))
+    if abs(l1 - l2) > max_len_diff:
         return False
     # 极短词（<=3 字符，如 '好的'、'ok'、'1'）不参与模糊比对，防误伤
     if max(l1, l2) <= 3:
         return False
-    # 1. 相似度比对 > 85%
+    # 1. 相似度比对 >= 85%
     sim = difflib.SequenceMatcher(None, s1, s2).ratio()
     if sim >= 0.85:
         return True
@@ -119,6 +138,8 @@ def normalize_dedup_text(content):
     # Unify @AIbot / @Albot / @aibot / @bot OCR variations (capital I vs lowercase l)
     c = re.sub(r"@\s*(?:aibot|albot|bot|微信小号)\b", "@bot", c)
     c = re.sub(r"^(?:aibot|albot|bot)\b", "@bot", c)
+    # Strip unrendered glyph / box OCR jitter tokens (e.g. [方框], □, replacement char)
+    c = re.sub(r"\[(?:方框|未知表情)\]|[□▯\ufffd]", "", c)
     c = re.sub(r"\s+", "", c)
     return c
 
@@ -141,7 +162,7 @@ def match_and_consume_seen_ts(sender, content, min_ts, consumed_counts):
         if t >= min_ts - 1.5:
             consumed_counts[key_full] = j + 1
             return t
-    # 模糊匹配同一发送者 60s 内的 OCR 抖动记录，协助对齐时间戳水位线
+    # 模糊匹配同一发送者历史 OCR 抖动记录（高相似度放宽至 1 小时），协助对齐时间戳水位线防止倒置
     now = time.time()
     prefix = f"{s_clean}:::"
     for k, f_ts_list in seen_msg_timestamps.items():
@@ -149,10 +170,12 @@ def match_and_consume_seen_ts(sender, content, min_ts, consumed_counts):
             continue
         past_c = k[len(prefix):]
         if is_fuzzy_match(c_clean, past_c):
+            sim_high = len(c_clean) >= 6 and difflib.SequenceMatcher(None, c_clean, past_c).ratio() >= 0.88
+            max_age = 3600 if sim_high else 120
             f_used_idx = consumed_counts.get(k, 0)
             for j in range(f_used_idx, len(f_ts_list)):
                 t = f_ts_list[j]
-                if (now - t < 60) and (t >= min_ts - 1.5):
+                if (now - t < max_age) and (t >= min_ts - 1.5):
                     consumed_counts[k] = j + 1
                     return t
     # 兼容同一句话发送者昵称轻微 OCR 抖动（1小时内）
@@ -181,17 +204,20 @@ def is_recent_duplicate(sender, content, window=86400, min_ts=0.0):
     if c_list and (now - c_list[-1] < 3600) and (c_list[-1] >= min_ts - 1.5):
         return True
 
-    # 短时提问模糊相似度比对（短文本相似度 > 85% 或编辑距离 <= 2）：
-    # 若检测到同一发送者在短时间内（60 秒内）发送了相似度极高的文本，判定为 OCR 采样抖动，自动去重丢弃
+    # 同一发送者模糊相似度比对（高相似度 >=88% 保持 1 小时防长消息滚动抖动，普通抖动保持 120s）
     prefix = f"{s_clean}:::"
     for k, past_ts_list in seen_msg_timestamps.items():
         if not k.startswith(prefix) or not past_ts_list:
             continue
         last_t = past_ts_list[-1]
-        if (now - last_t < 60) and (last_t >= min_ts - 1.5):
-            past_c = k[len(prefix):]
-            if is_fuzzy_match(c_clean, past_c):
-                log_msg(f"【模糊去重命中】同一发送者 [{s_clean}] 60s 内相似文本 (OCR抖动) 自动去重丢弃: '{c_clean}' ~ '{past_c}' (时间差={now - last_t:.1f}s)")
+        if last_t < min_ts - 1.5:
+            continue
+        past_c = k[len(prefix):]
+        if is_fuzzy_match(c_clean, past_c):
+            sim_high = len(c_clean) >= 6 and difflib.SequenceMatcher(None, c_clean, past_c).ratio() >= 0.88
+            max_age = 3600 if sim_high else 120
+            if now - last_t < max_age:
+                log_msg(f"【模糊去重命中】同一发送者 [{s_clean}] 相似文本 (OCR抖动) 自动去重丢弃: '{c_clean[:30]}' ~ '{past_c[:30]}' (时间差={now - last_t:.1f}s)")
                 return True
 
     # 全局内容 60 秒内模糊去重兜底（防发送者昵称 OCR 微小抖动）
@@ -294,9 +320,18 @@ last_received_files = {}  # session_key -> dict(file_name, file_size, file_path,
 last_received_images = {}  # session_key -> dict(has_image, image_type, ocr_and_detail, _crop_box, _screen_pos, _img_bytes, sender, ts)
 
 
+def _is_within_dir(target_path: str, allowed_root: str) -> bool:
+    try:
+        real_target = os.path.realpath(target_path)
+        real_root = os.path.realpath(allowed_root)
+        return real_target == real_root or real_target.startswith(real_root + os.sep)
+    except Exception:
+        return False
+
+
 def find_received_file(file_name="", max_wait_sec=3.0):
     """
-    在 WeChat Linux 文件缓存目录查找接收到的本地文件。
+    在 WeChat Linux 文件缓存目录查找接收到的本地文件（严格防御路径穿越）。
     WeChat Linux 4.0 将接收的文件存储在:
     /home/opc/xwechat_files/<wxid>/msg/file/YYYY-MM/<filename>
     """
@@ -311,27 +346,38 @@ def find_received_file(file_name="", max_wait_sec=3.0):
             base_dir = b
             break
 
+    # 严格剥离任何目录分隔符，彻底阻断 ../ 路径穿越
+    safe_name = os.path.basename(str(file_name or "").replace("\\", "/")).strip()
+    if safe_name in ("", ".", ".."):
+        safe_name = ""
+
     start_t = time.time()
     while time.time() - start_t <= max_wait_sec:
-        # 1. 精确路径匹配
-        if file_name:
-            pattern = f"{base_dir}/*/msg/file/*/{file_name}"
-            matches = glob.glob(pattern)
+        all_files = [
+            f for f in glob.glob(f"{base_dir}/*/msg/file/*/*")
+            if os.path.isfile(f) and _is_within_dir(f, base_dir)
+        ]
+        # 1. 精确文件名匹配（使用 glob.escape 防止通配符注入）
+        if safe_name:
+            esc_name = glob.escape(safe_name)
+            matches = [
+                f for f in glob.glob(f"{base_dir}/*/msg/file/*/{esc_name}")
+                if os.path.isfile(f) and _is_within_dir(f, base_dir)
+            ]
             if matches:
                 matches.sort(key=lambda x: os.path.getmtime(x), reverse=True)
                 return matches[0]
 
             # 2. 忽略大小写精确匹配
-            all_files = glob.glob(f"{base_dir}/*/msg/file/*/*")
-            f_norm = file_name.strip().lower()
+            f_norm = safe_name.lower()
             matches = [f for f in all_files if os.path.basename(f).strip().lower() == f_norm]
             if matches:
                 matches.sort(key=lambda x: os.path.getmtime(x), reverse=True)
                 return matches[0]
 
             # 3. 文件名主干与后缀模糊匹配 (如 report(1).pdf 匹配 report.pdf)
-            stem = os.path.splitext(file_name)[0].strip().lower()
-            ext = os.path.splitext(file_name)[1].strip().lower()
+            stem = os.path.splitext(safe_name)[0].strip().lower()
+            ext = os.path.splitext(safe_name)[1].strip().lower()
             if stem and ext:
                 fuzzy = [
                     f for f in all_files
@@ -342,10 +388,9 @@ def find_received_file(file_name="", max_wait_sec=3.0):
                     return fuzzy[0]
 
         # 4. 兜底策略：查找最近 30 秒内新生成或修改的文件
-        all_recent = glob.glob(f"{base_dir}/*/msg/file/*/*")
-        if all_recent:
-            all_recent.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            newest = all_recent[0]
+        if all_files:
+            all_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            newest = all_files[0]
             if time.time() - os.path.getmtime(newest) < 30.0:
                 return newest
 
@@ -356,7 +401,7 @@ def find_received_file(file_name="", max_wait_sec=3.0):
 
 def parse_file_content(file_path, max_chars=35000):
     """
-    通用多格式本地文件解析器：
+    通用多格式本地文件解析器（仅允许读取微信接收目录或 /tmp 下的受控附件）：
     - 纯文本 / 代码（.txt / .py / .json / .csv / .md / .sh / .yaml 等）：直接读取
     - PDF 文档（.pdf）：利用 pypdf 提取分页全文
     - Excel 表格（.xlsx / .xls）：利用 openpyxl / xlrd 解析为结构化 Markdown 表格
@@ -364,6 +409,15 @@ def parse_file_content(file_path, max_chars=35000):
     """
     if not file_path or not os.path.exists(file_path):
         return f"[错误: 找不到本地文件 {file_path}]"
+
+    allowed_roots = [
+        "/home/opc/xwechat_files",
+        os.path.expanduser("~/xwechat_files"),
+        "/tmp",
+    ]
+    if not any(_is_within_dir(file_path, r) for r in allowed_roots if r):
+        log_msg(f"🚨 [安全拦截] 拒绝解析非受控目录下的本地文件: {file_path}")
+        return "[错误: 安全策略禁止读取微信附件目录以外的系统文件]"
 
     file_name = os.path.basename(file_path)
     file_ext = os.path.splitext(file_name)[1].lower()
@@ -740,22 +794,25 @@ def find_article_link_in_memory(keyword=""):
 def fetch_url_content(url, timeout=10, max_chars=3500):
     try:
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
         }
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            raw = resp.read()
+        if safe_http_get_bytes is not None:
+            raw, content_type, _ = safe_http_get_bytes(url, headers=headers, timeout=timeout, max_bytes=4 * 1024 * 1024)
+        else:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                content_type = resp.headers.get("Content-Type", "")
+                raw = resp.read(4 * 1024 * 1024)
 
-            charset = "utf-8"
-            if "charset=" in content_type.lower():
-                charset = content_type.lower().split("charset=")[-1].split(";")[0].strip()
-            try:
-                html_str = raw.decode(charset, errors="replace")
-            except Exception:
-                html_str = raw.decode("utf-8", errors="replace")
+        charset = "utf-8"
+        if "charset=" in content_type.lower():
+            charset = content_type.lower().split("charset=")[-1].split(";")[0].strip()
+        try:
+            html_str = raw.decode(charset, errors="replace")
+        except Exception:
+            html_str = raw.decode("utf-8", errors="replace")
 
         import html as html_lib
         title_m = re.search(r'<meta property="og:title" content="(.*?)"', html_str) or re.search(r'<title[^>]*>(.*?)</title>', html_str, re.IGNORECASE | re.DOTALL)
@@ -829,8 +886,10 @@ last_processed_ts = 0.0
 def init_db():
     global last_processed_ts, last_bot_db_ts
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cur = conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL;")
+        cur.execute("PRAGMA synchronous=NORMAL;")
         cur.execute("""
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -849,6 +908,8 @@ def init_db():
             conn.commit()
         except Exception:
             pass
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)")
+        conn.commit()
 
         # 预热本地图片持久化索引
         try:
@@ -891,7 +952,7 @@ def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None, ima
     if not content:
         return
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cur = conn.cursor()
         ts = float(msg_ts) if msg_ts is not None else time.time()
         if is_bot and ts > last_bot_db_ts:
@@ -909,7 +970,7 @@ def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None, ima
 
 def get_recent(limit=15):
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cur = conn.cursor()
         cur.execute("SELECT time_str, sender, content, is_bot FROM messages ORDER BY id DESC LIMIT ?", (limit,))
         rows = cur.fetchall()
@@ -932,17 +993,28 @@ def log_msg(msg):
 
 
 def load_config():
-    try:
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as e:
-        log_msg(f"Config load error: {e}")
-        return {}
+    with config_io_lock:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            log_msg(f"Config load error: {e}")
+            return {}
 
 
 def save_config(cfg):
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    with config_io_lock:
+        if atomic_write_json is not None:
+            atomic_write_json(CONFIG_PATH, cfg, mode=0o600)
+        else:
+            fd, tmp_p = tempfile.mkstemp(prefix=".cfg_", suffix=".tmp", dir=os.path.dirname(CONFIG_PATH) or ".")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(tmp_p, 0o600)
+            except Exception:
+                pass
+            os.replace(tmp_p, CONFIG_PATH)
 
 
 def ensure_processes():
@@ -1018,13 +1090,18 @@ def find_wechat_windows(d):
                 geom = w.get_geometry()
                 if cls:
                     cls_lowers = [c.lower() for c in cls]
-                    # 自动关闭 WeChatAppEx 网页/小程序弹窗，防止遮挡主聊天窗口
+                    # 自动关闭 WeChatAppEx 网页/小程序弹窗，并异步清理其残留渲染子进程防止内存泄漏
                     if any("wechatappex" in c for c in cls_lowers) and geom.width > 200:
                         try:
                             name = w.get_wm_name() or ""
-                            log_msg(f"自动关闭微信网页/小程序弹窗: {name} (id={hex(w.id)})")
+                            log_msg(f"自动关闭微信网页/小程序弹窗并回收渲染进程: {name} (id={hex(w.id)})")
                             w.destroy()
                             d.sync()
+                            subprocess.Popen(
+                                ["pkill", "-f", "WeChatAppEx"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                            )
                             return
                         except Exception:
                             pass
@@ -1389,11 +1466,14 @@ def x11_send_image(image_path_or_url):
 
     local_path = image_path_or_url
     if image_path_or_url.startswith("http://") or image_path_or_url.startswith("https://"):
+        local_raw = f"/tmp/wechat_dl_raw_{os.getpid()}_{int(time.time()*1000)}"
         try:
-            req = urllib.request.Request(image_path_or_url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as r:
-                data = r.read()
-            local_raw = "/tmp/wechat_dl_raw"
+            if safe_http_get_bytes is not None:
+                data, _, _ = safe_http_get_bytes(image_path_or_url, headers={"User-Agent": "Mozilla/5.0"}, timeout=15, max_bytes=12 * 1024 * 1024)
+            else:
+                req = urllib.request.Request(image_path_or_url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=15) as r:
+                    data = r.read(12 * 1024 * 1024)
             local_path = "/tmp/wechat_dl.png"
             with open(local_raw, "wb") as f:
                 f.write(data)
@@ -1401,6 +1481,12 @@ def x11_send_image(image_path_or_url):
         except Exception as e:
             log_msg(f"下载待发送图片失败: {e}")
             return False, str(e)
+        finally:
+            if os.path.exists(local_raw):
+                try:
+                    os.remove(local_raw)
+                except Exception:
+                    pass
 
     if not os.path.exists(local_path):
         log_msg(f"待发送图片文件不存在: {local_path}")
@@ -1511,6 +1597,10 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
         log_msg(f"切片落盘异常: {ce}")
 
     if saved and os.path.exists(local_path):
+        try:
+            shutil.copyfile(local_path, "/tmp/wechat_last_photo.png")
+        except Exception:
+            pass
         record = {
             "ts": ts,
             "sender": sender,
@@ -1821,7 +1911,7 @@ class TaskModelRouter:
                 "reasoning_effort": "medium",
             }
 
-        # 3. 主力回答问题：五五分流 (50% OpenAI gpt-6.1-sol / 50% Gemini 4 Argon)
+        # 3. 主力回答问题：五五分流 (50% OpenAI gpt-6.1-sol / 50% Gemini 4 Argon，含 Argon 连续超时熔断保护)
         if has_openai_key:
             cls._rr_counter = (cls._rr_counter + 1) % 2
             if cls._rr_counter == 1:
@@ -1832,6 +1922,15 @@ class TaskModelRouter:
                     "reason": f"主力问答五五分流 ({gpt_think_model})",
                     "reasoning_effort": "low",
                 }
+
+        if time.time() < _argon_cooldown_until:
+            log_msg("【模型分流路由】Gemini 4 Argon 处于超时熔断冷却期 -> 自动平滑切至 Gemini 3.8 Flash")
+            return {
+                "provider": "gemini",
+                "model": "gemini-3.8-flash",
+                "reason": "Argon 熔断冷却期分流 (Gemini 3.8 Flash)",
+                "reasoning_effort": None,
+            }
 
         log_msg(f"【模型分流路由】主力问答五五分流 [50% Gemini] -> 分流至 Gemini 4 Argon")
         return {
@@ -2442,64 +2541,64 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 f"- 分享文章标题：《{card_title}》\n"
                 f"- 核心要求：请使用 web_search 检索该文章的真实事件细节后再进行分析评价。\n"
             )
-        else:
-            # 3.5 针对股票量化诊断与技术面分析：调用 StockQuantPlugin 极速拉取盘口及日K指标，由 AI 专业操盘手一轮直出！
-            stock_sym = None
-            if StockQuantPlugin:
-                try:
-                    stock_sym = StockQuantPlugin.extract_stock_intent(content)
-                except Exception:
-                    stock_sym = None
+    elif not fetched_any_article:
+        # 3.5 针对股票量化诊断与技术面分析：调用 StockQuantPlugin 极速拉取盘口及日K指标，由 AI 专业操盘手一轮直出！
+        stock_sym = None
+        if StockQuantPlugin:
+            try:
+                stock_sym = StockQuantPlugin.extract_stock_intent(content)
+            except Exception:
+                stock_sym = None
 
-            stock_handled = False
-            if stock_sym and plugin_manager:
-                log_msg(f"【前置股票量化引擎】检测到股票/指数技术面分析诉求: 目标标的='{stock_sym}'，正在极速拉取盘口与日K量化指标...")
-                stock_res = plugin_manager.execute_tool("analyze_stock", {"symbol": stock_sym})
-                if isinstance(stock_res, dict) and not stock_res.get("error"):
-                    stock_name = stock_res.get("quote", {}).get("name", stock_sym)
-                    log_msg(f"【前置股票量化引擎】成功拉取 {stock_name} ({stock_sym}) 量化数据，交由 AI 专业操盘手一轮直出！")
+        stock_handled = False
+        if stock_sym and plugin_manager:
+            log_msg(f"【前置股票量化引擎】检测到股票/指数技术面分析诉求: 目标标的='{stock_sym}'，正在极速拉取盘口与日K量化指标...")
+            stock_res = plugin_manager.execute_tool("analyze_stock", {"symbol": stock_sym})
+            if isinstance(stock_res, dict) and not stock_res.get("error"):
+                stock_name = stock_res.get("quote", {}).get("name", stock_sym)
+                log_msg(f"【前置股票量化引擎】成功拉取 {stock_name} ({stock_sym}) 量化数据，交由 AI 专业操盘手一轮直出！")
+                user_query += (
+                    f"\n\n【系统已实时调取该标的（{stock_name} / {stock_res.get('resolved_code')}）的最新量化诊断盘面数据】：\n"
+                    f"{stock_res.get('report_markdown', '')}\n\n"
+                    f"【量化操盘诊断报告撰写规范】：\n"
+                    f"你是一名拥有 15 年实战经验的顶级资深证券量化投资总监兼技术派操盘手。\n"
+                    f"请直接依据上方系统拉取的权威量化指标（多空均线、MACD/KDJ/RSI、布林带、CYQ获利盘筹码集中度、攻防关键位），在微信群输出一份专业、精炼、重点突出、结构严谨的操盘诊断研报（字数适中，多用项目符号，拒绝车轱辘废话）：\n"
+                    f"1. 📌【盘面格局与均线量价】：解读最新价格表现、多空排列结构、放量/缩量所处博弈阶段。\n"
+                    f"2. ⚡【核心指标多空共振】：结合 MACD 金叉/死叉、KDJ 超买/超卖、布林带轨道、生命线 (MA20) 给出动能判断。\n"
+                    f"3. 🎯【筹码结构与攻防关口】：分析主力获利盘比例与持仓成本，明确指出【第一压力位 R1】、【第一支撑位 S1】及【极端防守止损位 S2】。\n"
+                    f"4. 💡【实战操盘与风控策略】：给出明确的操作建议（如：底仓持有/突破追多/逢高落袋/底部分批建仓/观望防守），并附上纪律性止损位提示。\n"
+                    f"【重要】：无需再次调用任何工具，直接输出终版操盘研报！\n"
+                )
+                tools = None
+                stock_handled = True
+
+        # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
+        if not stock_handled:
+            clean_q = re.sub(r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s,，:：、?!？！]*', '', content.strip(), flags=re.IGNORECASE).strip()
+            search_intent_kws = [
+                "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
+                "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "行情", "汇率", "百科", "历史", "事件",
+                "真假", "真的吗", "搜", "查", "名人", "教授", "大学", "博士", "法院", "判决", "公司",
+                "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
+            ]
+            expand_followup_kws = ["展开", "细说", "详细", "具体", "多说", "深入", "再查", "深挖", "更多细节", "详细讲"]
+            quoted_text_clean = str((quote_info or {}).get("quoted_content", "")).strip()
+            is_expand_with_quote = bool(quoted_text_clean and any(kw in clean_q for kw in expand_followup_kws))
+            if plugin_manager and ((len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
+                search_query_str = clean_q
+                if is_expand_with_quote:
+                    # Extract key topic from the first clause/sentence of the quoted content so Serper searches the actual subject
+                    first_clause = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
+                    search_query_str = f"{first_clause} {clean_q}".strip()
+                log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
+                pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
+                if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
+                    log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
                     user_query += (
-                        f"\n\n【系统已实时调取该标的（{stock_name} / {stock_res.get('resolved_code')}）的最新量化诊断盘面数据】：\n"
-                        f"{stock_res.get('report_markdown', '')}\n\n"
-                        f"【量化操盘诊断报告撰写规范】：\n"
-                        f"你是一名拥有 15 年实战经验的顶级资深证券量化投资总监兼技术派操盘手。\n"
-                        f"请直接依据上方系统拉取的权威量化指标（多空均线、MACD/KDJ/RSI、布林带、CYQ获利盘筹码集中度、攻防关键位），在微信群输出一份专业、精炼、重点突出、结构严谨的操盘诊断研报（字数适中，多用项目符号，拒绝车轱辘废话）：\n"
-                        f"1. 📌【盘面格局与均线量价】：解读最新价格表现、多空排列结构、放量/缩量所处博弈阶段。\n"
-                        f"2. ⚡【核心指标多空共振】：结合 MACD 金叉/死叉、KDJ 超买/超卖、布林带轨道、生命线 (MA20) 给出动能判断。\n"
-                        f"3. 🎯【筹码结构与攻防关口】：分析主力获利盘比例与持仓成本，明确指出【第一压力位 R1】、【第一支撑位 S1】及【极端防守止损位 S2】。\n"
-                        f"4. 💡【实战操盘与风控策略】：给出明确的操作建议（如：底仓持有/突破追多/逢高落袋/底部分批建仓/观望防守），并附上纪律性止损位提示。\n"
-                        f"【重要】：无需再次调用任何工具，直接输出终版操盘研报！\n"
+                        f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具）】：\n"
+                        f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
                     )
                     tools = None
-                    stock_handled = True
-
-            # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
-            if not stock_handled:
-                clean_q = re.sub(r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s,，:：、?!？！]*', '', content.strip(), flags=re.IGNORECASE).strip()
-                search_intent_kws = [
-                    "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
-                    "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "行情", "汇率", "百科", "历史", "事件",
-                    "真假", "真的吗", "搜", "查", "名人", "教授", "大学", "博士", "法院", "判决", "公司",
-                    "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
-                ]
-                expand_followup_kws = ["展开", "细说", "详细", "具体", "多说", "深入", "再查", "深挖", "更多细节", "详细讲"]
-                quoted_text_clean = str((quote_info or {}).get("quoted_content", "")).strip()
-                is_expand_with_quote = bool(quoted_text_clean and any(kw in clean_q for kw in expand_followup_kws))
-                if plugin_manager and ((len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
-                    search_query_str = clean_q
-                    if is_expand_with_quote:
-                        # Extract key topic from the first clause/sentence of the quoted content so Serper searches the actual subject
-                        first_clause = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
-                        search_query_str = f"{first_clause} {clean_q}".strip()
-                    log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
-                    pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
-                    if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
-                        log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
-                        user_query += (
-                            f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具）】：\n"
-                            f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
-                        )
-                        tools = None
 
     user_content_payload = user_query
     if provider in ("gemini", "openai", "gpt") and image_info and image_info.get("has_image"):
@@ -2537,6 +2636,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         {"role": "user", "content": user_content_payload},
     ]
 
+    global _argon_fail_streak, _argon_cooldown_until
     final_reply = ""
     collected_tool_outputs = []
     for loop_idx in range(3):
@@ -2544,8 +2644,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             # 严格限制最多只允许第 1 轮 (loop_idx == 0) 触发工具调用；第 2 轮起强制 tools=None 直接根据已有信息+自身知识作答，彻底杜绝无限连环搜！
             active_tools = tools if (loop_idx == 0 and not collected_tool_outputs) else None
             log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮 (tools={'开' if active_tools else '关-强制总结'})...")
-            req_timeout = 45 if provider in ("openai", "gpt") else 32
+            req_timeout = 45 if provider in ("openai", "gpt") else (24 if target_model == "gemini-4-argon" else 32)
             res = call_routed_llm(provider, target_model, messages, tools=active_tools, timeout=req_timeout, reasoning_effort=route_effort)
+            if target_model == "gemini-4-argon":
+                _argon_fail_streak = 0
             choice = res["choices"][0]
             msg = choice["message"]
 
@@ -2554,6 +2656,14 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 for tc in msg["tool_calls"][:2]:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"].get("arguments", "{}")
+                    if fn_name == "generate_image" and image_info and image_info.get("local_path") and os.path.exists(image_info["local_path"]):
+                        try:
+                            parsed_args = json.loads(fn_args) if isinstance(fn_args, str) else dict(fn_args or {})
+                            if not parsed_args.get("ref_image_path"):
+                                parsed_args["ref_image_path"] = image_info["local_path"]
+                            fn_args = parsed_args
+                        except Exception:
+                            pass
                     log_msg(f"执行 API 插件: {fn_name}({fn_args})")
                     if plugin_manager:
                         tool_res = plugin_manager.execute_tool(fn_name, fn_args)
@@ -2643,8 +2753,12 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"role": "user", "content": fallback_query},
                 ]
                 continue
-            # 如果 Gemini 4 Argon 异常，优先切换至 OpenAI gpt-6.1-sol 或降级至 Gemini 3.8 Flash
+            # 如果 Gemini 4 Argon 异常，记录连续失败熔断并降级至 Gemini 3.8 Flash
             elif target_model == "gemini-4-argon":
+                _argon_fail_streak += 1
+                if _argon_fail_streak >= 2:
+                    _argon_cooldown_until = time.time() + 600
+                    log_msg(f"⚠️ Gemini 4 Argon 连续失败 {_argon_fail_streak} 次，触发 10 分钟熔断冷却保护！")
                 log_msg("Gemini 4 Argon 异常，重置上下文并降级至 Gemini 3.8 Flash 继续重试...")
                 target_model = "gemini-3.8-flash"
                 route_reason = "Argon 异常容灾降级"
@@ -3087,7 +3201,9 @@ def monitor_loop():
             auto_switch_private = cfg.get("auto_switch_private", True)
 
             img, wins = capture_screen_pil()
-            img.save("/tmp/screen.png")
+            with _screen_cache_lock:
+                _latest_screen_pil = img
+                _latest_win_box = None
 
             if check_and_dismiss_logout_modal(img):
                 modal_dismiss_streak += 1
@@ -3100,7 +3216,8 @@ def monitor_loop():
                     modal_dismiss_streak = 0
                 time.sleep(0.3)
                 img, wins = capture_screen_pil()
-                img.save("/tmp/screen.png")
+                with _screen_cache_lock:
+                    _latest_screen_pil = img
             else:
                 modal_dismiss_streak = max(0, modal_dismiss_streak - 1)
 
@@ -3114,7 +3231,9 @@ def monitor_loop():
                     min(img.width, w["x"] + w["width"] + pad),
                     min(img.height, w["y"] + w["height"] + pad),
                 )
-                img.crop(box).save("/tmp/wechat_win.png")
+                with _screen_cache_lock:
+                    _latest_screen_pil = img
+                    _latest_win_box = box
 
                 # 初始启动锚定：若主群聊配置存在，初次启动确保窗口聚焦于关注群聊
                 if not initial_focus_done and focus_chat and w["width"] >= 550:
@@ -3582,7 +3701,11 @@ def monitor_loop():
                         if isinstance(t_img, dict) and t_img.get("has_image"):
                             try:
                                 if t_img.get("local_path") and os.path.exists(t_img["local_path"]):
-                                    log_msg(f"直接使用本地持久化原图: {t_img['local_path']}")
+                                    try:
+                                        shutil.copyfile(t_img["local_path"], "/tmp/wechat_last_photo.png")
+                                    except Exception:
+                                        pass
+                                    log_msg(f"直接使用本地持久化原图并同步最新参考图: {t_img['local_path']}")
                                 elif t_img.get("_img_bytes"):
                                     with open("/tmp/wechat_last_photo.png", "wb") as pf:
                                         pf.write(t_img["_img_bytes"])
@@ -3851,11 +3974,11 @@ HTML_PAGE = """<!DOCTYPE html>
 
     <!-- Quick action toolbar -->
     <div class="toolbar">
-      <button class="tool-btn btn-warning" onclick="dismissModal()" title="关闭退出登录确认模态弹窗，解决输入框锁定">🛡️ 一键解除退出弹窗</button>
+      <button class="tool-btn btn-warning" onclick="dismissModal()" title="关闭退出登录确认模态弹窗与遮挡菜单，解决输入框锁定">🛡️ 一键解除弹窗/菜单</button>
       <button class="tool-btn btn-primary" onclick="forceRefreshScreen()" title="立即抓取最新云端截图">🔄 立即刷新</button>
       <button class="tool-btn btn-secondary" onclick="sendVirtualKey('Clear')" title="清空当前输入框残留字符">🧹 清空输入框</button>
       <button class="tool-btn btn-secondary" onclick="sendVirtualKey('Enter')" title="向当前焦点窗口发送回车键">⏎ 发送回车</button>
-      <button class="tool-btn btn-secondary" onclick="sendVirtualKey('Escape')" title="发送 Escape 键关闭上下文菜单">⎋ 发送 Esc</button>
+      <button class="tool-btn btn-secondary" onclick="recoverUI()" title="执行安全焦点恢复与弹窗排错（禁用Esc防触发退出框）">🩺 焦点自愈</button>
     </div>
   </div>
 
@@ -3952,7 +4075,7 @@ HTML_PAGE = """<!DOCTYPE html>
     <!-- Tab 4: Realtime Logs -->
     <div class="tab-content" id="tab-4">
       <div class="card-header" style="margin-bottom:6px;">
-        <span style="font-size:12px; color:#94a3b8;">自动更新 (2s/次)</span>
+        <span style="font-size:12px; color:#94a3b8;">自动更新 (2.5s/次)</span>
         <button class="view-btn" onclick="fetchLogs()">🔄 刷新日志</button>
       </div>
       <div id="logs" class="log-box">正在加载日志...</div>
@@ -4138,7 +4261,8 @@ async function saveConfig() {
   const system_prompt = document.getElementById('sys-prompt').value.trim();
   const new_password = document.getElementById('new-pwd').value.trim();
 
-  const payload = {auto_reply, trigger_mode, bot_names, temperature, amap_api_key, system_prompt};
+  const payload = {auto_reply, trigger_mode, bot_names, temperature, system_prompt};
+  if (amap_api_key) payload.amap_api_key = amap_api_key;
   if (new_password) payload.admin_password = new_password;
 
   try {
@@ -4151,10 +4275,16 @@ async function saveConfig() {
     if (d.ok) {
       toast('配置已成功保存！');
       document.getElementById('new-pwd').value = '';
+      document.getElementById('amap-key').value = '';
+      loadInitialConfig();
     } else {
       toast('保存失败: ' + (d.error || ''));
     }
   } catch (e) { toast('保存网络异常'); }
+}
+
+function fetchLogs() {
+  return fetchStatus();
 }
 
 async function fetchStatus() {
@@ -4206,9 +4336,13 @@ async function loadInitialConfig() {
     if (d.config) {
       document.getElementById('auto-reply').value = String(d.config.auto_reply !== false);
       document.getElementById('trigger-mode').value = d.config.trigger_mode || 'mention_only';
-      document.getElementById('bot-names').value = (d.config.bot_names || ['AIbot', 'Albot', 'aibot', 'bot']).join(', ');
+      const defaultNames = ['AIbot', 'Albot', 'aibot', 'bot'];
+      const activeNames = (Array.isArray(d.config.bot_names) && d.config.bot_names.length > 0) ? d.config.bot_names : defaultNames;
+      document.getElementById('bot-names').value = activeNames.join(', ');
       document.getElementById('temperature').value = d.config.temperature !== undefined ? d.config.temperature : 0.75;
-      document.getElementById('amap-key').value = d.config.amap_api_key || '';
+      const amapInput = document.getElementById('amap-key');
+      amapInput.value = '';
+      amapInput.placeholder = d.config.has_amap_key ? '已安全配置高德 Key（留空保持不变，输入新值可覆盖）' : '可选高德 Web 服务 Key';
       document.getElementById('sys-prompt').value = d.config.system_prompt || '';
     }
   } catch (e) {}
@@ -4240,7 +4374,7 @@ function renderSerperKeys(d) {
           <span style="font-family:monospace; font-size:13px; color:#f1f5f9;">${k.masked}</span>
           ${tag}
         </div>
-        <button class="tool-btn btn-danger" style="flex:none; min-width:auto; padding:3px 10px; font-size:11px;" onclick="removeSerperKey('${k.key}')">🗑️ 废弃/移除</button>
+        <button class="tool-btn btn-danger" style="flex:none; min-width:auto; padding:3px 10px; font-size:11px;" onclick="removeSerperKey('${k.id || k.masked}')">🗑️ 废弃/移除</button>
       </div>
     `;
   });
@@ -4252,7 +4386,7 @@ function renderSerperKeys(d) {
     d.exhausted_keys.forEach(e => {
       exhHtml += `
         <div style="font-size:11px; color:#64748b; font-family:monospace; padding:5px 0; border-bottom:1px dashed #1e293b;">
-          ❌ ${e.masked || e.key} — ${e.discarded_at} (${e.reason || '额度用完'})
+          ❌ ${e.masked || '***'} — ${e.discarded_at} (${e.reason || '额度用完'})
         </div>
       `;
     });
@@ -4317,18 +4451,120 @@ setInterval(forceRefreshScreen, 3000);
 """
 
 
-def get_admin_token(pwd):
-    return hashlib.sha256((pwd + "_wechat_salt_2026").encode("utf-8")).hexdigest()
+def get_configured_admin_password(cfg=None) -> str:
+    c = cfg if isinstance(cfg, dict) else load_config()
+    return str(c.get("admin_password") or os.environ.get("BOT_ADMIN_PASSWORD") or "").strip()
+
+
+def get_admin_token(pwd: str) -> str:
+    return hmac.new(_SESSION_SECRET, pwd.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def render_cached_png(kind: str = "win") -> bytes:
+    """按需从内存最新 PIL 画面编码 PNG（带 0.8s 字节级缓存，彻底消除后台每秒空转写盘）。"""
+    now = time.time()
+    with _screen_cache_lock:
+        cached_ts, cached_bytes = _png_cache.get(kind, (0.0, b""))
+        if cached_bytes and (now - cached_ts) < 0.8:
+            return cached_bytes
+        src_img = _latest_screen_pil
+        win_box = _latest_win_box
+
+    if src_img is None:
+        src_img, wins = capture_screen_pil()
+        if wins:
+            w = wins[0]
+            pad = 12
+            win_box = (
+                max(0, w["x"] - pad),
+                max(0, w["y"] - pad),
+                min(src_img.width, w["x"] + w["width"] + pad),
+                min(src_img.height, w["y"] + w["height"] + pad),
+            )
+
+    if src_img is None:
+        return b""
+
+    target_img = src_img.crop(win_box) if (kind == "win" and win_box) else src_img
+    buf = io.BytesIO()
+    target_img.save(buf, format="PNG")
+    data = buf.getvalue()
+    with _screen_cache_lock:
+        _png_cache[kind] = (now, data)
+    return data
+
+
+def reap_stale_appex_and_temp_files(min_appex_age_sec: int = 900):
+    """安全回收运行过久的 WeChatAppEx 孤儿渲染进程，并清理过期临时图片（绝不触碰微信主进程）。"""
+    reaped = 0
+    try:
+        ps_out = subprocess.check_output(["ps", "-eo", "pid=,etimes=,args="], text=True, timeout=5)
+        for line in ps_out.splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) < 3:
+                continue
+            pid_s, etimes_s, args = parts[0], parts[1], parts[2]
+            if "WeChatAppEx" in args and "/usr/bin/wechat" not in args:
+                try:
+                    pid = int(pid_s)
+                    etimes = int(etimes_s)
+                    if etimes >= min_appex_age_sec:
+                        os.kill(pid, 15)
+                        reaped += 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    if reaped > 0:
+        log_msg(f"🧹【内存守护】已安全回收 {reaped} 个滞留超过 {min_appex_age_sec // 60} 分钟的 WeChatAppEx 渲染子进程")
+
+    now = time.time()
+    # 清理 /tmp 下超过 24 小时的生成/网页临时图片
+    try:
+        for fn in os.listdir("/tmp"):
+            if fn.startswith(("wechat_ai_gen_", "wechat_wp_", "wechat_search_", "wechat_dl_raw_")):
+                fp = os.path.join("/tmp", fn)
+                if os.path.isfile(fp) and (now - os.path.getmtime(fp) > 86400):
+                    os.remove(fp)
+    except Exception:
+        pass
+
+    # 清理 data/images 下超过 14 天的旧切片缓存，控制根分区磁盘占用
+    try:
+        if os.path.isdir(IMAGES_DIR):
+            for fn in os.listdir(IMAGES_DIR):
+                if fn.startswith("img_") and fn.endswith(".png"):
+                    fp = os.path.join(IMAGES_DIR, fn)
+                    if os.path.isfile(fp) and (now - os.path.getmtime(fp) > 14 * 86400):
+                        os.remove(fp)
+    except Exception:
+        pass
 
 
 class BotHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
+    def _client_ip(self) -> str:
+        peer_ip = self.client_address[0] if self.client_address else "unknown"
+        if peer_ip in ("127.0.0.1", "::1"):
+            cf_ip = (self.headers.get("CF-Connecting-IP") or "").strip()
+            if cf_ip:
+                return cf_ip
+            xff = (self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            if xff:
+                return xff
+        return peer_ip
+
+    def _is_https(self) -> bool:
+        proto = (self.headers.get("X-Forwarded-Proto") or "").lower()
+        return "https" in proto
+
     def _send_json(self, data, code=200, extra_headers=None):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         if extra_headers:
             for k, v in extra_headers.items():
@@ -4337,33 +4573,34 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _is_authenticated(self):
-        cfg = load_config()
-        admin_pwd = cfg.get("admin_password", "Lin2026@k9x2!")
+        admin_pwd = get_configured_admin_password()
+        if not admin_pwd:
+            return False
         expected_token = get_admin_token(admin_pwd)
 
-        # 1. 检查 Cookie
+        # 1. 检查 Cookie (常量时间比对)
         cookie_header = self.headers.get("Cookie", "")
-        if f"bot_session={expected_token}" in cookie_header:
-            return True
+        for item in cookie_header.split(";"):
+            item = item.strip()
+            if item.startswith("bot_session="):
+                val = item[len("bot_session="):].strip()
+                if hmac.compare_digest(val, expected_token):
+                    return True
 
-        # 2. 检查 HTTP Basic Auth
+        # 2. 检查 HTTP Basic / Bearer Auth (供运维工具安全调用，禁用不安全的 URL Query 明文传参)
         auth_header = self.headers.get("Authorization", "")
         if auth_header.startswith("Basic "):
             try:
                 raw = base64.b64decode(auth_header[6:].strip()).decode("utf-8")
                 parts = raw.split(":", 1)
-                if len(parts) == 2 and parts[1] == admin_pwd:
+                if len(parts) == 2 and hmac.compare_digest(parts[1], admin_pwd):
                     return True
             except Exception:
                 pass
-
-        # 3. 检查 Query Param (?token=... or ?pwd=...)
-        parsed = urlparse(self.path)
-        qs = parse_qs(parsed.query)
-        if "token" in qs and qs["token"][0] == expected_token:
-            return True
-        if "pwd" in qs and qs["pwd"][0] == admin_pwd:
-            return True
+        elif auth_header.startswith("Bearer "):
+            tok = auth_header[7:].strip()
+            if hmac.compare_digest(tok, expected_token):
+                return True
 
         return False
 
@@ -4371,8 +4608,9 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/logout":
+            sec = "; Secure" if self._is_https() else ""
             self.send_response(302)
-            self.send_header("Set-Cookie", "bot_session=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+            self.send_header("Set-Cookie", f"bot_session=deleted; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{sec}")
             self.send_header("Location", "/")
             self.end_headers()
             return
@@ -4395,6 +4633,7 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
                 body = HTML_PAGE.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -4406,10 +4645,8 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if parsed.path == "/api/screen.png":
-            p = "/tmp/screen.png"
-            if os.path.exists(p):
-                with open(p, "rb") as f:
-                    data = f.read()
+            data = render_cached_png("screen")
+            if data:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -4419,10 +4656,8 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(404)
         elif parsed.path == "/api/win.png":
-            p = "/tmp/wechat_win.png" if os.path.exists("/tmp/wechat_win.png") else "/tmp/screen.png"
-            if os.path.exists(p):
-                with open(p, "rb") as f:
-                    data = f.read()
+            data = render_cached_png("win")
+            if data:
                 self.send_response(200)
                 self.send_header("Content-Type", "image/png")
                 self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
@@ -4435,10 +4670,19 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             _, wins = capture_screen_pil()
             logged_in = bool(wins and wins[0]["width"] >= 550)
             cfg = load_config()
-            safe_cfg = {k: v for k, v in cfg.items() if not k.endswith("_key") and k != "admin_password"}
+            # 严格字段白名单，杜绝任何单复数 API Key / 密码下发到前端
+            safe_cfg = {
+                "auto_reply": cfg.get("auto_reply", True),
+                "trigger_mode": cfg.get("trigger_mode", "mention_only"),
+                "bot_names": cfg.get("bot_names") if cfg.get("bot_names") else ["AIbot", "Albot", "aibot", "bot"],
+                "temperature": cfg.get("temperature", 0.75),
+                "system_prompt": cfg.get("system_prompt", ""),
+                "focus_chat": cfg.get("focus_chat", "MAGA"),
+                "has_amap_key": bool(cfg.get("amap_api_key")),
+            }
             with state_lock:
                 logs_copy = list(recent_logs)
-            
+
             wechat_pid = ""
             try:
                 wechat_pid = subprocess.check_output(["pgrep", "-f", "/usr/bin/wechat"]).decode("utf-8").strip().split("\n")[0]
@@ -4455,7 +4699,12 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
                 "logs": logs_copy,
             })
         elif parsed.path == "/api/history":
-            self._send_json({"ok": True, "history": get_recent(30)})
+            qs = parse_qs(parsed.query)
+            try:
+                lim = max(1, min(100, int(qs.get("limit", ["30"])[0])))
+            except Exception:
+                lim = 30
+            self._send_json({"ok": True, "history": get_recent(lim)})
         elif parsed.path == "/api/serper_keys":
             from plugins.serper_pool import get_serper_pool_status
             self._send_json(get_serper_pool_status())
@@ -4464,22 +4713,41 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        length = int(self.headers.get("Content-Length", "0"))
+        length = min(int(self.headers.get("Content-Length", "0")), 262144)
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
         except Exception:
             body = {}
 
-        # 登录接口无需鉴权
+        # 登录接口：无默认密码兜底 + 基于客户端 IP 的防暴力破解限流
         if parsed.path == "/api/login":
-            pwd = body.get("password", "")
-            cfg = load_config()
-            admin_pwd = cfg.get("admin_password", "Lin2026@k9x2!")
-            if pwd == admin_pwd:
+            client_ip = self._client_ip()
+            now_ts = time.time()
+            with _login_lock:
+                recent_fails = [t for t in _login_failures.get(client_ip, []) if now_ts - t < 600]
+                _login_failures[client_ip] = recent_fails
+                if len(recent_fails) >= 8:
+                    log_msg(f"🚨 [安全拦截] 登录失败次数过多，临时封禁 IP 10 分钟: {client_ip}")
+                    self._send_json({"ok": False, "error": "尝试次数过多，请 10 分钟后再试"}, code=429)
+                    return
+
+            pwd = str(body.get("password", ""))
+            admin_pwd = get_configured_admin_password()
+            if not admin_pwd:
+                self._send_json({"ok": False, "error": "服务端尚未在 config.json 中配置 admin_password"}, code=403)
+                return
+
+            if pwd and hmac.compare_digest(pwd, admin_pwd):
+                with _login_lock:
+                    _login_failures.pop(client_ip, None)
                 token = get_admin_token(admin_pwd)
-                cookie = f"bot_session={token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax"
-                self._send_json({"ok": True, "token": token}, extra_headers={"Set-Cookie": cookie})
+                sec = "; Secure" if self._is_https() else ""
+                cookie = f"bot_session={token}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax{sec}"
+                self._send_json({"ok": True}, extra_headers={"Set-Cookie": cookie})
             else:
+                with _login_lock:
+                    _login_failures.setdefault(client_ip, []).append(now_ts)
+                log_msg(f"⚠️ [安全审计] Web 控制台密码验证失败 (IP={client_ip})")
                 self._send_json({"ok": False, "error": "密码错误，请重新输入"}, code=403)
             return
 
@@ -4507,14 +4775,15 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "message": "已成功关闭所有遮挡弹窗并恢复聊天窗口"})
         elif parsed.path == "/api/key":
             key_name = body.get("key", "")
+            if key_name == "Escape":
+                # 严禁向微信 4.x 发送 Escape，改为安全解除弹窗
+                recover_wechat_ui_state()
+                self._send_json({"ok": True, "key": "SafeRecover"})
+                return
             d = display.Display(":99")
             try:
                 if key_name == "Enter":
                     kc = d.keysym_to_keycode(XK.XK_Return)
-                    xtest.fake_input(d, X.KeyPress, kc)
-                    xtest.fake_input(d, X.KeyRelease, kc)
-                elif key_name == "Escape":
-                    kc = d.keysym_to_keycode(XK.XK_Escape)
                     xtest.fake_input(d, X.KeyPress, kc)
                     xtest.fake_input(d, X.KeyRelease, kc)
                 elif key_name == "Clear":
@@ -4550,12 +4819,26 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": True, "message": "机器人服务正在重启..."})
         elif parsed.path == "/api/config":
             cfg = load_config()
-            for k in ("auto_reply", "trigger_mode", "bot_names", "system_prompt", "amap_api_key", "admin_password", "temperature"):
+            for k in ("auto_reply", "trigger_mode", "bot_names", "system_prompt", "temperature"):
                 if k in body:
+                    if k == "bot_names" and isinstance(body[k], list) and len(body[k]) == 0:
+                        continue
                     cfg[k] = body[k]
+            if body.get("amap_api_key"):
+                cfg["amap_api_key"] = str(body["amap_api_key"]).strip()
+            if body.get("admin_password"):
+                new_pwd = str(body["admin_password"]).strip()
+                if len(new_pwd) < 8:
+                    self._send_json({"ok": False, "error": "管理员密码长度至少需要 8 位"}, code=400)
+                    return
+                cfg["admin_password"] = new_pwd
             save_config(cfg)
             log_msg(f"控制台更新配置: trigger_mode={cfg.get('trigger_mode')}, auto_reply={cfg.get('auto_reply')}, temp={cfg.get('temperature')}")
-            self._send_json({"ok": True})
+            extra = {}
+            if body.get("admin_password"):
+                sec = "; Secure" if self._is_https() else ""
+                extra["Set-Cookie"] = f"bot_session={get_admin_token(cfg['admin_password'])}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax{sec}"
+            self._send_json({"ok": True}, extra_headers=extra or None)
         elif parsed.path == "/api/serper_keys/add":
             from plugins.serper_pool import add_serper_keys, get_serper_pool_status
             keys_input = body.get("keys") or body.get("key") or ""
@@ -4566,21 +4849,25 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             from plugins.serper_pool import remove_serper_key, get_serper_pool_status
             target_key = body.get("key", "").strip()
             removed, _ = remove_serper_key(target_key)
-            masked = f"{target_key[:6]}...{target_key[-4:]}" if len(target_key) >= 10 else target_key
-            log_msg(f"控制台指令: 手动移除 Serper API Key: {masked}")
+            masked = f"{target_key[:6]}...{target_key[-4:]}" if len(target_key) >= 14 else target_key
+            log_msg(f"控制台指令: 手动移除 Serper API Key (标识={masked})")
             self._send_json({"ok": True, "removed": removed, "pool": get_serper_pool_status()})
         else:
             self.send_error(404)
 
 
 def start_system_watchdog():
-    """独立看门狗后台线程：监控主循环心跳与系统状态，防止死锁与失联。"""
+    """独立看门狗后台线程：监控主循环心跳与定期回收 WeChatAppEx 孤儿渲染进程。"""
     def _watchdog_runner():
-        log_msg("【系统看门狗】守护线程已启动 (主循环停滞超时: 90s, 硬重置超时: 180s)")
+        log_msg("【系统看门狗】守护线程已启动 (主循环停滞超时: 90s, 硬重置超时: 180s, 内存GC周期: 20m)")
+        last_gc_ts = 0.0
         while True:
             time.sleep(10)
             try:
                 now = time.time()
+                if now - last_gc_ts >= 1200.0:
+                    last_gc_ts = now
+                    reap_stale_appex_and_temp_files(min_appex_age_sec=900)
                 elapsed = now - _last_loop_heartbeat
                 if elapsed > 90.0:
                     log_msg(f"🚨【系统看门狗报警】主监控循环停滞超过 {int(elapsed)} 秒！触发一级应急自愈恢复...")
@@ -4618,6 +4905,9 @@ if __name__ == "__main__":
     start_system_watchdog()
     t = threading.Thread(target=supervised_monitor_loop, daemon=True)
     t.start()
-    server = ThreadingHTTPServer(("0.0.0.0", 18890), BotHTTPHandler)
-    log_msg("HTTP 控制台已启动: http://0.0.0.0:18890 (外网端口 18890)")
+    init_cfg = load_config()
+    listen_host = str(init_cfg.get("listen_host") or os.environ.get("BOT_LISTEN_HOST") or "127.0.0.1").strip()
+    listen_port = int(init_cfg.get("listen_port") or 18890)
+    server = ThreadingHTTPServer((listen_host, listen_port), BotHTTPHandler)
+    log_msg(f"HTTP 控制台已安全启动: http://{listen_host}:{listen_port} (仅限本地反代访问)")
     server.serve_forever()
