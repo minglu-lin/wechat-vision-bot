@@ -13,6 +13,7 @@ WeChat Vision AI Bot - 远程控制与运维命令行工具
 - 查询本地持久化对话记忆库 (history)
 """
 
+import base64
 import json
 import os
 import subprocess
@@ -47,9 +48,8 @@ def remote_api(path, method="GET", payload=None, timeout=35):
         "req = urllib.request.Request(url, data=data, headers=hdrs, method=method)\n"
         "print(urllib.request.urlopen(req, timeout=30).read().decode('utf-8'))\n"
     )
-    cmd = ["ssh", SSH_HOST, "python3 -"]
-    # Pass script + optional JSON payload separated cleanly via env/arg
-    cmd = ["ssh", SSH_HOST, "python3", "-c", py_code]
+    b64_script = base64.b64encode(py_code.encode("utf-8")).decode("ascii")
+    cmd = ["ssh", SSH_HOST, f"python3 -c \"import base64; exec(base64.b64decode('{b64_script}'))\""]
     res = subprocess.run(cmd, input=body_bytes, capture_output=True, timeout=timeout)
     out_str = res.stdout.decode("utf-8", errors="replace").strip()
     try:
@@ -74,7 +74,9 @@ def pull_image(api_endpoint="/api/win.png", local_path="wechat_latest.png"):
         f"req = urllib.request.Request({REMOTE_API + api_endpoint!r}, headers=hdrs)\n"
         "sys.stdout.buffer.write(urllib.request.urlopen(req, timeout=20).read())\n"
     )
-    res = subprocess.run(["ssh", SSH_HOST, "python3", "-c", py_code], capture_output=True, check=True, timeout=30)
+    b64_script = base64.b64encode(py_code.encode("utf-8")).decode("ascii")
+    cmd = ["ssh", SSH_HOST, f"python3 -c \"import base64; exec(base64.b64decode('{b64_script}'))\""]
+    res = subprocess.run(cmd, capture_output=True, check=True, timeout=30)
     with open(local_path, "wb") as f:
         f.write(res.stdout)
     return local_path
