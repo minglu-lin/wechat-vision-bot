@@ -122,7 +122,7 @@ def compute_pil_dhash(pil_img):
 
 
 def hamming_distance_64(h1: int, h2: int) -> int:
-    return (h1 ^ h2).bit_count()
+    return bin(int(h1) ^ int(h2)).count("1")
 
 
 def register_seen_image_hash(dhash, sender: str, ts_val: float, image_path: str = ""):
@@ -1791,11 +1791,11 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
     return None
 
 
-def find_image_for_query(query_text="", quote_info=None, session_key="", max_age_sec=3600):
+def find_image_for_query(query_text="", quote_info=None, session_key="", max_age_sec=3600, asker=""):
     """
     根据微信‘引用’或语义提问精准溯源本地图片记录：
     1. 引用溯源：若引用了某人且引用内容包含 [图片] 或图，精准对齐该人发送的历史本地图片
-    2. 语义问图：若提问显式涉及读图、看图、分析图，对齐会话最近一张本地图片
+    2. 语义问图：若提问显式涉及读图、看图、分析图，优先对齐提问者本人近期发图，再对齐会话最近实质图片
     """
     now = time.time()
     # 1. 微信引用优先精准匹配
@@ -1819,14 +1819,49 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
 
     # 2. 语义问图匹配最近本地图片（必须显式包含看图/读图/图片类词汇，严禁分析/数据/内容等泛化词）
     c = (query_text or "").lower()
-    img_kws = ["看图", "读图", "这张图", "这个图", "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中", "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图"]
+    img_kws = [
+        "看图", "读图", "这张图", "这个图", "这张照片", "这个照片", "新闻图",
+        "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中",
+        "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图",
+    ]
     if any(kw in c for kw in img_kws):
+        asker_norm = normalize_dedup_sender(asker) if asker and not is_unknown_placeholder_sender(asker) else ""
+        # 2a. 优先匹配提问者本人 180 秒内发出的图片（防止同批次排序或群友表情包截胡）
+        if asker_norm:
+            for rec in reversed(recent_image_records):
+                if now - rec["ts"] > 180:
+                    break
+                rec_sender = str(rec.get("sender", ""))
+                rec_norm = normalize_dedup_sender(rec_sender)
+                if rec_norm and (rec_norm == asker_norm or asker_norm in rec_norm or rec_norm in asker_norm):
+                    if os.path.exists(rec["image_path"]):
+                        log_msg(f"【本地图片提问者优先命中】对齐提问 '{c[:20]}' -> 提问者近期图片: {rec['image_path']} (来自: {rec_sender})")
+                        return rec
+
+        # 2b. 回退至会话最近 10 分钟内有效图片（非问表情时优先于群友插发的表情包选择实质图片）
+        recent_limit = min(max_age_sec, 600)
+        candidates = []
         for rec in reversed(recent_image_records):
-            if now - rec["ts"] > max_age_sec:
+            if now - rec["ts"] > recent_limit:
                 break
             if os.path.exists(rec["image_path"]):
-                log_msg(f"【本地图片语义问图命中】对齐提问 '{c[:20]}' -> 会话最新本地图片: {rec['image_path']} (来自: {rec['sender']})")
-                return rec
+                candidates.append(rec)
+
+        if candidates:
+            newest = candidates[0]
+            def _is_sticker(r):
+                return ("表情" in str(r.get("image_type", ""))) or ("表情包" in str(r.get("ocr_and_detail", "")))
+
+            if "表情" not in c and _is_sticker(newest):
+                for cand in candidates[1:]:
+                    if newest["ts"] - cand["ts"] > 180:
+                        break
+                    if not _is_sticker(cand):
+                        log_msg(f"【本地图片语义问图命中】对齐提问 '{c[:20]}' -> 跳过表情包命中近期实质图: {cand['image_path']} (来自: {cand['sender']})")
+                        return cand
+
+            log_msg(f"【本地图片语义问图命中】对齐提问 '{c[:20]}' -> 会话最新本地图片: {newest['image_path']} (来自: {newest['sender']})")
+            return newest
 
     return None
 
@@ -3153,26 +3188,33 @@ def safe_generate_and_reply(target, cfg, recent_history, prefix_sender=False, pr
     return False, "", concurrent_arrival
 
 
+def is_row0_file_helper(img, w) -> bool:
+    """Check strictly inside Row 0's avatar box for File Transfer Assistant's emerald-green + white folder icon.
+    Avoids false positives from WeChat 4.1's active row selection background RGB(21, 172, 112).
+    """
+    try:
+        emerald_cnt = 0
+        white_cnt = 0
+        for y in range(w["y"] + 98, w["y"] + 121, 2):
+            for x in range(w["x"] + 82, w["x"] + 105, 2):
+                r, g, b = img.getpixel((x, y))[:3]
+                if r < 15 and g > 185 and b < 105:
+                    emerald_cnt += 1
+                elif r > 240 and g > 240 and b > 240:
+                    white_cnt += 1
+        return emerald_cnt >= 20 and white_cnt >= 6
+    except Exception:
+        return False
+
+
 def find_maga_sidebar_y(img, w):
     """
     动态判定 MAGA 在侧边栏的准确行坐标：
     若第 0 行为文件传输助手（绿色文件夹图标），MAGA 在第 1 行 (w["y"] + 185)；
     否则 MAGA 在第 0 行 (w["y"] + 112)。
     """
-    try:
-        has_file_helper = False
-        for y in range(w["y"] + 95, w["y"] + 140, 2):
-            for x in range(w["x"] + 76, w["x"] + 110, 2):
-                r, g, b = img.getpixel((x, y))[:3]
-                if g > 170 and r < 50 and b < 120:
-                    has_file_helper = True
-                    break
-            if has_file_helper:
-                break
-        if has_file_helper:
-            return w["y"] + 185
-    except Exception:
-        pass
+    if is_row0_file_helper(img, w):
+        return w["y"] + 185
     return w["y"] + 112
 
 
@@ -3227,18 +3269,7 @@ def find_sidebar_red_badges(img, w):
     sy2 = min(w["y"] + w["height"] - 30, w["y"] + 450)
 
     # 动态检测第 0 行是否为文件传输助手
-    has_file_helper = False
-    try:
-        for y_fh in range(w["y"] + 95, w["y"] + 140, 2):
-            for x_fh in range(w["x"] + 76, w["x"] + 110, 2):
-                r, g, b = img.getpixel((x_fh, y_fh))[:3]
-                if g > 170 and r < 50 and b < 120:
-                    has_file_helper = True
-                    break
-            if has_file_helper:
-                break
-    except Exception:
-        pass
+    has_file_helper = is_row0_file_helper(img, w)
     maga_row_idx = 1 if has_file_helper else 0
 
     sub = img.crop((sx1, sy1, sx2, sy2))
@@ -3680,6 +3711,33 @@ def monitor_loop():
                                                     floor_ts = max(floor_ts, matched_t)
                                                 mark_seen(m_s, m_c, ts=matched_t or floor_ts or last_processed_ts, only_if_missing=True)
 
+                                    # 1.5 预落盘当前批次内所有新图片，避免同屏“先文后图”乱序时语义找图捞到历史旧图或他人表情包
+                                    for idx, msg_item in enumerate(raw_msgs):
+                                        if idx in seen_indices:
+                                            continue
+                                        cur_min_ts = msg_floor_ts[idx]
+                                        m_in = msg_item.get("is_incoming", True)
+                                        m_s = msg_item.get("sender", "群友")
+                                        m_c = msg_item.get("content", "").strip()
+                                        if is_explicit_bot_invocation(m_c):
+                                            m_in = True
+                                        if not m_c or is_recent_duplicate(m_s, m_c, min_ts=cur_min_ts) or is_in_task_queue(m_s, m_c):
+                                            continue
+                                        r_img = msg_item.get("referenced_image", {})
+                                        if m_in and isinstance(r_img, dict) and r_img.get("has_image"):
+                                            if match_seen_image_ts(m_s, r_img, chat_img, min_ts=cur_min_ts) is not None:
+                                                msg_item["_dup_img_skip"] = True
+                                                continue
+                                            if m_s not in ["我们自己", "bot", "AIbot", "Albot", "aibot"] and not is_unknown_placeholder_sender(m_s):
+                                                pre_saved = save_incoming_image(m_s, r_img, chat_img, msg_ts=batch_ts)
+                                                if pre_saved:
+                                                    r_img["local_path"] = pre_saved
+                                                    msg_item["_pre_saved_img_path"] = pre_saved
+                                                r_img["ts"] = batch_ts
+                                                r_img["sender"] = m_s
+                                                pre_sess = m_s if is_in_private_chat else focus_chat
+                                                last_received_images[pre_sess] = r_img
+
                                     # 2. 仅对未命中历史水位线的增量新消息打上批次时间戳 batch_ts 并按批次处理
                                     for idx, msg_item in enumerate(raw_msgs):
                                         if idx in seen_indices:
@@ -3714,7 +3772,7 @@ def monitor_loop():
                                         has_img = img_info.get("has_image", False) if isinstance(img_info, dict) else False
                                         has_file = file_att.get("has_file", False) if isinstance(file_att, dict) else False
 
-                                        if has_img and match_seen_image_ts(s, img_info, chat_img, min_ts=cur_min_ts) is not None:
+                                        if msg_item.get("_dup_img_skip") or (not msg_item.get("_pre_saved_img_path") and has_img and match_seen_image_ts(s, img_info, chat_img, min_ts=cur_min_ts) is not None):
                                             log_msg(f"【图片指纹去重】同一张图片 OCR 描述变化，按 dHash 自动去重跳过 (sender={s})")
                                             mark_seen(s, c, ts=batch_ts, only_if_missing=True)
                                             continue
@@ -3751,14 +3809,15 @@ def monitor_loop():
                                             rec_c = card_prefix + (" " + rec_c if rec_c and rec_c != c_title else "")
                                         if has_q and q_info.get("quoted_content"):
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
-                                        saved_img_path = None
+                                        saved_img_path = msg_item.get("_pre_saved_img_path")
                                         if is_in and has_img and img_info and s not in ["我们自己", "bot", "AIbot", "Albot", "aibot"]:
-                                            # 立即执行本地图片持久化落盘 (原图提取 + 气泡切片双保险)
-                                            saved_img_path = save_incoming_image(s, img_info, chat_img, msg_ts=batch_ts)
+                                            if not saved_img_path:
+                                                # 立即执行本地图片持久化落盘 (原图提取 + 气泡切片双保险)
+                                                saved_img_path = save_incoming_image(s, img_info, chat_img, msg_ts=batch_ts)
                                             if saved_img_path:
                                                 img_info["local_path"] = saved_img_path
                                             if not is_unknown_placeholder_sender(s):
-                                                img_info["ts"] = time.time()
+                                                img_info["ts"] = batch_ts
                                                 img_info["sender"] = s
                                                 last_received_images[session_key] = img_info
                                             if img_info.get("image_type"):
@@ -3858,7 +3917,7 @@ def monitor_loop():
                                             # 1. 微信“引用看图”首要原则：如果消息带引用 (has_q=True)，优先通过引用溯源被引用的真实高清大图！
                                             # 绝不使用本条消息气泡自带的 28x42 微型缩略图
                                             if has_q:
-                                                matched_rec = find_image_for_query(c, quote_info=q_info, session_key=session_key)
+                                                matched_rec = find_image_for_query(c, quote_info=q_info, session_key=session_key, asker=s)
                                                 if matched_rec:
                                                     log_msg(f"【引用看图命中】成功溯源被引用的真实高清大图: {matched_rec['image_path']} (来自: {matched_rec.get('sender')})")
                                                     target_img_info = {
@@ -3878,7 +3937,7 @@ def monitor_loop():
                                                 # 如果当前会话处于分享文章/卡片上下文中，绝不错误绑定过去的不相关历史图片
                                                 target_img_info = None
                                             elif not target_img_info or not target_img_info.get("has_image"):
-                                                matched_rec = find_image_for_query(c, quote_info=q_info, session_key=session_key)
+                                                matched_rec = find_image_for_query(c, quote_info=q_info, session_key=session_key, asker=s)
                                                 if matched_rec:
                                                     target_img_info = {
                                                         "has_image": True,
