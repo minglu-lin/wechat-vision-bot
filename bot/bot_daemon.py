@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import os
 import re
@@ -13,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -75,8 +77,121 @@ import unicodedata
 
 seen_msg_timestamps = {}
 seen_content_timestamps = {}
+seen_image_hashes = deque(maxlen=80)
 last_bot_db_ts = 0.0
 _last_loop_heartbeat = time.time()
+
+UNKNOWN_SENDER_PLACEHOLDERS = {
+    "", "未知", "未知用户", "未知群友", "未知发送者", "未知好友",
+    "群友", "群成员", "匿名", "unknown", "user", "对方",
+}
+
+
+def is_unknown_placeholder_sender(sender: str) -> bool:
+    """Return True if sender is an empty or OCR-invented unknown placeholder."""
+    s_clean = re.sub(r"\(.*?\)|\s+", "", (sender or "").strip()).lower()
+    return (not s_clean) or (s_clean in UNKNOWN_SENDER_PLACEHOLDERS) or s_clean.startswith("未知")
+
+
+def compute_pil_dhash(pil_img):
+    """Compute a 64-bit dHash ignoring a 6% outer border against minor crop jitter."""
+    if pil_img is None:
+        return None
+    try:
+        w, h = pil_img.size
+        if w < 16 or h < 16:
+            return None
+        work = pil_img
+        if w >= 40 and h >= 40:
+            dx = int(w * 0.06)
+            dy = int(h * 0.06)
+            work = pil_img.crop((dx, dy, max(dx + 2, w - dx), max(dy + 2, h - dy)))
+        resampling = getattr(Image, "Resampling", Image)
+        small = work.convert("L").resize((9, 8), resampling.BILINEAR)
+        px = small.load()
+        hval = 0
+        bit = 0
+        for y in range(8):
+            for x in range(8):
+                if px[x + 1, y] > px[x, y]:
+                    hval |= (1 << bit)
+                bit += 1
+        return hval
+    except Exception:
+        return None
+
+
+def hamming_distance_64(h1: int, h2: int) -> int:
+    return (h1 ^ h2).bit_count()
+
+
+def register_seen_image_hash(dhash, sender: str, ts_val: float, image_path: str = ""):
+    if dhash is None:
+        return
+    s_clean = normalize_dedup_sender(sender)
+    for rec in seen_image_hashes:
+        if rec["dhash"] == dhash and abs(rec["ts"] - ts_val) < 2.0 and rec["sender"] == s_clean:
+            return
+    seen_image_hashes.append({
+        "dhash": dhash,
+        "sender": s_clean,
+        "ts": float(ts_val),
+        "image_path": image_path,
+    })
+
+
+def match_seen_image_ts(sender: str, img_info: dict, chat_img=None, min_ts: float = 0.0, max_age: float = 7200.0):
+    """Match an extracted image crop against recent perceptual dHashes."""
+    if not isinstance(img_info, dict):
+        return None
+    dhash = img_info.get("_dhash")
+    if dhash is None:
+        pil_crop = None
+        if img_info.get("_img_bytes"):
+            try:
+                pil_crop = Image.open(io.BytesIO(img_info["_img_bytes"]))
+            except Exception:
+                pil_crop = None
+        elif img_info.get("_crop_box") and chat_img is not None:
+            try:
+                pil_crop = chat_img.crop(tuple(img_info["_crop_box"]))
+            except Exception:
+                pil_crop = None
+        dhash = compute_pil_dhash(pil_crop)
+        if dhash is not None:
+            img_info["_dhash"] = dhash
+    if dhash is None:
+        return None
+
+    now = time.time()
+    s_clean = normalize_dedup_sender(sender)
+    for rec in reversed(seen_image_hashes):
+        r_ts = rec["ts"]
+        if now - r_ts >= max_age or r_ts < min_ts - 1.5:
+            continue
+        dist = hamming_distance_64(dhash, rec["dhash"])
+        if dist <= 12:
+            return r_ts
+        if s_clean == rec["sender"] and (now - r_ts < 90.0) and dist <= 18:
+            return r_ts
+    return None
+
+
+def match_scrolled_top_fragment_ts(content: str, min_ts: float = 0.0, max_age: float = 21600.0):
+    """Match a top-edge partial OCR fragment if it is a substring of an earlier full message."""
+    c_clean = normalize_dedup_text(content)
+    if len(c_clean) < 12:
+        return None
+    now = time.time()
+    for past_c, past_ts_list in seen_content_timestamps.items():
+        if not past_ts_list or len(past_c) <= len(c_clean):
+            continue
+        last_t = past_ts_list[-1]
+        if last_t < min_ts - 1.5 or (now - last_t >= max_age):
+            continue
+        if c_clean in past_c:
+            return last_t
+    return None
 
 
 def edit_distance(s1: str, s2: str) -> int:
@@ -387,12 +502,15 @@ def find_received_file(file_name="", max_wait_sec=3.0):
                     fuzzy.sort(key=lambda x: os.path.getmtime(x), reverse=True)
                     return fuzzy[0]
 
-        # 4. 兜底策略：查找最近 30 秒内新生成或修改的文件
+        # 4. 兜底策略：查找最近 30 秒内新生成或修改的同扩展名文件
         if all_files:
-            all_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            newest = all_files[0]
-            if time.time() - os.path.getmtime(newest) < 30.0:
-                return newest
+            ext = os.path.splitext(safe_name)[1].strip().lower() if safe_name else ""
+            ext_files = [f for f in all_files if not ext or f.lower().endswith(ext)]
+            if ext_files:
+                ext_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+                newest = ext_files[0]
+                if time.time() - os.path.getmtime(newest) < 30.0:
+                    return newest
 
         time.sleep(0.5)
 
@@ -729,7 +847,7 @@ def extract_urls(text):
 
 def find_article_link_in_memory(keyword=""):
     try:
-        out = subprocess.check_output(["pgrep", "-x", "wechat"]).decode().split()
+        out = subprocess.check_output(["pgrep", "-x", "wechat"], timeout=3).decode().split()
         if not out:
             return None
         pid = int(out[0])
@@ -766,29 +884,49 @@ def find_article_link_in_memory(keyword=""):
 
     maps.reverse()
 
+    url_patterns = (
+        re.compile(rb'"link"\s*:\s*"(https://mp\.weixin\.qq\.com/s[^"]+)"'),
+        re.compile(rb'<url><!\[CDATA\[(https://mp\.weixin\.qq\.com/s[^\]]+)\]\]></url>'),
+        re.compile(rb'https://mp\.weixin\.qq\.com/s[a-zA-Z0-9_\-\.\/\?\=\&\%]+'),
+    )
+    best_dist = None
+    best_link = None
+
     try:
         with open(f"/proc/{pid}/mem", "rb", 0) as mem:
             for start, end in maps:
                 try:
                     mem.seek(start)
                     chunk = mem.read(end - start)
-                    if kw_bytes in chunk:
-                        m = re.search(rb'"link"\s*:\s*"(https://mp\.weixin\.qq\.com/s[^"]+)"', chunk)
-                        if m:
-                            raw_link = m.group(1).decode("utf-8", errors="ignore").replace("&amp;", "&")
-                            if is_valid_mp_url(raw_link):
-                                return raw_link
-                        m2 = re.search(rb'https://mp\.weixin\.qq\.com/s[a-zA-Z0-9_\-\.\/\?\=\&\%]+', chunk)
-                        if m2:
-                            raw_link = m2.group(0).decode("utf-8", errors="ignore").replace("&amp;", "&").rstrip("\\;&<>'\"")
-                            if is_valid_mp_url(raw_link):
-                                return raw_link
+                    search_pos = 0
+                    hits = 0
+                    while hits < 25:
+                        pos = chunk.find(kw_bytes, search_pos)
+                        if pos < 0:
+                            break
+                        hits += 1
+                        search_pos = pos + len(kw_bytes)
+                        win_start = max(0, pos - 2048)
+                        win_end = min(len(chunk), pos + len(kw_bytes) + 4096)
+                        window = chunk[win_start:win_end]
+                        kw_rel = pos - win_start
+                        for pat in url_patterns:
+                            for m in pat.finditer(window):
+                                raw_bytes = m.group(1) if m.lastindex else m.group(0)
+                                raw_link = raw_bytes.decode("utf-8", errors="ignore").replace("&amp;", "&").rstrip("\\;&<>'\"")
+                                if is_valid_mp_url(raw_link):
+                                    dist = abs(m.start() - kw_rel)
+                                    if best_dist is None or dist < best_dist:
+                                        best_dist = dist
+                                        best_link = raw_link
+                    if best_link:
+                        return best_link
                 except Exception:
                     continue
     except Exception as e:
         log_msg(f"内存扫描链接异常: {e}")
 
-    return None
+    return best_link
 
 
 def fetch_url_content(url, timeout=10, max_chars=3500):
@@ -885,6 +1023,7 @@ last_processed_ts = 0.0
 
 def init_db():
     global last_processed_ts, last_bot_db_ts
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cur = conn.cursor()
@@ -911,19 +1050,27 @@ def init_db():
         cur.execute("CREATE INDEX IF NOT EXISTS idx_messages_ts ON messages(ts)")
         conn.commit()
 
-        # 预热本地图片持久化索引
+        # 预热本地图片持久化索引及视觉去重 dHash 指纹
         try:
             cur.execute("SELECT ts, sender, content, image_path FROM messages WHERE image_path IS NOT NULL AND image_path != '' ORDER BY id DESC LIMIT 30")
             for r_ts, r_sender, r_content, r_img_path in reversed(cur.fetchall()):
                 if r_img_path and os.path.exists(r_img_path):
+                    ts_f = float(r_ts)
                     recent_image_records.append({
-                        "ts": float(r_ts),
+                        "ts": ts_f,
                         "sender": r_sender,
                         "content": r_content,
                         "image_path": r_img_path,
                     })
+                    try:
+                        with Image.open(r_img_path) as im:
+                            dh = compute_pil_dhash(im)
+                        if dh is not None:
+                            register_seen_image_hash(dh, r_sender, ts_f, r_img_path)
+                    except Exception:
+                        pass
             if recent_image_records:
-                log_msg(f"已从数据库预热 {len(recent_image_records)} 条本地图片持久化记录")
+                log_msg(f"已从数据库预热 {len(recent_image_records)} 条本地图片持久化记录 (视觉指纹 {len(seen_image_hashes)} 条)")
         except Exception:
             pass
 
@@ -940,10 +1087,15 @@ def init_db():
             for candidate_c in (r_content, raw_c):
                 if candidate_c:
                     mark_seen(r_sender, candidate_c, ts=ts_val)
-        conn.close()
         log_msg(f"已从数据库预热 {len(rows)} 条历史消息时间戳索引 (当前水位线 ts={last_processed_ts:.2f}, 最新bot回复 ts={last_bot_db_ts:.2f})")
     except Exception as e:
         log_msg(f"Init DB error: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None, image_path=None):
@@ -951,6 +1103,7 @@ def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None, ima
     content = (content or "").strip()
     if not content:
         return
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cur = conn.cursor()
@@ -963,23 +1116,34 @@ def save_msg(sender, content, is_bot=False, is_mentioned=False, msg_ts=None, ima
             (ts, now_str, sender, content, 1 if is_bot else 0, 1 if is_mentioned else 0, image_path)
         )
         conn.commit()
-        conn.close()
     except Exception as e:
         log_msg(f"Save msg error: {e}")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def get_recent(limit=15):
+    conn = None
     try:
         conn = sqlite3.connect(DB_PATH, timeout=10.0)
         cur = conn.cursor()
-        cur.execute("SELECT time_str, sender, content, is_bot FROM messages ORDER BY id DESC LIMIT ?", (limit,))
+        cur.execute("SELECT time_str, sender, content, is_bot, ts FROM messages ORDER BY id DESC LIMIT ?", (limit,))
         rows = cur.fetchall()
-        conn.close()
         rows.reverse()
-        return [{"time": r[0], "sender": r[1], "content": r[2], "is_bot": bool(r[3])} for r in rows]
+        return [{"time": r[0], "sender": r[1], "content": r[2], "is_bot": bool(r[3]), "ts": float(r[4] or 0.0)} for r in rows]
     except Exception as e:
         log_msg(f"Get recent history error: {e}")
         return []
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
 
 def log_msg(msg):
@@ -1024,12 +1188,13 @@ def ensure_processes():
         out = ""
     if not out:
         log_msg("Starting Xvfb :99...")
-        subprocess.Popen(
-            ["Xvfb", ":99", "-screen", "0", "1280x800x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
-            stdout=open("/tmp/xvfb.log", "a"),
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-        )
+        with open("/tmp/xvfb.log", "a") as lf:
+            subprocess.Popen(
+                ["Xvfb", ":99", "-screen", "0", "1280x800x24", "-ac", "+extension", "GLX", "+render", "-noreset"],
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
         time.sleep(1.5)
 
     try:
@@ -1042,13 +1207,14 @@ def ensure_processes():
         env["DISPLAY"] = ":99"
         env["LANG"] = "zh_CN.UTF-8"
         env["LC_ALL"] = "zh_CN.UTF-8"
-        subprocess.Popen(
-            ["dbus-run-session", "/usr/bin/wechat"],
-            env=env,
-            stdout=open("/tmp/wechat.log", "a"),
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-        )
+        with open("/tmp/wechat.log", "a") as lf:
+            subprocess.Popen(
+                ["dbus-run-session", "/usr/bin/wechat"],
+                env=env,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
         time.sleep(4.0)
 
 
@@ -1065,13 +1231,14 @@ def restart_wechat_client():
     env["LANG"] = "zh_CN.UTF-8"
     env["LC_ALL"] = "zh_CN.UTF-8"
     try:
-        subprocess.Popen(
-            ["dbus-run-session", "/usr/bin/wechat"],
-            env=env,
-            stdout=open("/tmp/wechat.log", "a"),
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-        )
+        with open("/tmp/wechat.log", "a") as lf:
+            subprocess.Popen(
+                ["dbus-run-session", "/usr/bin/wechat"],
+                env=env,
+                stdout=lf,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+            )
     except Exception as e:
         log_msg(f"拉起微信失败: {e}")
     time.sleep(5.0)
@@ -1505,13 +1672,14 @@ def x11_send_image(image_path_or_url):
     env["DISPLAY"] = ":99"
     xclip_bin = "/usr/local/bin/xclip" if os.path.exists("/usr/local/bin/xclip") else "xclip"
     try:
-        subprocess.Popen(
+        p = subprocess.Popen(
             [xclip_bin, "-selection", "clipboard", "-t", "image/png", "-i", local_path],
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+        threading.Thread(target=p.wait, daemon=True).start()
         time.sleep(0.2)
     except Exception as e:
         log_msg(f"xclip 加载图片到剪贴板失败: {e}")
@@ -1566,7 +1734,7 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
     持久化命名: data/images/img_{int(ts)}_{clean_sender}.png
     采用纯内存/视觉切片落盘，零鼠标点击，杜绝触发微信图片查看器遮挡。
     """
-    if sender in ["我们自己", "bot", "AIbot", "Albot", "aibot"] or not sender:
+    if sender in ["我们自己", "bot", "AIbot", "Albot", "aibot"] or is_unknown_placeholder_sender(sender):
         return None
     ts = float(msg_ts) if msg_ts is not None else time.time()
     s_clean = re.sub(r'[^\w\u4e00-\u9fa5]', '_', str(sender or "user"))[:20].strip('_') or "user"
@@ -1601,6 +1769,16 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
             shutil.copyfile(local_path, "/tmp/wechat_last_photo.png")
         except Exception:
             pass
+        dhash = img_info.get("_dhash")
+        if dhash is None:
+            try:
+                with Image.open(local_path) as im:
+                    dhash = compute_pil_dhash(im)
+                if dhash is not None:
+                    img_info["_dhash"] = dhash
+            except Exception:
+                pass
+        register_seen_image_hash(dhash, sender, ts, local_path)
         record = {
             "ts": ts,
             "sender": sender,
@@ -1972,23 +2150,32 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"  5. 没有明确提问意图或指令诉求的普通陈述句。\n\n"
         )
 
+    top_clip_rule = (
+        "【顶边截断残缺气泡丢弃铁律（极其重要）】：截图最顶部边缘如果出现被截断一半的气泡、"
+        "只露出下半截的分享卡片或看不到上方发送者昵称的残缺气泡/图片，它们属于早已滚出视野的旧消息！"
+        "必须直接忽略跳过，绝不可放入 messages 列表（或必须标记 is_top_clipped=true），"
+        "绝不可凭下半截残字猜测补全标题，也绝不可编造“未知群友”、“未知用户”、“未知”等占位昵称！\n\n"
+    )
+
     if is_private_chat:
         prompt = (
             f"这是一张微信【私聊窗口】（好友 1 对 1 对话）最新截图。\n"
             f"当前是好友与 bot 的私信单聊界面。\n"
-            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括对方发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
+            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条完整消息列表（包括对方发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
+            f"{top_clip_rule}"
             f"针对每条消息，提取以下字段：\n"
             f"1. sender: 对方好友昵称（查看聊天窗口顶部标题所显示的名称，或者对方发送的白色气泡发送者）\n"
             f"2. content: 消息主体文本内容（若是文件卡片，提取文件名并格式化为 '[发送文件: 文件名]'；若是图片，简要描述图片类型与核心画面）\n"
             f"3. is_incoming: 是否是对方发送的左侧白色气泡（true 为对方发送，false 为右侧绿色气泡我们自己/bot 发送）\n"
             f"4. is_mentioned: 【私聊核心原则】：在 1 对 1 私聊中，对方发送的任何消息（is_incoming=True）都是直接对 bot 说的！因此只要对方发送了有效提问、指令或闲聊，is_mentioned 必须强制设为 true（无需 @bot 或 bot 关键字）！如果是敷衍附和或无意义标点，可设为 false。\n"
             f"5. is_followup: 是否是对上一轮回答的连续追问（若是追问设为 true，否则 false）\n"
-            f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
-            f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
-            f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
+            f"6. is_top_clipped: 该气泡/卡片是否紧贴截图最顶边且上半截（或发送者昵称）被裁切残缺？（完整消息填 false，顶边残缺消息填 true）\n"
+            f"7. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
+            f"8. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
+            f"9. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
             f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
             f"   - 若不是卡片：is_card=false\n"
-            f"9. file_attachment: 该消息是否为发送的文件卡片（如 .pdf, .xlsx, .xls, .docx, .doc, .txt, .py, .csv, .md, .zip 等各类文件）？\n"
+            f"10. file_attachment: 该消息是否为发送的文件卡片（如 .pdf, .xlsx, .xls, .docx, .doc, .txt, .py, .csv, .md, .zip 等各类文件）？\n"
             f"   - 若是文件卡片：has_file=true, file_name(完整文件名含扩展名), file_size(如 61B, 2.5MB), box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间\n"
             f"   - 若不是文件卡片：has_file=false, file_name='', file_size='', box_2d: []\n\n"
             f"请严格输出纯 JSON，不要带 markdown 代码块（不要带 ```json）：\n"
@@ -2000,6 +2187,7 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f'      "is_incoming": true,\n'
             f'      "is_mentioned": true,\n'
             f'      "is_followup": false,\n'
+            f'      "is_top_clipped": false,\n'
             f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
             f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
             f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}},\n'
@@ -2011,9 +2199,10 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
     else:
         prompt = (
             f"这是一张微信群聊窗口最新截图。\n"
-            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条消息列表（包括群友发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
+            f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条完整消息列表（包括群友发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
+            f"{top_clip_rule}"
             f"针对每条消息，提取以下字段：\n"
-            f"1. sender: 发送者群昵称（若是右侧绿色气泡，则为我们自己/bot）\n"
+            f"1. sender: 发送者群昵称（若是右侧绿色气泡，则为我们自己/bot；若顶边被截断看不到昵称则直接丢弃该条）\n"
             f"2. content: 消息主体文本内容（若是文件卡片，提取文件名并格式化为 '[发送文件: 文件名]'；若是图片，简要描述图片类型与核心画面）\n"
             f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
             f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
@@ -2021,12 +2210,13 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"   - 【严格禁忌1】：如果群友是在 @其他群成员（例如 '@张三 ...'、'@黄嘉诚 ...'，@后面跟的不是 AIbot/Albot/bot），绝对不属于呼叫 bot，is_mentioned 必须为 false！\n"
             f"   - 【严格禁忌2】：当群友在第三人称随口谈论提到 bot（例如“不用加bot你也会回”、“这个bot好逗”、“加bot干嘛”），是在与群友闲聊而非指令时，is_mentioned 必须为 false！\n"
             f"5. is_followup: 是否是对上一轮回答的连续追问（严格按照下方连续追问准则判断）\n"
-            f"6. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
-            f"7. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
-            f"8. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
+            f"6. is_top_clipped: 该气泡/卡片是否紧贴截图最顶边且上半截（或发送者昵称）被裁切残缺？（完整消息填 false，顶边残缺消息填 true）\n"
+            f"7. quote: 是否使用了微信‘引用’（has_quote, quoted_sender, quoted_content）\n"
+            f"8. referenced_image: 是否包含图片或关联图片（has_image, image_type, ocr_and_detail: 详细提取图片可见文字或核心画面, box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间）\n"
+            f"9. article_card: 该消息是否是微信图文分享卡片（如公众号文章卡片、新闻卡片、第三方链接卡片）？\n"
             f"   - 若是卡片：is_card=true, title(卡片完整标题), source(卡片底部来源/媒体名，如大河报、澎湃新闻、知乎等), url(若有可见链接则填写，无则留空)\n"
             f"   - 若不是卡片：is_card=false\n"
-            f"9. file_attachment: 该消息是否为发送的文件卡片（如 .pdf, .xlsx, .xls, .docx, .doc, .txt, .py, .csv, .md, .zip 等各类文件）？\n"
+            f"10. file_attachment: 该消息是否为发送的文件卡片（如 .pdf, .xlsx, .xls, .docx, .doc, .txt, .py, .csv, .md, .zip 等各类文件）？\n"
             f"   - 若是文件卡片：has_file=true, file_name(完整文件名含扩展名), file_size(如 61B, 2.5MB), box_2d: 归一化坐标 [ymin, xmin, ymax, xmax]，取值0到1000之间\n"
             f"   - 若不是文件卡片：has_file=false, file_name='', file_size='', box_2d: []\n\n"
             f"{session_instruction}"
@@ -2039,6 +2229,7 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f'      "is_incoming": true,\n'
             f'      "is_mentioned": true,\n'
             f'      "is_followup": false,\n'
+            f'      "is_top_clipped": false,\n'
             f'      "quote": {{"has_quote": false, "quoted_sender": "", "quoted_content": ""}},\n'
             f'      "referenced_image": {{"has_image": false, "image_type": "", "ocr_and_detail": "", "box_2d": []}},\n'
             f'      "article_card": {{"is_card": false, "title": "", "source": "", "url": ""}},\n'
@@ -2111,6 +2302,12 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
 
         if isinstance(data, dict):
             msgs = data.get("messages", [])
+            filtered_msgs = []
+            for m in msgs:
+                if bool(m.get("is_top_clipped")):
+                    continue
+                filtered_msgs.append(m)
+            msgs = filtered_msgs
             for m in msgs:
                 ref_img = m.get("referenced_image")
                 if ref_img and ref_img.get("has_image") and ref_img.get("box_2d"):
@@ -2285,6 +2482,23 @@ def clean_bot_reply(text):
         cleaned_lines.append(l)
 
     return "\n".join(cleaned_lines).strip()
+
+
+def strip_bot_mentions(text: str) -> str:
+    """Strip both leading and trailing @AIbot/@Albot/@bot/@微信小号 summons."""
+    clean_c = re.sub(
+        r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s\u2005\u00a0\u3000,，:：、?!？！]*',
+        '',
+        (text or '').strip(),
+        flags=re.IGNORECASE,
+    )
+    clean_c = re.sub(
+        r'[\s\u2005\u00a0\u3000,，:：、?!？！]*@\s*(?:aibot|albot|bot|微信小号)\s*$',
+        '',
+        clean_c,
+        flags=re.IGNORECASE,
+    ).strip()
+    return clean_c
 
 
 def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_info=None, image_info=None, file_info=None, card_info=None, force_provider=None):
@@ -2475,13 +2689,27 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             if len(mb.strip()) >= 3:
                 card_keywords.append(mb.strip())
 
-    # 4) Extract from recent_history (if user asks for evaluation/analysis/summary/what it says)
+    # 4) Extract from recent_history (only when evaluating an article or bare @bot right after a recent card)
+    clean_c = strip_bot_mentions(content)
     is_evaluating = any(kw in content for kw in [
         "锐评", "分析", "评价", "怎么看", "如何看", "解读", "讲了什么", "说了什么",
-        "总结", "详细说", "说说", "看下", "看看", "链接", "文章", "公众号", "推文", "卡片", "新闻", "报道"
+        "总结", "详细说", "说说", "看下", "看看", "链接", "文章", "公众号", "推文",
+        "卡片", "新闻", "报道", "上面那篇", "那篇", "这篇"
     ])
-    if recent_history:
-        for h in reversed(recent_history[:6]):
+    is_bare_mention = (
+        (len(clean_c) == 0)
+        and not (quote_info and quote_info.get("has_quote"))
+        and not (image_info and image_info.get("has_image"))
+        and not file_info
+    )
+    now_card_ts = time.time()
+    if is_evaluating and recent_history:
+        for h in reversed(recent_history[-6:]):
+            if h.get("is_bot"):
+                continue
+            h_ts = float(h.get("ts") or 0.0)
+            if h_ts > 0 and (now_card_ts - h_ts > 1800):
+                continue
             hc = h.get("content", "")
             mh = re.search(r'\[分享文章卡片:\s*《(.*?)》', hc)
             if mh:
@@ -2493,6 +2721,29 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 if is_valid_mp_url(u) and u not in found_urls:
                     found_urls.append(u)
                     break
+            if found_urls:
+                break
+    elif is_bare_mention and recent_history:
+        for h in reversed(recent_history[-4:]):
+            if h.get("is_bot"):
+                continue
+            hc = (h.get("content") or "").strip()
+            if not hc or not strip_bot_mentions(hc) or is_trivial_or_reaction(hc) or "这次处理失败" in hc:
+                continue
+            h_ts = float(h.get("ts") or 0.0)
+            if h_ts > 0 and (now_card_ts - h_ts > 300):
+                break
+            mh = re.search(r'\[分享文章卡片:\s*《(.*?)》', hc)
+            if mh:
+                h_title = mh.group(1).strip()
+                if h_title not in card_keywords:
+                    card_keywords.append(h_title)
+            else:
+                for u in extract_urls(hc):
+                    if is_valid_mp_url(u) and u not in found_urls:
+                        found_urls.append(u)
+                        break
+            break
 
     # 3. 针对收集到的文章标题，深入微信内存检索真实 URL
     if not found_urls:
@@ -2574,7 +2825,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
 
         # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
         if not stock_handled:
-            clean_q = re.sub(r'^(?:@\s*(?:aibot|albot|bot|微信小号)|(?:aibot|albot|bot))[\s,，:：、?!？！]*', '', content.strip(), flags=re.IGNORECASE).strip()
+            clean_q = strip_bot_mentions(content)
             search_intent_kws = [
                 "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
                 "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "行情", "汇率", "百科", "历史", "事件",
@@ -2600,8 +2851,8 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     )
                     tools = None
 
-    user_content_payload = user_query
-    if provider in ("gemini", "openai", "gpt") and image_info and image_info.get("has_image"):
+    img_b64 = None
+    if image_info and image_info.get("has_image"):
         img_data = None
         # 1. 优先读取持久化本地图片记录 (零延迟、原分辨率)
         if image_info.get("local_path") and os.path.exists(image_info["local_path"]):
@@ -2623,26 +2874,31 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         if img_data and len(img_data) > 500:
             try:
                 img_b64 = base64.b64encode(img_data).decode("ascii")
-                user_content_payload = [
-                    {"type": "text", "text": user_query},
-                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}}
-                ]
-                log_msg(f"已将本地持久化图片 ({len(img_data)} 字节) 作为视觉多模态输入直接送入 {target_model}")
+                log_msg(f"已加载本地持久化图片 ({len(img_data)} 字节) 准备作为视觉多模态输入送入 {target_model}")
             except Exception as e:
-                log_msg(f"组装图片多模态 payload 异常: {e}")
+                log_msg(f"编码图片多模态 payload 异常: {e}")
+
+    def _build_user_payload(text_q: str, cur_provider: str):
+        if img_b64 and cur_provider in ("gemini", "openai", "gpt"):
+            return [
+                {"type": "text", "text": text_q},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}},
+            ]
+        return text_q
 
     messages = [
         {"role": "system", "content": system_instruction},
-        {"role": "user", "content": user_content_payload},
+        {"role": "user", "content": _build_user_payload(user_query, provider)},
     ]
 
     global _argon_fail_streak, _argon_cooldown_until
     final_reply = ""
     collected_tool_outputs = []
-    for loop_idx in range(3):
+    tool_round_executed = False
+    for loop_idx in range(4):
         try:
-            # 严格限制最多只允许第 1 轮 (loop_idx == 0) 触发工具调用；第 2 轮起强制 tools=None 直接根据已有信息+自身知识作答，彻底杜绝无限连环搜！
-            active_tools = tools if (loop_idx == 0 and not collected_tool_outputs) else None
+            # 最多允许在尚未执行过工具时触发 1 轮工具调用；工具返回或已进入后期轮次时强制 tools=None 直接作答
+            active_tools = tools if (tools and not tool_round_executed and not collected_tool_outputs and loop_idx < 2) else None
             log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮 (tools={'开' if active_tools else '关-强制总结'})...")
             req_timeout = 45 if provider in ("openai", "gpt") else (24 if target_model == "gemini-4-argon" else 32)
             res = call_routed_llm(provider, target_model, messages, tools=active_tools, timeout=req_timeout, reasoning_effort=route_effort)
@@ -2652,11 +2908,12 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             msg = choice["message"]
 
             if active_tools and (choice.get("finish_reason") == "tool_calls" or msg.get("tool_calls")) and msg.get("tool_calls"):
+                tool_round_executed = True
                 log_msg(f"模型 ({target_model}) 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
                 for tc in msg["tool_calls"][:2]:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"].get("arguments", "{}")
-                    if fn_name == "generate_image" and image_info and image_info.get("local_path") and os.path.exists(image_info["local_path"]):
+                    if fn_name in ("generate_ai_image", "generate_image") and image_info and image_info.get("local_path") and os.path.exists(image_info["local_path"]):
                         try:
                             parsed_args = json.loads(fn_args) if isinstance(fn_args, str) else dict(fn_args or {})
                             if not parsed_args.get("ref_image_path"):
@@ -2682,7 +2939,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 )
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": synth_query},
+                    {"role": "user", "content": _build_user_payload(synth_query, provider)},
                 ]
                 continue
 
@@ -2700,10 +2957,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                tools = None
+                    tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": fallback_query},
+                    {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
             # 如果 Gemini 4 Argon 返回空内容，自动切换 Gemini 3.8 Flash 兜底
@@ -2714,10 +2971,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                tools = None
+                    tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": fallback_query},
+                    {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
             # 如果 Kimi 返回空内容，自动切 Gemini 兜底
@@ -2729,10 +2986,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                tools = None
+                    tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": fallback_query},
+                    {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
         except Exception as e:
@@ -2747,10 +3004,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                tools = None
+                    tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": fallback_query},
+                    {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
             # 如果 Gemini 4 Argon 异常，记录连续失败熔断并降级至 Gemini 3.8 Flash
@@ -2765,10 +3022,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                tools = None
+                    tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": fallback_query},
+                    {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
             # 如果 Gemini 3.8 Flash 发生异常，尝试切换 Kimi 兜底
@@ -2783,7 +3040,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": fallback_query},
+                    {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
             # 如果 Kimi 超时或出错，无缝切换 Gemini 3.8 Flash 兜底
@@ -2795,10 +3052,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 fallback_query = user_query
                 if collected_tool_outputs:
                     fallback_query += "\n\n【系统已为你检索到的实时参考资料】：\n" + "\n".join(collected_tool_outputs)
-                tools = None
+                    tools = None
                 messages = [
                     {"role": "system", "content": system_instruction},
-                    {"role": "user", "content": fallback_query},
+                    {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
             break
@@ -3342,11 +3599,23 @@ def monitor_loop():
                                     raw_msgs = parse_recent_messages_with_vision(
                                         chat_img, bot_names, last_replied_user=last_replied_user, session_active=session_active, chat_box=chat_box, is_private_chat=is_in_private_chat
                                     )
+                                    if not is_in_private_chat and raw_msgs:
+                                        cleaned_raw = []
+                                        for m_item in raw_msgs:
+                                            m_in = m_item.get("is_incoming", True)
+                                            m_s = m_item.get("sender", "")
+                                            m_c = (m_item.get("content") or "").strip()
+                                            if m_in and is_unknown_placeholder_sender(m_s) and not is_explicit_bot_invocation(m_c):
+                                                log_msg(f"【顶边残缺气泡过滤】忽略无昵称残缺气泡 (sender={m_s or '空'}): {m_c[:35]}")
+                                                continue
+                                            cleaned_raw.append(m_item)
+                                        raw_msgs = cleaned_raw
 
                                     cur_session_key = focus_chat if not is_in_private_chat else (raw_msgs[0].get("sender", "好友") if raw_msgs else focus_chat)
                                     for m_item in raw_msgs:
                                         r_img = m_item.get("referenced_image")
-                                        if isinstance(r_img, dict) and r_img.get("has_image"):
+                                        m_sender = m_item.get("sender", "")
+                                        if isinstance(r_img, dict) and r_img.get("has_image") and not is_unknown_placeholder_sender(m_sender):
                                             if r_img.get("_crop_box") and not r_img.get("_img_bytes"):
                                                 try:
                                                     cb = tuple(r_img["_crop_box"])
@@ -3356,7 +3625,7 @@ def monitor_loop():
                                                 except Exception:
                                                     pass
                                             r_img["ts"] = time.time()
-                                            r_img["sender"] = m_item.get("sender", "群友")
+                                            r_img["sender"] = m_sender
                                             last_received_images[cur_session_key] = r_img
 
                                     reply_candidates = []
@@ -3364,11 +3633,10 @@ def monitor_loop():
                                     batch_ts = time.time()
                                     global last_processed_ts
 
-                                    # 1. 时间戳水位线与屏幕底部锚点定位 (cutoff_idx)：
+                                    # 1. 逐条单调递增时间戳水位线与已见索引定位 (floor_ts + seen_indices)：
                                     # 微信窗口自上而下严格按时间由旧到新排列 (t_0 <= t_1 <= ... <= t_n)。
-                                    # 维护单调递增时间戳下界 running_min_ts 与同屏出现次数消费表 consumed_counts：
-                                    # - 若某条消息位于 bot 最新回复下方 (running_min_ts >= last_bot_db_ts)，而它在去重表中的旧记录时间戳 < running_min_ts，
-                                    #   或者同屏上方同名同内容气泡已经消耗掉那条旧时间戳记录，则判定屏幕下方这条是用户再次发送的新消息（绝不误杀重复指令如再次发 'bot 展开说说'）！
+                                    # 即使上方某条消息因 OCR 抖动暂时未命中去重，后续已见气泡或图片仍可推进 floor_ts 与 seen_indices，
+                                    # 同时绝不会越过未见新消息吞掉该条消息！
                                     last_bot_idx = -1
                                     for idx, m_item in enumerate(raw_msgs):
                                         m_in = m_item.get("is_incoming", True)
@@ -3376,50 +3644,47 @@ def monitor_loop():
                                         if m_c and not is_explicit_bot_invocation(m_c) and not m_in:
                                             last_bot_idx = idx
 
-                                    cutoff_idx = -1
-                                    running_min_ts = 0.0
+                                    seen_indices = set()
+                                    msg_floor_ts = [0.0] * len(raw_msgs)
+                                    floor_ts = 0.0
                                     consumed_counts = {}
-                                    hit_unseen = False
                                     for idx, m_item in enumerate(raw_msgs):
+                                        msg_floor_ts[idx] = floor_ts
                                         m_in = m_item.get("is_incoming", True)
                                         m_s = m_item.get("sender", "群友")
                                         m_c = (m_item.get("content") or "").strip()
                                         if not m_c:
+                                            seen_indices.add(idx)
                                             continue
                                         if is_explicit_bot_invocation(m_c):
                                             m_in = True
                                         if not m_in:
-                                            matched_bot_t = match_and_consume_seen_ts("bot", m_c, running_min_ts, consumed_counts)
-                                            # 防丢单核心铁律：若同屏上方已出现未处理的新消息 (hit_unseen=True)，
-                                            # 严禁将 cutoff_idx 和 running_min_ts 越过新消息推进到下方的机器人回复气泡！
-                                            # 否则该未处理消息会被错误切入旧消息区，被静默吞掉丢弃。
-                                            if not hit_unseen:
-                                                if matched_bot_t is not None:
-                                                    running_min_ts = max(running_min_ts, matched_bot_t)
-                                                if idx == last_bot_idx and last_bot_db_ts > 0:
-                                                    running_min_ts = max(running_min_ts, last_bot_db_ts)
-                                                cutoff_idx = max(cutoff_idx, idx)
-                                            mark_seen("bot", m_c, ts=running_min_ts or last_processed_ts, only_if_missing=True)
+                                            matched_bot_t = match_and_consume_seen_ts("bot", m_c, floor_ts, consumed_counts)
+                                            seen_indices.add(idx)
+                                            if matched_bot_t is not None:
+                                                floor_ts = max(floor_ts, matched_bot_t)
+                                            elif idx == last_bot_idx and last_bot_db_ts >= floor_ts - 1.5:
+                                                floor_ts = max(floor_ts, last_bot_db_ts)
+                                            mark_seen("bot", m_c, ts=floor_ts or last_processed_ts, only_if_missing=True)
                                         else:
-                                            matched_t = match_and_consume_seen_ts(m_s, m_c, running_min_ts, consumed_counts)
+                                            matched_t = match_and_consume_seen_ts(m_s, m_c, floor_ts, consumed_counts)
+                                            if matched_t is None:
+                                                r_img = m_item.get("referenced_image")
+                                                if isinstance(r_img, dict) and r_img.get("has_image"):
+                                                    matched_t = match_seen_image_ts(m_s, r_img, chat_img, min_ts=floor_ts)
+                                            if matched_t is None and idx == 0:
+                                                matched_t = match_scrolled_top_fragment_ts(m_c, min_ts=floor_ts)
                                             if matched_t is not None or is_in_task_queue(m_s, m_c):
-                                                if not hit_unseen:
-                                                    if matched_t is not None:
-                                                        running_min_ts = max(running_min_ts, matched_t)
-                                                    cutoff_idx = max(cutoff_idx, idx)
-                                            else:
-                                                hit_unseen = True
+                                                seen_indices.add(idx)
+                                                if matched_t is not None:
+                                                    floor_ts = max(floor_ts, matched_t)
+                                                mark_seen(m_s, m_c, ts=matched_t or floor_ts or last_processed_ts, only_if_missing=True)
 
-                                    # 将水位线及上方所有旧消息的当前 OCR 文本变体静默补充至去重表（only_if_missing=True 不覆盖原历史时间戳）
-                                    for idx in range(0, cutoff_idx + 1):
-                                        m_old = raw_msgs[idx]
-                                        c_old = (m_old.get("content") or "").strip()
-                                        if c_old:
-                                            mark_seen(m_old.get("sender", "群友"), c_old, ts=running_min_ts or last_processed_ts, only_if_missing=True)
-
-                                    # 2. 仅对水位线下方 (idx > cutoff_idx) 的增量新消息打上新批次时间戳 batch_ts 并按批次处理
-                                    for idx in range(cutoff_idx + 1, len(raw_msgs)):
-                                        msg_item = raw_msgs[idx]
+                                    # 2. 仅对未命中历史水位线的增量新消息打上批次时间戳 batch_ts 并按批次处理
+                                    for idx, msg_item in enumerate(raw_msgs):
+                                        if idx in seen_indices:
+                                            continue
+                                        cur_min_ts = msg_floor_ts[idx]
                                         is_in = msg_item.get("is_incoming", True)
                                         s = msg_item.get("sender", "群友")
                                         c = msg_item.get("content", "").strip()
@@ -3432,11 +3697,9 @@ def monitor_loop():
                                         if not c:
                                             continue
 
-                                        # Deduplicate against messages after running_min_ts & pending queue
-                                        if is_recent_duplicate(s, c, min_ts=running_min_ts) or is_in_task_queue(s, c):
+                                        # Deduplicate against messages after per-message floor_ts & pending queue
+                                        if is_recent_duplicate(s, c, min_ts=cur_min_ts) or is_in_task_queue(s, c):
                                             continue
-
-                                        new_msg_count += 1
 
                                         # 检查是否为最高优先级强行召唤指令 (@AIbot 或 bot 开头)
                                         is_explicit = is_explicit_bot_invocation(c)
@@ -3450,6 +3713,13 @@ def monitor_loop():
                                         has_q = q_info.get("has_quote", False) if isinstance(q_info, dict) else False
                                         has_img = img_info.get("has_image", False) if isinstance(img_info, dict) else False
                                         has_file = file_att.get("has_file", False) if isinstance(file_att, dict) else False
+
+                                        if has_img and match_seen_image_ts(s, img_info, chat_img, min_ts=cur_min_ts) is not None:
+                                            log_msg(f"【图片指纹去重】同一张图片 OCR 描述变化，按 dHash 自动去重跳过 (sender={s})")
+                                            mark_seen(s, c, ts=batch_ts, only_if_missing=True)
+                                            continue
+
+                                        new_msg_count += 1
 
                                         file_info = None
                                         session_key = s if is_in_private_chat else focus_chat
@@ -3487,16 +3757,23 @@ def monitor_loop():
                                             saved_img_path = save_incoming_image(s, img_info, chat_img, msg_ts=batch_ts)
                                             if saved_img_path:
                                                 img_info["local_path"] = saved_img_path
-                                            img_info["ts"] = time.time()
-                                            img_info["sender"] = s
-                                            last_received_images[session_key] = img_info
+                                            if not is_unknown_placeholder_sender(s):
+                                                img_info["ts"] = time.time()
+                                                img_info["sender"] = s
+                                                last_received_images[session_key] = img_info
                                             if img_info.get("image_type"):
                                                 rec_c = f"[附图: {img_info.get('image_type')}] " + rec_c
                                         if has_file and file_att.get("file_name"):
                                             rec_c = f"[文件: {file_att.get('file_name')}] " + (rec_c if rec_c and not rec_c.startswith("[发送文件") else "")
 
+                                        # 占位未知昵称的背景消息绝不污染历史库；若显式 @bot 则允许正常回复
+                                        if (not is_in_private_chat) and is_in and is_unknown_placeholder_sender(s) and not is_explicit:
+                                            mark_seen(s, c, ts=batch_ts)
+                                            continue
+
                                         # 写入当前批次时间戳 batch_ts 并立即注册去重时间戳，持久化关联本地图片路径
-                                        save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m, msg_ts=batch_ts, image_path=saved_img_path)
+                                        if not ((not is_in_private_chat) and is_in and is_unknown_placeholder_sender(s)):
+                                            save_msg(s, rec_c, is_bot=not is_in, is_mentioned=is_m, msg_ts=batch_ts, image_path=saved_img_path)
                                         mark_seen(s, c, ts=batch_ts)
                                         last_processed_ts = batch_ts
 
@@ -4358,6 +4635,12 @@ async function loadSerperKeys() {
   } catch (e) {}
 }
 
+function escHtml(str) {
+  return String(str == null ? '' : str).replace(/[&<>"']/g, function(ch) {
+    return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+  });
+}
+
 function renderSerperKeys(d) {
   const container = document.getElementById('serper-keys-list');
   if (!d.active_keys || d.active_keys.length === 0) {
@@ -4368,13 +4651,15 @@ function renderSerperKeys(d) {
   d.active_keys.forEach((k, idx) => {
     const isPri = idx === 0;
     const tag = isPri ? '<span class="badge badge-ok">当前主力 (优先调用)</span>' : `<span class="badge badge-info">后备 #${idx}</span>`;
+    const safeMasked = escHtml(k.masked || '***');
+    const safeId = escHtml(k.id || k.masked || '');
     html += `
       <div style="display:flex; align-items:center; justify-content:space-between; background:#050811; border:1px solid #1e293b; padding:8px 12px; border-radius:6px; margin-bottom:6px;">
         <div style="display:flex; align-items:center; gap:8px;">
-          <span style="font-family:monospace; font-size:13px; color:#f1f5f9;">${k.masked}</span>
+          <span style="font-family:monospace; font-size:13px; color:#f1f5f9;">${safeMasked}</span>
           ${tag}
         </div>
-        <button class="tool-btn btn-danger" style="flex:none; min-width:auto; padding:3px 10px; font-size:11px;" onclick="removeSerperKey('${k.id || k.masked}')">🗑️ 废弃/移除</button>
+        <button class="tool-btn btn-danger" style="flex:none; min-width:auto; padding:3px 10px; font-size:11px;" data-key-id="${safeId}" onclick="removeSerperKey(this.dataset.keyId)">🗑️ 废弃/移除</button>
       </div>
     `;
   });
@@ -4386,7 +4671,7 @@ function renderSerperKeys(d) {
     d.exhausted_keys.forEach(e => {
       exhHtml += `
         <div style="font-size:11px; color:#64748b; font-family:monospace; padding:5px 0; border-bottom:1px dashed #1e293b;">
-          ❌ ${e.masked || '***'} — ${e.discarded_at} (${e.reason || '额度用完'})
+          ❌ ${escHtml(e.masked || '***')} — ${escHtml(e.discarded_at || '')} (${escHtml(e.reason || '额度用完')})
         </div>
       `;
     });
@@ -4541,6 +4826,26 @@ def reap_stale_appex_and_temp_files(min_appex_age_sec: int = 900):
         pass
 
 
+_CF_NETWORKS = tuple(ipaddress.ip_network(cidr) for cidr in (
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+    "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
+    "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32",
+    "2405:8100::/32", "2a06:98c0::/29", "2c0f:f248::/32",
+))
+
+
+def _is_cloudflare_ip(ip_str: str) -> bool:
+    try:
+        ip_obj = ipaddress.ip_address(ip_str.split("%", 1)[0].strip())
+        if isinstance(ip_obj, ipaddress.IPv6Address) and ip_obj.ipv4_mapped:
+            ip_obj = ip_obj.ipv4_mapped
+        return any(ip_obj in net for net in _CF_NETWORKS)
+    except Exception:
+        return False
+
+
 class BotHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
@@ -4548,10 +4853,13 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
     def _client_ip(self) -> str:
         peer_ip = self.client_address[0] if self.client_address else "unknown"
         if peer_ip in ("127.0.0.1", "::1"):
+            real_ip = (self.headers.get("X-Real-IP") or "").strip()
             cf_ip = (self.headers.get("CF-Connecting-IP") or "").strip()
-            if cf_ip:
+            if real_ip and cf_ip and _is_cloudflare_ip(real_ip):
                 return cf_ip
-            xff = (self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+            if real_ip:
+                return real_ip
+            xff = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
             if xff:
                 return xff
         return peer_ip
@@ -4712,6 +5020,12 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def do_POST(self):
+        origin = (self.headers.get("Origin") or "").strip()
+        host_hdr = (self.headers.get("Host") or "").strip().lower()
+        if origin and host_hdr and urlparse(origin).netloc.lower() != host_hdr:
+            self._send_json({"ok": False, "error": "Origin mismatch"}, code=403)
+            return
+
         parsed = urlparse(self.path)
         length = min(int(self.headers.get("Content-Length", "0")), 262144)
         try:
@@ -4724,6 +5038,10 @@ class BotHTTPHandler(BaseHTTPRequestHandler):
             client_ip = self._client_ip()
             now_ts = time.time()
             with _login_lock:
+                if len(_login_failures) > 1024:
+                    stale_ips = [ip for ip, ts_l in _login_failures.items() if not ts_l or (now_ts - ts_l[-1] >= 600)]
+                    for sip in stale_ips:
+                        _login_failures.pop(sip, None)
                 recent_fails = [t for t in _login_failures.get(client_ip, []) if now_ts - t < 600]
                 _login_failures[client_ip] = recent_fails
                 if len(recent_fails) >= 8:

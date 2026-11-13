@@ -5,6 +5,7 @@ Network Plugin: IP Geolocation & Domain Lookup
 Provides IP address geographic location, ISP, and ASN information via ip-api.com.
 """
 
+import urllib.parse
 import urllib.request
 import json
 import re
@@ -35,8 +36,11 @@ class NetworkPlugin(BasePlugin):
         target = (ip or "").strip()
         if not target:
             return {"error": "未提供要查询的 IP 地址"}
+        if not re.fullmatch(r'[a-zA-Z0-9.\-:]{1,253}', target):
+            return {"error": "无效的 IP 地址或域名格式"}
 
-        url = f"http://ip-api.com/json/{target}?lang=zh-CN"
+        enc_target = urllib.parse.quote(target, safe=":")
+        url = f"http://ip-api.com/json/{enc_target}?lang=zh-CN"
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "WeChatBot/2.0"})
             with urllib.request.urlopen(req, timeout=6) as r:

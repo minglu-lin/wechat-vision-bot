@@ -10,6 +10,7 @@ and Pivot Points support/resistance boundaries.
 import math
 import re
 import json
+import urllib.parse
 import urllib.request
 from typing import Dict, List, Optional, Tuple, Any
 
@@ -77,11 +78,59 @@ class StockDataEngine:
     }
 
     @classmethod
+    def resolve_chinese_stock(cls, query: str) -> Optional[str]:
+        """Resolve an arbitrary Chinese stock/ETF/index name via Tencent Smartbox API."""
+        q = (query or "").strip()
+        if not q or len(q) > 24:
+            return None
+        try:
+            url = f"https://smartbox.gtimg.cn/s3/?v=2&q={urllib.parse.quote(q)}&t=all"
+            req = urllib.request.Request(url, headers={
+                "User-Agent": cls.HEADERS["User-Agent"],
+                "Referer": "https://gu.qq.com/",
+            })
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                raw = resp.read().decode("utf-8", errors="ignore")
+            m = re.search(r'v_hint="([^"]+)"', raw)
+            if not m:
+                return None
+            hint = m.group(1).encode("utf-8").decode("unicode_escape", errors="ignore")
+            candidates = []
+            for item in hint.split("^"):
+                parts = item.split("~")
+                if len(parts) < 3:
+                    continue
+                mkt, code = parts[0].strip().lower(), parts[1].strip()
+                cat = parts[4].strip().upper() if len(parts) > 4 else ""
+                if not mkt or not code:
+                    continue
+                if mkt in ("sh", "sz", "bj") and re.fullmatch(r'\d{6}', code):
+                    sym = f"{mkt}{code}"
+                elif mkt == "hk" and re.fullmatch(r'\d{1,5}', code):
+                    sym = f"hk{code.zfill(5)}"
+                elif mkt == "us":
+                    clean_us = re.sub(r'\.(?:OQ|N|AM|ARCA|PK)$', '', code.upper())
+                    if not re.fullmatch(r'[A-Z\.]{1,8}', clean_us):
+                        continue
+                    sym = clean_us
+                else:
+                    continue
+                # Prefer GP (stock), ETF, ZS (index) over bonds/futures
+                priority = 0 if ("GP" in cat or "ETF" in cat or "ZS" in cat) else 1
+                candidates.append((priority, sym))
+            if candidates:
+                candidates.sort(key=lambda x: x[0])
+                return candidates[0][1]
+        except Exception:
+            pass
+        return None
+
+    @classmethod
     def normalize_symbol(cls, raw_symbol: str) -> Tuple[str, str, str, str, str]:
         """
         Normalize input into standard codes.
         Returns: (clean_code, market_type, tencent_realtime_code, tencent_kline_code, eastmoney_secid)
-        market_type: 'a_share' | 'hk_share' | 'us_share' | 'cn_index' | 'hk_index' | 'us_index'
+        market_type: 'a_share' | 'hk_share' | 'us_share' | 'cn_index' | 'hk_index' | 'us_index' | 'unknown'
         """
         s = (raw_symbol or "").strip()
         # 1. Alias lookup
@@ -134,10 +183,17 @@ class StockDataEngine:
             code = m_hk.group(2)
             return code, "hk_share", f"hk{code}", f"hk{code}", f"116.{code}"
 
+        # 6.5 Dynamic lookup for arbitrary Chinese names (e.g. 泡泡玛特, 老铺黄金, 中概互联)
+        if re.search(r'[\u4e00-\u9fff]', s):
+            resolved = cls.resolve_chinese_stock(s)
+            if resolved and not re.search(r'[\u4e00-\u9fff]', resolved):
+                return cls.normalize_symbol(resolved)
+            return "", "unknown", "", "", ""
+
         # 7. US Share / ETF (letters)
         ticker = re.sub(r'[^A-Z\.]', '', s_clean)
         if not ticker:
-            ticker = "NVDA"
+            return "", "unknown", "", "", ""
         return ticker, "us_share", f"s_us{ticker}", f"us{ticker}", f"105.{ticker}"
 
     @staticmethod
@@ -595,6 +651,10 @@ class TechnicalQuantEngine:
         }
 
 
+_KNOWN_CN_PATTERN = "|".join(re.escape(k) for k in sorted(NAME_TO_CODE.keys(), key=len, reverse=True))
+_SAFE_TICKER_OR_CN = rf'(?:[A-Za-z0-9\.\^]{{1,8}}|(?:sh|sz|bj|hk)\d{{5,6}}|{_KNOWN_CN_PATTERN})'
+
+
 class StockQuantPlugin(BasePlugin):
     name = "analyze_stock"
     description = (
@@ -619,10 +679,15 @@ class StockQuantPlugin(BasePlugin):
     }
 
     # Fast-Path patterns for instant quote inquiry (0-token, <100ms)
+    # Note: generic words like 价格/行情/多少钱 are restricted to ASCII tickers or known aliases
+    # to avoid capturing general queries like "猪肉价格 @Albot".
     fast_patterns = [
-        r'^(?:查一下?|看下?|查询?)?\s*(?:实时|最新)?\s*(?P<symbol>[A-Za-z0-9\.\^]+|[\u4e00-\u9fa5]{2,6})\s*(?:实时|最新)?\s*(?:股价|价格|行情|盘口|现价)$',
-        r'^(?:股价|行情|盘口)\s*(?P<symbol>[A-Za-z0-9\.\^]+|[\u4e00-\u9fa5]{2,6})$',
-        r'^(?:查一下?|看下?|查询?)?\s*(?P<symbol>[A-Za-z0-9\.\^]+|[\u4e00-\u9fa5]{2,6})\s*(?:现在|目前)?\s*(?:多少钱|多少点|现价是多少)$',
+        r'^(?:查一下?|看下?|查询?)?\s*(?:实时|最新)?\s*(?P<symbol>[A-Za-z0-9\.\^]+|[\u4e00-\u9fa5]{2,8})\s*(?:实时|最新)?\s*(?:股价|股票行情|盘口|现价)$',
+        rf'^(?:查一下?|看下?|查询?)?\s*(?:实时|最新)?\s*(?P<symbol>{_SAFE_TICKER_OR_CN})\s*(?:实时|最新)?\s*(?:价格|行情)$',
+        r'^(?:股价|股票行情|盘口)\s*(?P<symbol>[A-Za-z0-9\.\^]+|[\u4e00-\u9fa5]{2,8})$',
+        rf'^(?:行情)\s*(?P<symbol>{_SAFE_TICKER_OR_CN})$',
+        r'^(?:查一下?|看下?|查询?)?\s*(?P<symbol>[A-Za-z0-9\.\^]+|[\u4e00-\u9fa5]{2,8})\s*(?:现在|目前)?\s*(?:多少点|现价是多少)$',
+        rf'^(?:查一下?|看下?|查询?)?\s*(?P<symbol>{_SAFE_TICKER_OR_CN})\s*(?:现在|目前)?\s*(?:多少钱)$',
     ]
 
     @classmethod
@@ -635,6 +700,7 @@ class StockQuantPlugin(BasePlugin):
             return None
         t = text.strip()
         t = re.sub(r'^(?:@\S+\s*|bot\s*|albot\s*|aibot\s*|小号\s*|：|:|,|，)+', '', t, flags=re.IGNORECASE).strip()
+        t = re.sub(r'(?:\s*@\s*(?:aibot|albot|bot|微信小号)\S*)+$', '', t, flags=re.IGNORECASE).strip()
 
         stock_kws = [
             "分析", "技术面", "基本面", "k线", "走势", "操盘", "压力位", "支撑位",
@@ -681,6 +747,8 @@ class StockQuantPlugin(BasePlugin):
 
         # 1. Normalize code and market routing
         clean_code, market_type, tc_code, kline_code, secid = StockDataEngine.normalize_symbol(sym)
+        if market_type == "unknown" or not clean_code:
+            return {"error": f"未找到股票标的‘{sym}’"}
 
         # 2. Fetch real-time pan-kou quote
         quote = StockDataEngine.fetch_realtime_quote(tc_code, market_type, clean_code)

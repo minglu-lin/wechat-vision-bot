@@ -33,7 +33,8 @@ def cmd_list():
         print("❌ 当前无可用 Key！")
     for item in status["active_keys"]:
         pri_str = "【当前主力 (优先调用)】" if item["is_primary"] else f"【后备 #{item['index']}】"
-        print(f"  [{item['index']+1}] {item['key']} {pri_str}")
+        disp = item.get("masked") or item.get("id", "***")
+        print(f"  [{item['index']+1}] {disp} {pri_str}")
     if status.get("exhausted_keys"):
         print("\n" + "-" * 65)
         print("🗑️ 已废弃/用尽的 Key：")

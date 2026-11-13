@@ -23,6 +23,8 @@ import time
 from PIL import Image
 from .base import BasePlugin, safe_http_get_bytes
 
+Image.MAX_IMAGE_PIXELS = 36_000_000
+
 # Global image sender hook registered by daemon
 _IMAGE_SENDER = None
 
@@ -235,15 +237,10 @@ class GenerateImagePlugin(BasePlugin):
 
             enc_prompt = urllib.parse.quote(p)
             url = f"https://image.pollinations.ai/prompt/{enc_prompt}?width={w}&height={h}&nologo=true&seed={seed}"
-            local_raw = f"/tmp/wechat_ai_gen_{seed}_raw"
 
             try:
-                req = urllib.request.Request(url, headers={"User-Agent": "WeChatBot/2.0"})
-                with urllib.request.urlopen(req, timeout=25) as r:
-                    raw = r.read()
-                with open(local_raw, "wb") as f:
-                    f.write(raw)
-                Image.open(local_raw).convert("RGB").save(local_png, "PNG")
+                raw, _, _ = safe_http_get_bytes(url, headers={"User-Agent": "WeChatBot/2.0"}, timeout=25, max_bytes=12 * 1024 * 1024)
+                Image.open(io.BytesIO(raw)).convert("RGB").save(local_png, "PNG")
             except Exception as e:
                 return {"error": f"AI 绘画服务请求异常: {e}"}
 
@@ -314,7 +311,6 @@ class SearchImagePlugin(BasePlugin):
             search_kw += " 表情包"
 
         seed = random.randint(1000, 9999999)
-        local_raw = f"/tmp/wechat_search_{seed}_raw"
         local_png = f"/tmp/wechat_search_{seed}.png"
         headers_dl = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -343,13 +339,9 @@ class SearchImagePlugin(BasePlugin):
                             if not img_url:
                                 continue
                             try:
-                                req2 = urllib.request.Request(img_url, headers=headers_dl)
-                                with urllib.request.urlopen(req2, timeout=8) as r2:
-                                    data = r2.read()
+                                data, _, _ = safe_http_get_bytes(img_url, headers=headers_dl, timeout=8, max_bytes=10 * 1024 * 1024)
                                 if len(data) >= 5000:
-                                    with open(local_raw, "wb") as f:
-                                        f.write(data)
-                                    im = Image.open(local_raw)
+                                    im = Image.open(io.BytesIO(data))
                                     if im.width >= 100 and im.height >= 100:
                                         im.convert("RGB").save(local_png, "PNG")
                                         if _IMAGE_SENDER:
@@ -387,13 +379,9 @@ class SearchImagePlugin(BasePlugin):
             if murls:
                 for target_url in murls[:4]:
                     try:
-                        req2 = urllib.request.Request(target_url, headers=headers_dl)
-                        with urllib.request.urlopen(req2, timeout=8) as r2:
-                            data = r2.read()
+                        data, _, _ = safe_http_get_bytes(target_url, headers=headers_dl, timeout=8, max_bytes=10 * 1024 * 1024)
                         if len(data) >= 5000:
-                            with open(local_raw, "wb") as f:
-                                f.write(data)
-                            im = Image.open(local_raw)
+                            im = Image.open(io.BytesIO(data))
                             if im.width >= 100 and im.height >= 100:
                                 im.convert("RGB").save(local_png, "PNG")
                                 if _IMAGE_SENDER:

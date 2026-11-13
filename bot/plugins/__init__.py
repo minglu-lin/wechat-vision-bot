@@ -82,9 +82,10 @@ class PluginManager:
         if not user_content:
             return False, None
 
-        # Clean leading bot / @bot prefix for cleaner pattern matching
+        # Clean leading and trailing bot / @bot prefix for cleaner pattern matching
         c = user_content.strip()
         c = re.sub(r'^(?:@\S+\s*|bot\s*|albot\s*|aibot\s*|小号\s*|：|:|,|，)+', '', c, flags=re.IGNORECASE).strip()
+        c = re.sub(r'(?:\s*@\s*(?:aibot|albot|bot|微信小号)\S*)+$', '', c, flags=re.IGNORECASE).strip()
         if not c:
             return False, None
 
@@ -93,6 +94,8 @@ class PluginManager:
             if kwargs is not None:
                 try:
                     res = plugin.execute(**kwargs)
+                    if isinstance(res, dict) and res.get("error"):
+                        continue
                     reply = plugin.format_fast_reply(res)
                     if reply:
                         return True, reply
