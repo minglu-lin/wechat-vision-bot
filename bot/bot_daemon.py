@@ -180,6 +180,40 @@ def match_seen_image_ts(sender: str, img_info: dict, chat_img=None, min_ts: floa
     return None
 
 
+def is_bot_sent_image(img_info: dict, chat_img=None, max_age: float = 1800.0) -> bool:
+    """Check if an extracted image bubble matches a chart/image recently sent by the bot itself."""
+    if not isinstance(img_info, dict):
+        return False
+    dhash = img_info.get("_dhash")
+    if dhash is None:
+        pil_crop = None
+        if img_info.get("_img_bytes"):
+            try:
+                pil_crop = Image.open(io.BytesIO(img_info["_img_bytes"]))
+            except Exception:
+                pil_crop = None
+        elif img_info.get("_crop_box") and chat_img is not None:
+            try:
+                pil_crop = chat_img.crop(tuple(img_info["_crop_box"]))
+            except Exception:
+                pil_crop = None
+        dhash = compute_pil_dhash(pil_crop)
+        if dhash is not None:
+            img_info["_dhash"] = dhash
+    if dhash is None:
+        return False
+
+    now = time.time()
+    for rec in reversed(seen_image_hashes):
+        if rec.get("sender") != "bot":
+            continue
+        if now - rec["ts"] >= max_age:
+            continue
+        if hamming_distance_64(dhash, rec["dhash"]) <= 16:
+            return True
+    return False
+
+
 def match_scrolled_top_fragment_ts(content: str, min_ts: float = 0.0, max_age: float = 21600.0):
     """Match a top-edge partial OCR fragment if it is a substring of an earlier full message."""
     c_clean = normalize_dedup_text(content)
@@ -1671,6 +1705,15 @@ def x11_send_image(image_path_or_url):
         log_msg("发送图片失败: 微信未登录")
         return False, "WeChat not logged in yet"
 
+    sent_dhash = None
+    try:
+        with Image.open(local_path) as sent_im:
+            sent_dhash = compute_pil_dhash(sent_im)
+        if sent_dhash is not None:
+            register_seen_image_hash(sent_dhash, "bot", time.time(), local_path)
+    except Exception:
+        sent_dhash = None
+
     env = os.environ.copy()
     env["DISPLAY"] = ":99"
     xclip_bin = "/usr/local/bin/xclip" if os.path.exists("/usr/local/bin/xclip") else "xclip"
@@ -1714,6 +1757,8 @@ def x11_send_image(image_path_or_url):
         d.close()
 
     last_send_ts = time.time()
+    if sent_dhash is not None:
+        register_seen_image_hash(sent_dhash, "bot", last_send_ts, local_path)
     log_msg(f"已向微信发送图片: {local_path}")
     return True, "OK"
 
@@ -1799,7 +1844,11 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
     根据微信‘引用’或语义提问精准溯源本地图片记录：
     1. 引用溯源：若引用了某人且引用内容包含 [图片] 或图，精准对齐该人发送的历史本地图片
     2. 语义问图：若提问显式涉及读图、看图、分析图，优先对齐提问者本人近期发图，再对齐会话最近实质图片
+    （若用户是在要求本机绘制/生成金融价格走势图，直接返回 None，严禁误绑群聊旧图片！）
     """
+    if FinancialChartPlugin and FinancialChartPlugin.is_chart_generation_request(query_text or ""):
+        return None
+
     now = time.time()
     # 1. 微信引用优先精准匹配
     if quote_info and quote_info.get("has_quote"):
@@ -1808,7 +1857,7 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
         # 若引用内容为文章卡片/链接，绝不误认为图片引用！
         if any(kw in q_content for kw in ["🔗", "《", "http", "mp.weixin.qq.com", "分享文章卡片"]):
             return None
-        is_quote_img = any(kw in q_content for kw in ["[图片]", "图", "照片", "截图", "chart", "image"]) or not q_content
+        is_quote_img = any(kw in q_content for kw in ["[图片]", "照片", "截图", "chart", "image"]) or not q_content
         if is_quote_img:
             # 从最近的图片记录倒序查找匹配的 sender
             for rec in reversed(recent_image_records):
@@ -1820,12 +1869,13 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
                         log_msg(f"【本地图片精准引用命中】对齐引用 [{q_sender}: {q_content[:20]}] -> 本地图片: {rec['image_path']}")
                         return rec
 
-    # 2. 语义问图匹配最近本地图片（必须显式包含看图/读图/图片类词汇，严禁分析/数据/内容等泛化词）
+    # 2. 语义问图匹配最近本地图片（必须显式指向已上传图片，严禁裸词‘走势图’/‘图片’劫持生图与制图请求）
     c = (query_text or "").lower()
     img_kws = [
         "看图", "读图", "这张图", "这个图", "这张照片", "这个照片", "新闻图",
-        "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中",
-        "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图",
+        "上面这个图", "上面这张图", "看下这个图", "看下这张图", "我的这个图", "我的这张图",
+        "图里", "图上", "截图中", "截图里", "照片里", "图片里", "图中的", "图片内容", "图上的字",
+        "这张走势图", "这个走势图", "这张k线图", "这个k线图",
     ]
     if any(kw in c for kw in img_kws):
         asker_norm = normalize_dedup_sender(asker) if asker and not is_unknown_placeholder_sender(asker) else ""
@@ -2202,9 +2252,9 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条完整消息列表（包括对方发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
             f"{top_clip_rule}"
             f"针对每条消息，提取以下字段：\n"
-            f"1. sender: 对方好友昵称（查看聊天窗口顶部标题所显示的名称，或者对方发送的白色气泡发送者）\n"
+            f"1. sender: 对方好友昵称（查看聊天窗口顶部标题所显示的名称，或者左侧白色气泡发送者；若是紧贴右侧头像发出的绿色气泡或右侧无边框图片/走势图，则统一填 'bot'）\n"
             f"2. content: 消息主体文本内容（若是文件卡片，提取文件名并格式化为 '[发送文件: 文件名]'；若是图片，简要描述图片类型与核心画面）\n"
-            f"3. is_incoming: 是否是对方发送的左侧白色气泡（true 为对方发送，false 为右侧绿色气泡我们自己/bot 发送）\n"
+            f"3. is_incoming: 是否是对方从左侧头像发送的消息（true 为左侧对方发送的白色气泡或左侧图片；false 为紧贴右侧头像由我们自己/bot 发送的绿色气泡或右侧图片/图表，注意 bot 自己发的图片没有绿色背景但紧贴右侧头像！）\n"
             f"4. is_mentioned: 【私聊核心原则】：在 1 对 1 私聊中，对方发送的任何消息（is_incoming=True）都是直接对 bot 说的！因此只要对方发送了有效提问、指令或闲聊，is_mentioned 必须强制设为 true（无需 @bot 或 bot 关键字）！如果是敷衍附和或无意义标点，可设为 false。\n"
             f"5. is_followup: 是否是对上一轮回答的连续追问（若是追问设为 true，否则 false）\n"
             f"6. is_top_clipped: 该气泡/卡片是否紧贴截图最顶边且上半截（或发送者昵称）被裁切残缺？（完整消息填 false，顶边残缺消息填 true）\n"
@@ -2240,9 +2290,9 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
             f"请自上而下（按时间由旧到新顺序）提取聊天记录区域中可见的最新的 1~6 条完整消息列表（包括群友发的白色气泡、我们自己发的绿色气泡、图片消息以及文件卡片）：\n\n"
             f"{top_clip_rule}"
             f"针对每条消息，提取以下字段：\n"
-            f"1. sender: 发送者群昵称（若是右侧绿色气泡，则为我们自己/bot；若顶边被截断看不到昵称则直接丢弃该条）\n"
+            f"1. sender: 发送者群昵称（若是右侧绿色气泡或紧贴右侧头像发出的图片/走势图，均为我们自己发送，sender 统一填 'bot'；若顶边被截断看不到昵称则直接丢弃该条）\n"
             f"2. content: 消息主体文本内容（若是文件卡片，提取文件名并格式化为 '[发送文件: 文件名]'；若是图片，简要描述图片类型与核心画面）\n"
-            f"3. is_incoming: 是否是群友发送的左侧白色气泡（true 为群友发送，false 为右侧绿色气泡）\n"
+            f"3. is_incoming: 是否是群友从左侧头像发送的消息（true 为左侧头像旁群友发送的白色气泡或左侧图片/卡片；false 为紧贴右侧头像由我们自己/bot 发送的绿色气泡或右侧图片/走势图，注意我们自己发的图片没有绿色气泡背景但紧贴右侧头像！）\n"
             f"4. is_mentioned: 该消息是否在【显式呼叫/指令召唤】bot？\n"
             f"   - 【用户最高铁律】：只要消息中显式包含 @AIbot、@Albot、@bot、@微信小号（无论位于句首、句中还是句尾，如 'xxx @Albot' 或 '@AIbot xxx'），或者以 bot、aibot 开头（如 'bot ...'），无论后面是什么内容，is_mentioned 必须强制为 true！\n"
             f"   - 【严格禁忌1】：如果群友是在 @其他群成员（例如 '@张三 ...'、'@黄嘉诚 ...'，@后面跟的不是 AIbot/Albot/bot），绝对不属于呼叫 bot，is_mentioned 必须为 false！\n"
@@ -2362,6 +2412,10 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
                             )
                             if (crop_box[2] - crop_box[0] >= 70) and (crop_box[3] - crop_box[1] >= 70):
                                 ref_img["_crop_box"] = list(crop_box)
+                                if xmin >= 380 and xmax >= 820 and not is_explicit_bot_invocation(m.get("content", "")):
+                                    # 紧贴右侧自身头像发出的大图/走势图气泡，强制归属 bot 防止回声误认为群友发图
+                                    m["is_incoming"] = False
+                                    m["sender"] = "bot"
                                 if chat_box:
                                     screen_cx = chat_box[0] + int(((xmin + xmax) / 2) * (chat_box[2] - chat_box[0]) / 1000)
                                     screen_cy = chat_box[1] + int(((ymin + ymax) / 2) * (chat_box[3] - chat_box[1]) / 1000)
@@ -2976,7 +3030,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"  • 全网搜图与真实照片 (search_image)：搜索真实人物照片、名人、新闻事件图片、高清壁纸或表情包并直接发送到微信聊天中。当群友要求'搜索xxx的照片'、'看下xxx长啥样'、'发一张xxx的图'、'找一张xxx壁纸'时，必须立即调用 search_image！\n"
         f"  • 网页图片提取与发送 (send_webpage_image)：从网页链接（HTTP/HTTPS/微信公众号文章）中提取真实正文照片、合影、配图并直接发送到微信聊天中！当群友询问'把网页里的图发出来'、'这个网页也有照片啊'、'你就不能发出来图片吗'、'发下照片'时，必须立即调用 send_webpage_image！\n"
         f"- 当群友提出绘画、作图、生图、重制照片、改图等诉求时，请优先调用 generate_ai_image；当群友要求找真实照片、看图、要某类表情包或壁纸时，调用 search_image；当群友要求发送网页/文章内的照片时，调用 send_webpage_image。\n"
-        f"- 调用生图、搜图或网页发图工具后，系统已自动把图片发送到微信窗口中，你只需自然亲切地告知对方图片已发送，并用一两句话简要介绍画面内容即可，绝对严禁说'我发不了图片'！\n"
+        f"- 仅当本轮已实际调用制图/生图/搜图/网页发图工具且返回 image_sent_to_wechat=true（或下方明确注入了【系统已通过本机真实数据脚本绘制并将高清走势图直接发送到了微信群聊窗口中】）时，才可自然告知对方‘图已发’并用一两句话简要解读；若本轮上下文未包含上述真实发图成功回执，绝对严禁模仿历史聊天记录谎称‘图已发’、‘走势图发群里了’或‘这次真发了’！若尚未发图且工具可用，请直接调用对应发图工具。\n"
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
@@ -3198,9 +3252,15 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         # 3.4 针对经济/股票/大宗商品/汇率/国债等价格走势图请求：本机脚本拉取真实历史数据与 buffett.lmlu.de 估值直接绘图发送（非AI生图）
         chart_handled = False
         chart_intent = None
-        if FinancialChartPlugin and not (image_info and image_info.get("has_image")):
+        is_chart_req = bool(FinancialChartPlugin and FinancialChartPlugin.is_chart_generation_request(content))
+        has_direct_upload = bool(image_info and image_info.get("has_image") and image_info.get("_crop_box"))
+        if FinancialChartPlugin and not has_direct_upload:
             try:
-                chart_intent = FinancialChartPlugin.extract_chart_intent(content)
+                chart_intent = FinancialChartPlugin.extract_chart_intent(
+                    content,
+                    recent_history=recent_history,
+                    quote_info=quote_info,
+                )
             except Exception:
                 chart_intent = None
 
@@ -3209,6 +3269,13 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             chart_res = plugin_manager.execute_tool("generate_financial_chart", chart_intent)
             if isinstance(chart_res, dict) and not chart_res.get("error"):
                 log_msg(f"【前置数据制图引擎】成功渲染并发送 {chart_res.get('name')} ({chart_res.get('symbol')}) 走势图！")
+                image_info = None
+                if target_model == "gemini-3.8-flash" and force_provider != "gemini":
+                    rerouted = TaskModelRouter.route(content, quote_info=quote_info, image_info=None, file_info=file_info, card_info=card_info)
+                    provider = rerouted["provider"]
+                    target_model = rerouted["model"]
+                    route_reason = rerouted["reason"]
+                    route_effort = rerouted.get("reasoning_effort")
                 user_query += (
                     f"\n\n【系统已通过本机真实数据脚本绘制并将高清走势图直接发送到了微信群聊窗口中】（零AI生图，数据100%真实）：\n"
                     f"{json.dumps(chart_res, ensure_ascii=False, indent=2)}\n"
@@ -3216,6 +3283,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 )
                 tools = None
                 chart_handled = True
+            elif isinstance(chart_res, dict) and chart_res.get("error"):
+                log_msg(f"【前置数据制图引擎】直调返回提示: {chart_res.get('error')}，保留工具交由模型二次确认代码")
+                image_info = None
 
         # 3.5 针对股票量化诊断与技术面分析：调用 StockQuantPlugin 极速拉取盘口及日K指标，由 AI 专业操盘手一轮直出！
         stock_sym = None
@@ -3248,7 +3318,13 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 stock_handled = True
 
         # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
-        if not stock_handled:
+        # （注意：若为制图/生图/搜图请求且尚未完成发图，必须保留 tools 权限以便模型调用发图工具，严禁被前置文本搜索置空 tools！）
+        clean_q_for_img_tool = strip_bot_mentions(content)
+        needs_img_tool = is_chart_req or any(
+            kw in clean_q_for_img_tool
+            for kw in ["发一张", "来一张", "画一张", "生成一张", "搜一张", "找一张", "把网页里的图", "发下照片"]
+        )
+        if not stock_handled and not needs_img_tool:
             clean_q = strip_bot_mentions(content)
             search_intent_kws = [
                 "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
@@ -4095,7 +4171,7 @@ def monitor_loop():
                                     for m_item in raw_msgs:
                                         r_img = m_item.get("referenced_image")
                                         m_sender = m_item.get("sender", "")
-                                        if isinstance(r_img, dict) and r_img.get("has_image") and not is_unknown_placeholder_sender(m_sender):
+                                        if isinstance(r_img, dict) and r_img.get("has_image"):
                                             if r_img.get("_crop_box") and not r_img.get("_img_bytes"):
                                                 try:
                                                     cb = tuple(r_img["_crop_box"])
@@ -4104,9 +4180,10 @@ def monitor_loop():
                                                     r_img["_img_bytes"] = buf.getvalue()
                                                 except Exception:
                                                     pass
-                                            r_img["ts"] = time.time()
-                                            r_img["sender"] = m_sender
-                                            last_received_images[cur_session_key] = r_img
+                                            if is_bot_sent_image(r_img, chat_img) and not is_explicit_bot_invocation(m_item.get("content", "")):
+                                                m_item["is_incoming"] = False
+                                                m_item["sender"] = "bot"
+                                                continue
 
                                     reply_candidates = []
                                     new_msg_count = 0
@@ -4395,11 +4472,16 @@ def monitor_loop():
                                                         "ocr_and_detail": matched_rec.get("ocr_and_detail", ""),
                                                         "sender": matched_rec.get("sender", ""),
                                                     }
-                                                elif session_key in last_received_images:
+                                                elif session_key in last_received_images and not (FinancialChartPlugin and FinancialChartPlugin.is_chart_generation_request(c)):
                                                     recent_img = last_received_images[session_key]
                                                     if time.time() - recent_img.get("ts", 0) < 600:
-                                                        img_kws = ["看图", "读图", "这张图", "这个图", "上面这个图", "看下这个图", "图里", "图上", "图片", "截图中", "照片里", "图中的", "图片内容", "图上的字", "走势图", "k线图", "解释", "什么意思", "这是啥", "写的啥"]
-                                                        is_quote_img = has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["[图片]", "图", "照片", "截图"])
+                                                        img_kws = [
+                                                            "看图", "读图", "这张图", "这个图", "上面这个图", "上面这张图", "看下这个图", "看下这张图",
+                                                            "我的这个图", "我的这张图", "图里", "图上", "截图中", "截图里", "照片里", "图片里",
+                                                            "图中的", "图片内容", "图上的字", "这张走势图", "这个走势图", "这张k线图", "这个k线图",
+                                                            "解释", "什么意思", "这是啥", "写的啥",
+                                                        ]
+                                                        is_quote_img = has_q and any(kw in str(q_info.get("quoted_content", "")).lower() for kw in ["[图片]", "照片", "截图"])
                                                         if is_quote_img or any(kw in c.lower() for kw in img_kws) or is_in_private_chat:
                                                             target_img_info = recent_img
                                                             log_msg(f"为用户提问关联会话最近接收的图片: {recent_img.get('image_type')} (来自: {recent_img.get('sender')})")

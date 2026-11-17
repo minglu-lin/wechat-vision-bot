@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from .base import BasePlugin
 from .image_tools import get_image_sender
-from .stock import NAME_TO_CODE, StockDataEngine
+from .stock import NAME_TO_CODE, StockDataEngine, StockQuantPlugin
 
 TZ_BJ = timezone(timedelta(hours=8))
 BUFFETT_BASE_URL = "https://buffett.lmlu.de"
@@ -121,8 +121,14 @@ GLOBAL_ASSET_ALIASES: Dict[str, Tuple[str, str]] = {
     "沪指": ("000001.SS", "上证综合指数"),
     "大盘": ("000001.SS", "上证综合指数"),
     "沪深300": ("000300.SS", "沪深 300 指数"),
+    "中证500": ("000905.SS", "中证 500 指数"),
+    "中证1000": ("000852.SS", "中证 1000 指数"),
+    "科创50": ("000688.SS", "科创 50 指数"),
+    "科创板": ("000688.SS", "科创 50 指数"),
+    "北证50": ("899050.BJ", "北证 50 指数"),
     "深证成指": ("399001.SZ", "深证成指"),
     "深成指": ("399001.SZ", "深证成指"),
+    "创业板指数": ("399006.SZ", "创业板指"),
     "创业板指": ("399006.SZ", "创业板指"),
     "创业板": ("399006.SZ", "创业板指"),
     "比特币": ("BTC-USD", "比特币 BTC"),
@@ -203,7 +209,7 @@ def parse_period_spec(period_str: str) -> Tuple[str, str, Optional[int], str]:
     if not s:
         return "1y", "1d", 366, "近1年"
 
-    if s in ("ytd", "今年", "今年以来", "年初至今"):
+    if s in ("ytd", "今年", "今年以来", "年初至今", "年内", "本年"):
         now = datetime.now(TZ_BJ)
         days = max(5, (now - datetime(now.year, 1, 1, tzinfo=TZ_BJ)).days + 1)
         return "ytd", "1d", days, "今年以来"
@@ -389,7 +395,7 @@ class MarketChartDataEngine:
                     "close": float(c_val),
                     "volume": float(v_val or 0),
                 })
-            if not bars:
+            if len(bars) < 2:
                 return None
             return {
                 "symbol": meta.get("symbol", yf_symbol),
@@ -546,20 +552,24 @@ class MarketChartDataEngine:
             source_label = "Buffett Terminal (buffett.lmlu.de)"
         else:
             yf_res = cls.fetch_yahoo_chart(yf_sym, yf_range=yf_range, yf_interval=yf_interval)
-            if yf_res and yf_res.get("bars"):
+            if yf_res and len(yf_res.get("bars") or []) >= 2:
                 bars = yf_res["bars"]
-                currency = yf_res.get("currency") or ""
+                currency = "点" if yf_sym.startswith("^") else (yf_res.get("currency") or "")
                 final_name = final_name or yf_res.get("name") or yf_sym
                 source_label = "Buffett Terminal + Yahoo Finance" if bt_data else "Yahoo Finance"
-            elif mkt_type != "unknown" and kline_code:
-                # Fallback to EastMoney / Tencent K-lines for A-shares / BJ-shares
-                limit_n = min(1500, max(60, int((slice_days or 365) * 0.72)))
-                kl = StockDataEngine.fetch_klines(kline_code, secid, mkt_type, limit=limit_n)
-                if kl:
-                    bars = kl
-                    currency = "CNY" if mkt_type in ("a_share", "cn_index") else ("HKD" if "hk" in mkt_type else "USD")
-                    final_name = final_name or clean_code
-                    source_label = "EastMoney / Tencent Quote"
+            else:
+                if mkt_type == "unknown":
+                    q_norm_in = re.sub(r'\.(?:SS|SZ|BJ)$', '', q, flags=re.IGNORECASE)
+                    clean_code, mkt_type, tc_code, kline_code, secid = StockDataEngine.normalize_symbol(q_norm_in)
+                if mkt_type != "unknown" and kline_code:
+                    # Fallback to Tencent / EastMoney K-lines for CN indices / A-shares / BJ-shares
+                    limit_n = min(1500, max(60, int((slice_days or 365) * 0.75)))
+                    kl = StockDataEngine.fetch_klines(kline_code, secid, mkt_type, limit=limit_n)
+                    if kl:
+                        bars = kl
+                        currency = "点" if "index" in mkt_type else ("CNY" if mkt_type == "a_share" else ("HKD" if "hk" in mkt_type else "USD"))
+                        final_name = final_name or disp_name or clean_code
+                        source_label = "Tencent / EastMoney Quote"
 
         if not bars or len(bars) < 2:
             return {"error": f"暂无‘{q}’({yf_sym}) 的有效历史价格序列数据"}
@@ -1103,86 +1113,229 @@ class FinancialChartPlugin(BasePlugin):
         "required": ["symbol"],
     }
 
+    _PERIOD_EXTRACT_RE = re.compile(
+        r'(今年以来|年初至今|今年|本年|年内|上市以来|全部历史|历史全周期|'
+        r'(?:最近|近|过去)?\s*(?:\d+|[一二两三四五六七八九十半])\s*个?\s*(?:年|月|周|星期|天|日)|'
+        r'半年|\bytd\b|\bmax\b|\d+\s*(?:y|yr|mo|m|w|wk|d)\b)',
+        flags=re.IGNORECASE,
+    )
+
+    _DEICTIC_SYM_RE = re.compile(
+        r'^(?:对应的?|相对应的?|它的?|这个|这只|这支|该|该股|该标的|该指数|'
+        r'上面(?:那个|那只|这只|这个|说的|提到的|的)?|刚才(?:那个|那只|说的|提到的|聊的|的)?|'
+        r'前面(?:那个|说的|的)?|同上|相关|上述|大a|大A|a股|A股)?$'
+    )
+
+    _PAREN_TICKER_RE = re.compile(
+        r'[（\(]((?:sh|sz|bj)?\d{6}|\d{4,5}\.HK|\d{4,6}\.(?:KS|KQ|SS|SZ|BJ|TW|T)|[A-Z]{1,5}(?:\-[A-Z]{1,3})?|\^[A-Z0-9]+)[）\)]'
+    )
+
+    @staticmethod
+    def _clean_query_mentions(text: str) -> str:
+        t = (text or "").strip()
+        t = re.sub(r'^\[(?:引用|附图|分享文章卡片|文件)[^\]]*\]\s*', '', t).strip()
+        t = re.sub(r'^(?:@\S+[\s\u2005\u00a0\u3000]*|bot\s*|albot\s*|aibot\s*|小号\s*|：|:|,|，)+', '', t, flags=re.IGNORECASE).strip()
+        t = re.sub(r'(?:[\s\u2005\u00a0\u3000]*@\s*(?:aibot|albot|bot|微信小号)\S*)+$', '', t, flags=re.IGNORECASE).strip()
+        return t
+
     @classmethod
-    def extract_chart_intent(cls, text: str) -> Optional[Dict[str, str]]:
-        """Detect if user explicitly asks for a stock/asset/macro data chart image and extract {symbol, period}."""
-        if not text:
-            return None
-        t = text.strip()
-        t = re.sub(r'^(?:@\S+\s*|bot\s*|albot\s*|aibot\s*|小号\s*|：|:|,|，)+', '', t, flags=re.IGNORECASE).strip()
-        t = re.sub(r'(?:\s*@\s*(?:aibot|albot|bot|微信小号)\S*)+$', '', t, flags=re.IGNORECASE).strip()
+    def is_chart_generation_request(cls, text: str) -> bool:
+        """Return True if the message asks the bot to generate/send a financial or macro data chart."""
+        t = cls._clean_query_mentions(text)
         if not t:
-            return None
+            return False
 
-        # Never intercept questions asking ABOUT an already-uploaded image or AI photo remixing
-        if re.search(r'(?:这张图|这个图|上面这[个张]图|图里|截图中).*(?:是啥|是什么|真的假的|真假|意思|写了|谁)', t):
-            return None
+        # Never intercept questions asking ABOUT an already-uploaded screenshot/image or AI photo remixing
+        if re.search(
+            r'(?:这张|这个|上面这[个张]?|我的这[个张]?|图里|图上|截图中|截图里).{0,8}(?:走势图|k线图|K线图|图|截图|照片)',
+            t,
+        ) and not re.search(r'(?:给我|发给我|重画|画一|生成)', t):
+            return False
         if any(w in t for w in ["重制", "P图", "p图", "把图里", "把照片", "壁纸", "表情包", "头像", "长啥样", "照片"]):
-            return None
+            return False
 
-        has_chart_noun = bool(re.search(
-            r'(?:走势图|股价图|价格图|行情图|k线图|K线图|折线图|曲线图|估值图|'
-            r'(?:给我|发一?[张个幅]?|来一?[张个幅]?|画一?[张个幅下]?|看一?[下张]?|生成一?[张个幅]?|拉一?[张个下]?).{0,22}(?:图|图表|曲线))',
+        explicit_chart_word = bool(re.search(
+            r'(?:走势图|股价图|价格图|行情图|k线图|K线图|折线图|曲线图|估值图|分时图)',
+            t,
+        ))
+        has_chart_noun = explicit_chart_word or bool(re.search(
+            r'(?:给我|发给我|发一?[张个幅下]?|来一?[张个幅]?|画一?[张个幅下]?|看一?[下张]?|生成一?[张个幅]?|拉一?[张个下]?|贴一?[张个下]?|补一?[张个下]?).{0,22}(?:图|图表|曲线)',
             t,
         ))
         if not has_chart_noun:
-            return None
+            return False
 
         fin_cues = [
             "股价", "股票", "走势", "行情", "k线", "K线", "价格", "市值", "估值", "买点", "击球区",
             "金价", "黄金", "白银", "原油", "油价", "汇率", "人民币", "日元", "美元", "美债", "收益率",
-            "指数", "纳指", "标普", "道指", "恒指", "上证", "沪深", "创业板", "比特币", "以太坊",
+            "指数", "纳指", "标普", "道指", "恒指", "上证", "沪深", "创业板", "科创", "比特币", "以太坊",
             "cpi", "ppi", "pmi", "gdp", "m2", "通胀", "失业率", "利率",
         ]
         t_low = t.lower()
         has_fin_cue = (
-            any(fc.lower() in t_low for fc in fin_cues)
+            explicit_chart_word
+            or any(fc.lower() in t_low for fc in fin_cues)
             or any(ak in t_low for ak in GLOBAL_ASSET_ALIASES)
             or any(mk in t_low for mk in MACRO_ALIASES)
             or any(nk in t for nk in NAME_TO_CODE)
-            or bool(re.search(r'(?:最近|近|过去)\s*(?:\d+|[一二两三四五六七八九十半])\s*个?\s*(?:年|月|周|天)', t))
+            or bool(cls._PERIOD_EXTRACT_RE.search(t))
         )
-        if not has_fin_cue:
+        return has_fin_cue
+
+    @classmethod
+    def _find_alias_in_text(cls, text_snippet: str) -> Optional[str]:
+        """Find the earliest non-shadowed known macro/global/stock alias in text_snippet."""
+        if not text_snippet:
+            return None
+        s_low = text_snippet.lower()
+        spans: List[Tuple[int, int, str]] = []
+
+        def _collect(keys_iter, target_str: str, is_lower: bool) -> None:
+            for k in keys_iter:
+                if len(k) < 2:
+                    continue
+                needle = k.lower() if is_lower else k
+                if needle.isascii():
+                    m = re.search(r'(?<![a-z0-9])' + re.escape(needle) + r'(?![a-z0-9])', target_str)
+                    if m:
+                        spans.append((m.start(), m.end(), k))
+                else:
+                    idx = target_str.find(needle)
+                    if idx >= 0:
+                        spans.append((idx, idx + len(needle), k))
+
+        _collect(MACRO_ALIASES.keys(), s_low, True)
+        _collect(GLOBAL_ASSET_ALIASES.keys(), s_low, True)
+        _collect(NAME_TO_CODE.keys(), text_snippet, False)
+        if not spans:
             return None
 
-        # Extract period string if present
-        period = "1y"
-        m_per = re.search(
-            r'(今年以来|年初至今|上市以来|全部历史|(?:最近|近|过去)?\s*(?:\d+|[一二两三四五六七八九十半])\s*个?\s*(?:年|月|周|星期|天|日)|半年|\d+\s*(?:y|yr|mo|m|w|d)\b)',
-            t,
-            flags=re.IGNORECASE,
-        )
-        if m_per:
-            period = m_per.group(1).strip()
+        # Discard spans completely covered by a strictly longer span
+        filtered: List[Tuple[int, int, str]] = []
+        for s1, e1, k1 in spans:
+            shadowed = any(
+                (s2 <= s1 and e2 >= e1 and (e2 - s2) > (e1 - s1))
+                for s2, e2, _ in spans
+            )
+            if not shadowed:
+                filtered.append((s1, e1, k1))
+        filtered.sort(key=lambda item: (item[0], -(item[1] - item[0])))
+        return filtered[0][2]
 
-        # Extract clean target symbol
-        sym_text = t
-        if m_per:
-            sym_text = sym_text.replace(m_per.group(0), " ")
-
-        # 1. Exact priority match against macro, global aliases, and NAME_TO_CODE
-        for mk in sorted(MACRO_ALIASES.keys(), key=len, reverse=True):
-            if len(mk) >= 2 and mk in t_low:
-                return {"symbol": mk, "period": period}
-        for ak in sorted(GLOBAL_ASSET_ALIASES.keys(), key=len, reverse=True):
-            if len(ak) >= 2 and ak in t_low:
-                return {"symbol": ak, "period": period}
-        for nk in sorted(NAME_TO_CODE.keys(), key=len, reverse=True):
-            if len(nk) >= 2 and nk in t:
-                return {"symbol": nk, "period": period}
-
-        # 2. Strip request verbs & chart suffixes to isolate the entity name (e.g. "给我一张海力士最近5年股价的图" -> "海力士")
+    @classmethod
+    def _strip_to_symbol_candidate(cls, sym_text: str) -> str:
         sym_clean = re.sub(
-            r'^(?:请|麻烦|帮我)?(?:给我|发给我|发|来|画|绘制|生成|看下|看看|查下|查一下|拉一下)?(?:一[张个幅份])?',
+            r'^(?:请|麻烦|帮我|劳驾|能不能|可以)?(?:把|将)?'
+            r'(?:给我|发给我|发一下|发下|发个|发|来一下|来个|来|画一下|画个|画|绘制|生成|看下|看看|查下|查一下|拉一下|贴一下|补一下)?'
+            r'(?:一[张个幅份])?',
             '',
             sym_text,
         ).strip()
         sym_clean = re.sub(
-            r'(?:最近|近|过去)?(?:的)?(?:历史|实时|最新)?(?:巴菲特)?(?:估值|安全边际|股价|股票|收盘价|价格|行情|走势|k线|K线|折线|曲线|数据)?(?:的)?(?:走势图|折线图|曲线图|图表|图片|图)[吗呢吧呀啊！!？?。]*$',
+            r'(?:最近|近|过去)?(?:的)?(?:历史|实时|最新)?(?:巴菲特)?'
+            r'(?:估值|安全边际|股价|股票|收盘价|价格|行情|走势|k线|K线|折线|曲线|数据)?(?:的)?'
+            r'(?:走势图|股价图|价格图|行情图|k线图|K线图|折线图|曲线图|估值图|分时图|图表|图片|图)'
+            r'(?:发出来|发群里|发一下|发下|发给我|给我看下|给我看看|画出来|生成出来|拉出来)?[吗呢吧呀啊呗！!？?。～~]*$',
             '',
             sym_clean,
         ).strip()
-        sym_clean = sym_clean.strip("的 　,，:：")
+        return sym_clean.strip("的 　,，:：")
+
+    @classmethod
+    def _resolve_from_history(
+        cls,
+        current_clean: str,
+        recent_history: Optional[List[Dict[str, Any]]] = None,
+        quote_info: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve deictic symbol & recent period from quoted message or recent chat history."""
+        now = time.time()
+        candidates: List[Tuple[str, bool]] = []
+
+        if isinstance(quote_info, dict) and quote_info.get("has_quote"):
+            qc = cls._clean_query_mentions(str(quote_info.get("quoted_content") or ""))
+            if qc and qc != current_clean:
+                candidates.append((qc, False))
+
+        for h in reversed((recent_history or [])[-8:]):
+            if not isinstance(h, dict):
+                continue
+            h_ts = float(h.get("ts") or 0.0)
+            if h_ts > 0 and (now - h_ts > 1200):
+                continue
+            raw_hc = str(h.get("content") or "")
+            is_bot = bool(h.get("is_bot")) or str(h.get("sender") or "") == "bot"
+            hc = cls._clean_query_mentions(raw_hc)
+            if not hc or hc == current_clean:
+                continue
+            # Skip earlier hallucinated/deictic chart messages that lack concrete entities
+            if is_bot and any(p in hc for p in ["这次真发了", "发不了图"]):
+                continue
+            candidates.append((hc, is_bot))
+
+        resolved_sym: Optional[str] = None
+        for hc, is_bot in candidates:
+            probe = hc[:180] if is_bot else hc
+            found = cls._find_alias_in_text(probe)
+            if found:
+                resolved_sym = found
+                break
+            m_tk = cls._PAREN_TICKER_RE.search(probe)
+            if m_tk:
+                resolved_sym = m_tk.group(1)
+                break
+            if not is_bot and StockQuantPlugin:
+                sq = StockQuantPlugin.extract_stock_intent(probe)
+                if sq:
+                    resolved_sym = sq
+                    break
+
+        resolved_per: Optional[str] = None
+        for hc, is_bot in candidates[:4]:
+            probe_p = hc[:100] if is_bot else hc
+            mp = cls._PERIOD_EXTRACT_RE.search(probe_p)
+            if mp:
+                resolved_per = mp.group(1).strip()
+                break
+
+        return resolved_sym, resolved_per
+
+    @classmethod
+    def extract_chart_intent(
+        cls,
+        text: str,
+        recent_history: Optional[List[Dict[str, Any]]] = None,
+        quote_info: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Detect if user asks for a stock/asset/macro data chart image and extract {symbol, period}."""
+        if not cls.is_chart_generation_request(text):
+            return None
+        t = cls._clean_query_mentions(text)
+
+        # Extract period string if present
+        period = "1y"
+        m_per = cls._PERIOD_EXTRACT_RE.search(t)
+        has_explicit_period = bool(m_per)
+        if m_per:
+            period = m_per.group(1).strip()
+
+        # Extract clean target symbol
+        sym_text = t.replace(m_per.group(0), " ") if m_per else t
+
+        # 1. Position-aware priority match against macro, global aliases, and NAME_TO_CODE
+        known = cls._find_alias_in_text(sym_text) or cls._find_alias_in_text(t)
+        if known:
+            return {"symbol": known, "period": period}
+
+        # 2. Strip request verbs & chart suffixes to isolate entity name or deictic pronoun
+        sym_clean = cls._strip_to_symbol_candidate(sym_text)
+        if not sym_clean or cls._DEICTIC_SYM_RE.match(sym_clean):
+            ctx_sym, ctx_per = cls._resolve_from_history(t, recent_history=recent_history, quote_info=quote_info)
+            if ctx_sym:
+                final_per = period if has_explicit_period else (ctx_per or "1y")
+                return {"symbol": ctx_sym, "period": final_per}
+            return None
+
         if 1 <= len(sym_clean) <= 20:
             return {"symbol": sym_clean, "period": period}
         return None
