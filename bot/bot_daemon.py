@@ -2738,15 +2738,34 @@ def post_sensitive_reply_to_box(sender: str, question: str, reply_text: str, cfg
     return None
 
 
+def _extract_pseudo_web_search_queries(text: str) -> list:
+    """提取模型在无 tools 模式下吐出的伪工具调用查询词，如 [~web_search(queries=[...])~] 或 $web_search{...}。"""
+    if not text:
+        return []
+    queries = []
+    # Match [~web_search(...)~] or [~google_search(...)~] or standalone web_search(queries=[...])
+    for m in re.finditer(r'(?:\[~|\$)?\b(?:web_search|google_search|search_web)\s*[\(\{]([\s\S]*?)[\)\}](?:~\])?', text, flags=re.IGNORECASE):
+        arg_blob = m.group(1)
+        for qm in re.finditer(r'["\']([^"\'\r\n]{2,120})["\']', arg_blob):
+            val = qm.group(1).strip()
+            if val.lower() not in ("query", "queries", "q", "web_search") and val not in queries:
+                queries.append(val)
+    return queries[:2]
+
+
 def _strip_cot_and_tool_blocks(text: str) -> str:
     if not text:
         return ""
     text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'<tool_call>[\s\S]*?</tool_call>', '', text, flags=re.IGNORECASE)
+    # Strip Gemini [~fn_name(...)~] pseudo-tool call blocks
+    text = re.sub(r'\[~\s*[a-zA-Z_][a-zA-Z0-9_]*\s*\([\s\S]*?\)\s*~\]', '', text)
     if any(k in text for k in ["Execute search", "Use tools", "Let's search", "Let's call", "tool_calls", "web_search("]):
         m_cot = re.search(r'(?:Execute search|Use tools|Let\'s search|Let\'s call)[\s\S]*?[）\)]\s*(?=[\u4e00-\u9fa5])', text)
         if m_cot:
             text = text[m_cot.end():].strip()
     text = re.sub(r'\$web_search(?::\d+)?\s*\{[^}]*\}', '', text)
+    text = re.sub(r'^\s*(?:web_search|google_search)\s*\([\s\S]*?\)\s*$', '', text, flags=re.MULTILINE)
     text = re.sub(r'```(?:json)?\s*\{\s*"query"[\s\S]*?\}\s*```', '', text)
     return text
 
@@ -2958,7 +2977,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
-        f"- 如果群聊中分享了微信文章卡片、新闻卡片、或群友要求对刚刚分享的文章‘评价一下’、‘总结下’、‘分析下’、‘你怎么看’、‘讲了什么’等：你绝对不能只凭标题凭空推测或说‘光从标题看’！必须立即调用 $web_search 联网搜索工具获取该文章的完整正文和真实事实细节，以完整报道事实为基础进行客观、深刻、有理有据的分析评价！\n"
+        f"- 如果群聊中分享了微信文章卡片、新闻卡片、或群友要求对刚刚分享的文章评价、总结、分析或查证真假：绝对不能只凭标题凭空推测！若下方已提供系统预检索资料，请直接基于该资料分析判断；若尚未提供且当前开启了工具权限，请使用标准函数调用 web_search 获取完整事实细节，绝对严禁在回复正文中输出 [~web_search(...)~] 或 $web_search 等任何内部指令文本！\n"
         f"【文档与附件文件深度解析指引（核心能力）】：\n"
         f"- 如果提问附带或关联了用户上传的附件文件（纯文本代码、PDF长论文/研报/合同、Excel结构化表格、Word文档等），系统已在下方将文件正文和结构化表格完整提取并注入到上下文中；\n"
         f"- 你必须仔细研读文件内容，全面、准确、专业地结合用户提问进行解答、数据汇总、提炼或代码分析。严禁说‘无法读取文件’或‘请发送文件’，因为文件内容已经完整呈现给你！\n"
@@ -3061,12 +3080,15 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             if len(mb.strip()) >= 3:
                 card_keywords.append(mb.strip())
 
-    # 4) Extract from recent_history (only when evaluating an article or bare @bot right after a recent card)
+    # 4) Extract from recent_history (when evaluating/fact-checking an article, same-sender recent card, or bare @bot)
     clean_c = strip_bot_mentions(content)
     is_evaluating = any(kw in content for kw in [
         "锐评", "分析", "评价", "怎么看", "如何看", "解读", "讲了什么", "说了什么",
         "总结", "详细说", "说说", "看下", "看看", "链接", "文章", "公众号", "推文",
-        "卡片", "新闻", "报道", "上面那篇", "那篇", "这篇"
+        "卡片", "新闻", "报道", "上面那篇", "那篇", "这篇",
+        "这个消息", "这条消息", "这消息", "这则消息", "这个事", "这件事", "这事",
+        "真的假的", "真假", "真的吗", "保真", "查一下", "查查", "搜一下", "搜搜",
+        "核实", "求证", "辟谣", "消息", "出处", "原文"
     ])
     is_bare_mention = (
         (len(clean_c) == 0)
@@ -3075,12 +3097,16 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         and not file_info
     )
     now_card_ts = time.time()
-    if is_evaluating and recent_history:
+    if (is_evaluating or len(clean_c) <= 24) and recent_history and not (image_info and image_info.get("has_image")):
         for h in reversed(recent_history[-6:]):
             if h.get("is_bot"):
                 continue
             h_ts = float(h.get("ts") or 0.0)
-            if h_ts > 0 and (now_card_ts - h_ts > 1800):
+            max_card_age = 1800 if is_evaluating else 120
+            if h_ts > 0 and (now_card_ts - h_ts > max_card_age):
+                continue
+            # 若未命中显式评价词，仅当同一提问者在 120 秒内刚发过卡片且短句追问时自动关联
+            if not is_evaluating and normalize_dedup_sender(h.get("sender", "")) != normalize_dedup_sender(sender):
                 continue
             hc = h.get("content", "")
             mh = re.search(r'\[分享文章卡片:\s*《(.*?)》', hc)
@@ -3089,12 +3115,13 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 if h_title not in card_keywords:
                     card_keywords.append(h_title)
                 break
-            for u in extract_urls(hc):
-                if is_valid_mp_url(u) and u not in found_urls:
-                    found_urls.append(u)
+            if is_evaluating:
+                for u in extract_urls(hc):
+                    if is_valid_mp_url(u) and "box.lmlu.de" not in u.lower() and u not in found_urls:
+                        found_urls.append(u)
+                        break
+                if found_urls:
                     break
-            if found_urls:
-                break
     elif is_bare_mention and recent_history:
         for h in reversed(recent_history[-4:]):
             if h.get("is_bot"):
@@ -3205,23 +3232,47 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
             ]
             expand_followup_kws = ["展开", "细说", "详细", "具体", "多说", "深入", "再查", "深挖", "更多细节", "详细讲"]
+            deictic_pronouns = ["这个", "这条", "这则", "上面", "刚才", "那篇", "这篇", "那个", "此事", "这事", "这消息", "真的假的"]
             quoted_text_clean = str((quote_info or {}).get("quoted_content", "")).strip()
             is_expand_with_quote = bool(quoted_text_clean and any(kw in clean_q for kw in expand_followup_kws))
+            has_deictic = any(dp in clean_q for dp in deictic_pronouns)
             if plugin_manager and ((len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
                 search_query_str = clean_q
-                if is_expand_with_quote:
-                    # Extract key topic from the first clause/sentence of the quoted content so Serper searches the actual subject
-                    first_clause = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
-                    search_query_str = f"{first_clause} {clean_q}".strip()
-                log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
-                pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
-                if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
-                    log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
-                    user_query += (
-                        f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具；若资料涉及国内重要领导人全名或敏感政治词，输出时务必按【避讳铁律】使用隐晦替代词称呼）】：\n"
-                        f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
-                    )
-                    tools = None
+                context_topic = ""
+                if quoted_text_clean:
+                    context_topic = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
+                elif has_deictic and len(clean_q) <= 24 and recent_history:
+                    # 指代句缺少实体主语时（如“这个消息真的假的查一下”），从最近上下文提取主题，绝不裸搜纯代词
+                    for h in reversed(recent_history[-5:]):
+                        hc = str(h.get("content") or "").strip()
+                        if not hc or is_trivial_or_reaction(hc):
+                            continue
+                        h_ts = float(h.get("ts") or 0.0)
+                        if h_ts > 0 and (time.time() - h_ts > 600):
+                            break
+                        mh = re.search(r'《(.*?)》', hc)
+                        if mh:
+                            context_topic = mh.group(1).strip()[:50]
+                            break
+                        hc_clean = re.sub(r'^\[(?:附图|引用|分享文章卡片|文件)[^\]]*\]\s*', '', hc).strip()
+                        if len(hc_clean) >= 4:
+                            context_topic = re.split(r'[。！？\n]', hc_clean)[0][:45].strip()
+                            break
+                if (is_expand_with_quote or (has_deictic and len(clean_q) <= 24)) and context_topic:
+                    search_query_str = f"{context_topic} {clean_q}".strip()
+
+                # 若短句全是代词且无上下文主语（如空上下文下的“这个消息真的假的查一下”），跳过盲目前置搜索，保留 tools 交由大模型自主生成精准关键词搜索
+                skip_blind_deictic = bool(has_deictic and len(clean_q) <= 18 and not context_topic)
+                if not skip_blind_deictic:
+                    log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
+                    pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
+                    if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
+                        log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
+                        user_query += (
+                            f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具；若资料涉及国内重要领导人全名或敏感政治词，输出时务必按【避讳铁律】使用隐晦替代词称呼）】：\n"
+                            f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
+                        )
+                        tools = None
 
     img_b64 = None
     if image_info and image_info.get("has_image"):
@@ -3267,6 +3318,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     final_reply = ""
     collected_tool_outputs = []
     tool_round_executed = False
+    pseudo_search_executed = False
     for loop_idx in range(4):
         try:
             # 最多允许在尚未执行过工具时触发 1 轮工具调用；工具返回或已进入后期轮次时强制 tools=None 直接作答
@@ -3316,6 +3368,27 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 continue
 
             content_text = (msg.get("content") or "").strip()
+            # 拦截模型在无 tools 模式下吐出的纯文本伪工具指令（如 Gemini 的 [~web_search(queries=[...])~]），代为执行真实检索后再生成总结
+            pseudo_queries = _extract_pseudo_web_search_queries(content_text)
+            if pseudo_queries and plugin_manager and not pseudo_search_executed and loop_idx < 3:
+                pseudo_search_executed = True
+                tool_round_executed = True
+                log_msg(f"🔄 拦截到模型 ({target_model}) 文本态伪搜索指令 {pseudo_queries}，自动转为真实 Serper 检索并重生成回答...")
+                for pq in pseudo_queries:
+                    tool_res = plugin_manager.execute_tool("web_search", {"query": pq})
+                    res_str = json.dumps(tool_res, ensure_ascii=False) if isinstance(tool_res, (dict, list)) else str(tool_res)
+                    collected_tool_outputs.append(f"[web_search({pq})]: {res_str}")
+                synth_query = (
+                    user_query
+                    + "\n\n【系统已为你执行上述搜索关键词并拿到真实 Google 检索资料（请直接据此用纯中文给出最终结论与分析，绝对严禁再输出 [~web_search(...)~] 等任何工具指令；若涉及国内重要领导人或敏感政治词，务必遵守【避讳铁律】）】：\n"
+                    + "\n".join(collected_tool_outputs)
+                )
+                messages = [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": _build_user_payload(synth_query, provider)},
+                ]
+                continue
+
             raw_clean = clean_bot_reply_format(content_text)
             final_reply = clean_bot_reply(content_text)
             if final_reply:
