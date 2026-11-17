@@ -3020,7 +3020,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"  • 查美食推荐 (search_local_food)：城市与商圈特色餐饮、招牌好店、人均预算与口碑\n"
         f"  • 查地铁与公交路线 (get_transit_route)：城市公共交通与地铁换乘方案、几号线、换乘站点、用时与票价\n"
         f"  • 汇率与加密货币 (get_exchange_rate, get_crypto_price)：实时法币汇率与主流数字货币行情\n"
-        f"  • 全球股票与宏观经济真实数据制图 (generate_financial_chart)：结合 https://buffett.lmlu.de/ 巴菲特价值投资终端与全球行情接口，由本机脚本从真实历史数据直接绘制高清走势图（非AI生图）并发送至微信！支持全球股票（美股/韩股如海力士000660.KS/日股/港股/A股）、指数、黄金原油、汇率、美债收益率、加密货币及中/美 CPI、PPI、PMI、M2、GDP 等指标（支持1月~10年任意跨度）。凡群友要求发走势图、股价图、价格曲线图或经济数据图表时，必须优先调用 generate_financial_chart，绝对严禁调用 AI 绘画瞎画假图，也严禁说发不了走势图！\n"
+        f"  • 全球股票与宏观经济真实数据制图 (generate_financial_chart)：结合 https://buffett.lmlu.de/ 巴菲特价值投资终端与全球行情接口，由本机脚本从真实历史数据直接绘制高清走势图（非AI生图）并发送至微信！支持单标的走势图以及 2~5 支多标的同图叠加对比走势图（传 symbols 数组如 ['上证指数','纳指'] 或逗号分隔，系统自动按共同起点 0% 归一化并对标双轴，股价 1 与 1000 也可同图对比）。支持全球股票（美股/韩股如海力士000660.KS/日股/港股/A股）、指数、黄金原油、汇率、美债收益率、加密货币及中/美 CPI、PPI、PMI、M2、GDP 等指标（支持1月~10年任意跨度）。凡群友要求发走势图、多支同图对比、股价曲线或经济数据图表时，必须优先调用 generate_financial_chart，严禁调用 AI 绘画瞎画假图，也严禁说‘合不到一张图里’或‘一次只能出一个标的’！\n"
         f"  • 查IP归属地 (lookup_ip)：公网IP与域名物理位置、ISP运营商\n"
         f"  • 科学计算 (calculate)：数学公式、求幂、函数计算\n"
         f"  • 随机决策与掷骰子 (decision_and_roll)：多选项决策、掷骰子、抛硬币\n"
@@ -3276,11 +3276,18 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     target_model = rerouted["model"]
                     route_reason = rerouted["reason"]
                     route_effort = rerouted.get("reasoning_effort")
-                user_query += (
-                    f"\n\n【系统已通过本机真实数据脚本绘制并将高清走势图直接发送到了微信群聊窗口中】（零AI生图，数据100%真实）：\n"
-                    f"{json.dumps(chart_res, ensure_ascii=False, indent=2)}\n"
-                    f"【回答要求】：走势图图片已经发在群里了！请直接结合上方真实统计指标（起止价格、区间涨跌幅、最高/最低极值点时间，以及若包含 buffett_terminal 字段则一并点出 https://buffett.lmlu.de 巴菲特安全边际击球区与估值结论），用 2~4 句精炼自然的文字做简要解读，严禁说‘发不了图’或‘去某某网站看’！\n"
-                )
+                if chart_res.get("type") == "financial_comparison_chart":
+                    user_query += (
+                        f"\n\n【系统已通过本机真实数据脚本将多标的同图对标走势图直接绘制并发送到了微信群聊窗口中】（共同起点 0% 归一化对标轴已自动对齐，零AI生图，数据100%真实）：\n"
+                        f"{json.dumps(chart_res, ensure_ascii=False, indent=2)}\n"
+                        f"【回答要求】：同图对比走势图已经发在群里了！请直接结合上方各标的在共同对标区间内的真实起止点位、累计涨跌幅、强弱剪刀差（spread_pct）与阶段强弱节奏，用 2~4 句精炼自然的文字做对比解读，严禁说‘合不到一张图里’或‘发不了图’！\n"
+                    )
+                else:
+                    user_query += (
+                        f"\n\n【系统已通过本机真实数据脚本绘制并将高清走势图直接发送到了微信群聊窗口中】（零AI生图，数据100%真实）：\n"
+                        f"{json.dumps(chart_res, ensure_ascii=False, indent=2)}\n"
+                        f"【回答要求】：走势图图片已经发在群里了！请直接结合上方真实统计指标（起止价格、区间涨跌幅、最高/最低极值点时间，以及若包含 buffett_terminal 字段则一并点出 https://buffett.lmlu.de 巴菲特安全边际击球区与估值结论），用 2~4 句精炼自然的文字做简要解读，严禁说‘发不了图’或‘去某某网站看’！\n"
+                    )
                 tools = None
                 chart_handled = True
             elif isinstance(chart_res, dict) and chart_res.get("error"):

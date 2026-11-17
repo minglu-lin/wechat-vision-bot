@@ -19,6 +19,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -109,17 +110,25 @@ GLOBAL_ASSET_ALIASES: Dict[str, Tuple[str, str]] = {
     "半导体指数": ("^SOX", "费城半导体指数"),
     "标普500": ("^GSPC", "标普 500 指数"),
     "标普": ("^GSPC", "标普 500 指数"),
+    "美股大盘": ("^GSPC", "标普 500 指数"),
+    "美股": ("^GSPC", "标普 500 指数"),
     "纳斯达克": ("^IXIC", "纳斯达克综合指数"),
     "纳指": ("^IXIC", "纳斯达克综合指数"),
     "道琼斯": ("^DJI", "道琼斯工业指数"),
     "道指": ("^DJI", "道琼斯工业指数"),
     "恒生指数": ("^HSI", "香港恒生指数"),
     "恒指": ("^HSI", "香港恒生指数"),
+    "港股大盘": ("^HSI", "香港恒生指数"),
+    "港股": ("^HSI", "香港恒生指数"),
     "恒生科技": ("3033.HK", "恒生科技 ETF"),
     "上证指数": ("000001.SS", "上证综合指数"),
+    "上证综指": ("000001.SS", "上证综合指数"),
     "上证": ("000001.SS", "上证综合指数"),
     "沪指": ("000001.SS", "上证综合指数"),
     "大盘": ("000001.SS", "上证综合指数"),
+    "a股大盘": ("000001.SS", "上证综合指数"),
+    "大a": ("000001.SS", "上证综合指数"),
+    "a股": ("000001.SS", "上证综合指数"),
     "沪深300": ("000300.SS", "沪深 300 指数"),
     "中证500": ("000905.SS", "中证 500 指数"),
     "中证1000": ("000852.SS", "中证 1000 指数"),
@@ -552,9 +561,15 @@ class MarketChartDataEngine:
             source_label = "Buffett Terminal (buffett.lmlu.de)"
         else:
             yf_res = cls.fetch_yahoo_chart(yf_sym, yf_range=yf_range, yf_interval=yf_interval)
+            cn_idx_syms = {"000001.SS", "000300.SS", "000905.SS", "000852.SS", "000688.SS", "399001.SZ", "399006.SZ", "899050.BJ"}
             if yf_res and len(yf_res.get("bars") or []) >= 2:
                 bars = yf_res["bars"]
-                currency = "点" if yf_sym.startswith("^") else (yf_res.get("currency") or "")
+                if yf_sym in ("^TNX", "^TYX"):
+                    currency = "%"
+                elif yf_sym.startswith("^") or yf_sym in cn_idx_syms or yf_sym == "DX-Y.NYB":
+                    currency = "点"
+                else:
+                    currency = yf_res.get("currency") or ""
                 final_name = final_name or yf_res.get("name") or yf_sym
                 source_label = "Buffett Terminal + Yahoo Finance" if bt_data else "Yahoo Finance"
             else:
@@ -1089,11 +1104,451 @@ class BuffettChartRenderer:
         final_rgb.save(out_path, "PNG", optimize=True)
         return stats
 
+    COMPARISON_PALETTE: List[Tuple[int, int, int]] = [
+        (56, 189, 248),   # #38BDF8 Sky Cyan
+        (245, 158, 11),   # #F59E0B Amber Gold
+        (16, 185, 129),   # #10B981 Emerald Green
+        (244, 63, 94),    # #F43F5E Rose Coral
+        (168, 85, 247),   # #A855F7 Vivid Violet
+    ]
+
+    @staticmethod
+    def _parse_bar_ordinal(date_raw: str) -> Optional[Tuple[int, str]]:
+        s = (date_raw or "").strip()[:10]
+        if not s:
+            return None
+        try:
+            if len(s) == 10 and s[4] == "-" and s[7] == "-":
+                dt = datetime.strptime(s, "%Y-%m-%d")
+            elif len(s) == 7 and s[4] == "-":
+                dt = datetime.strptime(s + "-01", "%Y-%m-%d")
+            elif len(s) == 4 and s.isdigit():
+                dt = datetime.strptime(s + "-01-01", "%Y-%m-%d")
+            else:
+                dt = datetime.strptime(s[:10], "%Y-%m-%d")
+            return dt.toordinal(), dt.strftime("%Y-%m-%d")
+        except Exception:
+            return None
+
+    @classmethod
+    def render_comparison(
+        cls,
+        series_list: List[Dict[str, Any]],
+        period_label: str,
+        out_path: str,
+    ) -> Dict[str, Any]:
+        """
+        Render 2~5 assets on a single aligned canvas:
+        - Common start date t_0 anchored at 0.00% baseline so prices of 1 and 1000 align cleanly.
+        - N == 2 (positive prices): Proportional-locked Dual Y-Axis (Left = Asset 1 real price, Right = Asset 2 real price).
+        - N >= 3 (or rate diff): Unified cumulative % Y-Axis + collision-free right callout pills with real prices.
+        """
+        S = 2
+        W, H = 1280 * S, 860 * S
+
+        prepped: List[Dict[str, Any]] = []
+        for idx, item in enumerate(series_list[:5]):
+            by_ord: Dict[int, Tuple[str, float]] = {}
+            for b in (item.get("bars") or []):
+                parsed = cls._parse_bar_ordinal(str(b.get("date") or ""))
+                c_val = b.get("close")
+                if parsed is None or c_val is None:
+                    continue
+                fv = float(c_val)
+                if math.isnan(fv) or math.isinf(fv):
+                    continue
+                by_ord[parsed[0]] = (parsed[1], fv)
+            pts = [(k, by_ord[k][0], by_ord[k][1]) for k in sorted(by_ord.keys())]
+            if len(pts) < 2:
+                continue
+            raw_name = str(item.get("name") or item.get("symbol") or f"Asset{idx+1}")
+            short_name = re.sub(r'\s*\(.*?\)\s*', '', raw_name).strip() or raw_name
+            if len(short_name) > 10:
+                short_name = short_name[:10]
+            prepped.append({
+                "raw": item,
+                "symbol": str(item.get("symbol") or ""),
+                "name": raw_name,
+                "short_name": short_name,
+                "currency": str(item.get("currency") or ""),
+                "color": cls.COMPARISON_PALETTE[idx % len(cls.COMPARISON_PALETTE)],
+                "pts": pts,
+            })
+
+        if len(prepped) < 2:
+            raise ValueError("多标的同图对比至少需要 2 组有效历史序列数据")
+
+        # Determine common overlap start anchor t_0
+        max_first_ord = max(s["pts"][0][0] for s in prepped)
+        min_last_ord = min(s["pts"][-1][0] for s in prepped)
+        anchor_ord = max_first_ord if max_first_ord < min_last_ord - 1 else min(s["pts"][0][0] for s in prepped)
+        anchor_date_str = datetime.fromordinal(anchor_ord).strftime("%Y-%m-%d")
+
+        for s in prepped:
+            pts = s["pts"]
+            le_pts = [p for p in pts if p[0] <= anchor_ord]
+            ge_pts = [p for p in pts if p[0] >= anchor_ord]
+            if le_pts and (anchor_ord - le_pts[-1][0] <= 45):
+                base_val = le_pts[-1][2]
+            elif ge_pts:
+                base_val = ge_pts[0][2]
+            else:
+                base_val = pts[0][2]
+
+            active = list(ge_pts) if ge_pts else [pts[-1]]
+            if active[0][0] > anchor_ord:
+                active.insert(0, (anchor_ord, anchor_date_str, base_val))
+
+            # Downsample very dense series while preserving start, end, peak, and trough
+            if len(active) > 380:
+                max_i = max(range(len(active)), key=lambda j: active[j][2])
+                min_i = min(range(len(active)), key=lambda j: active[j][2])
+                must_keep = {0, len(active) - 1, max_i, min_i}
+                step = len(active) / 360.0
+                picked = sorted(must_keep | {min(len(active) - 1, int(k * step)) for k in range(360)})
+                active = [active[j] for j in picked]
+
+            peak_v = active[0][2]
+            max_dd = 0.0
+            for _, _, cv in active:
+                if cv > peak_v:
+                    peak_v = cv
+                if peak_v > 0:
+                    dd = (cv - peak_v) / peak_v * 100.0
+                    if dd < max_dd:
+                        max_dd = dd
+
+            s["base_val"] = base_val
+            s["last_val"] = active[-1][2]
+            s["last_date"] = active[-1][1]
+            s["high_val"] = max(p[2] for p in active)
+            s["low_val"] = min(p[2] for p in active)
+            s["max_dd_pct"] = max_dd
+            s["active"] = active
+
+        use_pct_rebase = (
+            all(s["base_val"] > 1e-9 and min(p[2] for p in s["active"]) > 0 for s in prepped)
+            and not any(s["raw"].get("is_macro") and s["currency"] == "%" for s in prepped)
+        )
+
+        for s in prepped:
+            b0 = s["base_val"]
+            rel_pts: List[Tuple[int, str, float, float]] = []
+            for d_ord, d_str, cv in s["active"]:
+                rv = ((cv - b0) / b0 * 100.0) if use_pct_rebase else (cv - b0)
+                rel_pts.append((d_ord, d_str, cv, rv))
+            s["rel_pts"] = rel_pts
+            s["ret_val"] = rel_pts[-1][3]
+
+        is_dual_axis = (len(prepped) == 2 and use_pct_rebase)
+        alignment_mode = (
+            "proportional_dual_axis"
+            if is_dual_axis
+            else ("rebased_pct_axis" if use_pct_rebase else "rebased_diff_axis")
+        )
+
+        # Canvas & Fonts
+        bg_img = Image.new("RGBA", (W, H), (6, 10, 18, 255))
+        draw = ImageDraw.Draw(bg_img)
+        overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        odraw = ImageDraw.Draw(overlay)
+
+        f_title = cls._load_font(26 * S, bold=True)
+        f_badge = cls._load_font(13 * S, bold=True)
+        f_sub = cls._load_font(13 * S, bold=False)
+        f_card_name = cls._load_font((14 if len(prepped) <= 3 else 12) * S, bold=True)
+        f_card_val = cls._load_font((20 if len(prepped) <= 3 else 17) * S, bold=True)
+        f_card_sub = cls._load_font((11 if len(prepped) <= 3 else 10) * S, bold=False)
+        f_axis = cls._load_font(12 * S, bold=False)
+        f_axis_hdr = cls._load_font(12 * S, bold=True)
+        f_pin = cls._load_font(12 * S, bold=True)
+
+        pad_x = 34 * S
+        draw.rounded_rectangle(
+            [16 * S, 14 * S, W - 16 * S, H - 14 * S],
+            radius=18 * S,
+            fill=(13, 20, 34, 255),
+            outline=(38, 52, 75, 255),
+            width=1 * S,
+        )
+
+        # 1. Header
+        y_hdr = 32 * S
+        joined_names = " vs ".join(s["short_name"] for s in prepped)
+        if len(joined_names) > 34:
+            joined_names = joined_names[:33] + "…"
+        draw.text((pad_x, y_hdr), joined_names, font=f_title, fill=(248, 250, 252, 255))
+
+        mode_txt = "双轴等比例对标 · 起点 0% 锚定" if is_dual_axis else ("多标的同图对标 · 起点 0% 归一化" if use_pct_rebase else "多标的同图变动对标")
+        mb = draw.textbbox((0, 0), mode_txt, font=f_badge)
+        mw = (mb[2] - mb[0]) + 22 * S
+        mh = 28 * S
+        mx1 = W - pad_x - mw
+        my1 = y_hdr + 2 * S
+        odraw.rounded_rectangle([mx1, my1, W - pad_x, my1 + mh], radius=8 * S, fill=(30, 41, 59, 240), outline=(245, 158, 11, 155), width=1 * S)
+        odraw.text((mx1 + 11 * S, my1 + 5 * S), mode_txt, font=f_badge, fill=(252, 211, 77, 255))
+
+        end_date_str = max(s["last_date"] for s in prepped)
+        ranked = sorted(prepped, key=lambda x: x["ret_val"], reverse=True)
+        leader = ranked[0]
+        laggard = ranked[-1]
+        spread_val = leader["ret_val"] - laggard["ret_val"]
+        unit_sym = "%" if use_pct_rebase else " pp"
+        sub_line = (
+            f"周期: {period_label} (共同起点: {anchor_date_str} ~ {end_date_str})   ·   "
+            f"领跑: {leader['short_name']} ({leader['ret_val']:+.2f}{unit_sym})   ·   "
+            f"强弱剪刀差: {spread_val:.2f}{unit_sym}"
+        )
+        draw.text((pad_x, y_hdr + 39 * S), sub_line, font=f_sub, fill=(148, 163, 184, 255))
+
+        # 2. Multi-Asset Comparison KPI Cards
+        n_ser = len(prepped)
+        kpi_y1 = 102 * S
+        kpi_h = 74 * S
+        kpi_gap = (12 if n_ser <= 3 else 8) * S
+        kpi_w = (W - 2 * pad_x - (n_ser - 1) * kpi_gap) // n_ser
+
+        for i, s in enumerate(prepped):
+            kx1 = pad_x + i * (kpi_w + kpi_gap)
+            kx2 = kx1 + kpi_w
+            col = s["color"]
+            odraw.rounded_rectangle([kx1, kpi_y1, kx2, kpi_y1 + kpi_h], radius=10 * S, fill=(19, 28, 46, 232), outline=col + (135,), width=1 * S)
+            # Left color bar
+            odraw.rounded_rectangle([kx1 + 2 * S, kpi_y1 + 8 * S, kx1 + 7 * S, kpi_y1 + kpi_h - 8 * S], radius=2 * S, fill=col + (255,))
+
+            axis_tag = (" [左轴]" if i == 0 else " [右轴]") if is_dual_axis else ""
+            sym_tag = f" ({s['symbol']})" if (n_ser <= 3 and s["symbol"] and s["symbol"].lower() not in s["short_name"].lower()) else ""
+            hdr_lbl = f"{s['short_name']}{sym_tag}{axis_tag}"
+            max_chars = 26 if n_ser == 2 else (18 if n_ser == 3 else (13 if n_ser == 4 else 10))
+            if len(hdr_lbl) > max_chars:
+                hdr_lbl = hdr_lbl[:max_chars - 1] + "…"
+            odraw.text((kx1 + 14 * S, kpi_y1 + 8 * S), hdr_lbl, font=f_card_name, fill=col + (255,))
+
+            rv = s["ret_val"]
+            up_c = (110, 231, 183, 255) if rv >= 0 else (252, 165, 165, 255)
+            rv_str = f"{rv:+.2f}%" if use_pct_rebase else f"{rv:+.2f}"
+            odraw.text((kx1 + 14 * S, kpi_y1 + 27 * S), rv_str, font=f_card_val, fill=up_c)
+
+            last_s = cls._fmt_num(s["last_val"], s["currency"])
+            first_s = cls._fmt_num(s["base_val"], s["currency"])
+            if n_ser <= 2:
+                sub_s = f"现价 {last_s}  (期初 {first_s} · 最大回撤 {s['max_dd_pct']:.1f}%)"
+            elif n_ser == 3:
+                sub_s = f"现价 {last_s} (期初 {first_s})"
+            else:
+                sub_s = f"现 {last_s} / 初 {first_s}"
+            odraw.text((kx1 + 14 * S, kpi_y1 + 53 * S), sub_s, font=f_card_sub, fill=(148, 163, 184, 240))
+
+        # 3. Plot Geometry
+        plot_left = pad_x + 88 * S
+        plot_right = (W - pad_x - 94 * S) if is_dual_axis else (W - pad_x - 166 * S)
+        plot_top = kpi_y1 + kpi_h + 28 * S
+        footer_top = H - 46 * S
+        price_bot = footer_top - 28 * S
+
+        odraw.rounded_rectangle([plot_left, plot_top, plot_right, price_bot], radius=8 * S, fill=(8, 13, 24, 215), outline=(38, 52, 75, 195), width=1 * S)
+
+        # Axis Unit Headers above plot (avoid ◀/▶ glyphs which render as boxes in some CJK fonts)
+        if is_dual_axis:
+            c0, c1 = prepped[0]["color"], prepped[1]["color"]
+            lh_txt = f"左轴刻度: {prepped[0]['short_name']} ({prepped[0]['currency'] or '价格'})"
+            rh_txt = f"右轴刻度: {prepped[1]['short_name']} ({prepped[1]['currency'] or '价格'})"
+            odraw.ellipse([plot_left, plot_top - 17 * S, plot_left + 10 * S, plot_top - 7 * S], fill=c0 + (255,))
+            odraw.text((plot_left + 15 * S, plot_top - 21 * S), lh_txt, font=f_axis_hdr, fill=c0 + (245,))
+            rb = odraw.textbbox((0, 0), rh_txt, font=f_axis_hdr)
+            rx_txt = plot_right - (rb[2] - rb[0]) - 15 * S
+            odraw.text((rx_txt, plot_top - 21 * S), rh_txt, font=f_axis_hdr, fill=c1 + (245,))
+            odraw.ellipse([plot_right - 10 * S, plot_top - 17 * S, plot_right, plot_top - 7 * S], fill=c1 + (255,))
+        else:
+            lh_txt = "▲ 区间累计涨跌幅 (共同起点 = 0.00%)" if use_pct_rebase else "▲ 相对期初变动值 (起点 = 0.00)"
+            odraw.text((plot_left, plot_top - 21 * S), lh_txt, font=f_axis_hdr, fill=(148, 163, 184, 235))
+
+        # Y-range envelope (always contains 0.0 baseline; clamp > -100% for positive prices)
+        raw_lo = min(0.0, min(min(p[3] for p in s["rel_pts"]) for s in prepped))
+        raw_hi = max(0.0, max(max(p[3] for p in s["rel_pts"]) for s in prepped))
+        r_span_raw = max(2.0, raw_hi - raw_lo)
+        bottom_pad = min(r_span_raw * 0.09, 18.0) if (use_pct_rebase and raw_lo >= -5.0) else (r_span_raw * 0.10)
+        r_min = raw_lo - bottom_pad
+        if use_pct_rebase:
+            r_min = max(-96.0, r_min)
+        r_max = raw_hi + r_span_raw * 0.12
+        r_span = max(1.0, r_max - r_min)
+
+        def val_to_y(rv: float) -> int:
+            ratio = (rv - r_min) / r_span
+            return int(price_bot - ratio * (price_bot - plot_top))
+
+        min_ord = anchor_ord
+        max_ord = max(s["rel_pts"][-1][0] for s in prepped)
+        ord_span = max(1, max_ord - min_ord)
+        right_inner_pad = (86 * S) if is_dual_axis else (14 * S)
+        pw_inner = plot_right - plot_left - 12 * S - right_inner_pad
+
+        def ord_to_x(d_ord: int) -> int:
+            return int(plot_left + 12 * S + ((d_ord - min_ord) / ord_span) * pw_inner)
+
+        # Horizontal Grid & Proportional-Locked Y-Axis Labels
+        grid_steps = 5
+        for g in range(grid_steps + 1):
+            rg = r_min + (g / grid_steps) * r_span
+            gy = val_to_y(rg)
+            if plot_top + 4 * S < gy < price_bot - 4 * S:
+                odraw.line([(plot_left, gy), (plot_right, gy)], fill=(51, 65, 85, 88), width=1 * S)
+            if is_dual_axis:
+                p0_v = max(0.0, prepped[0]["base_val"] * (1.0 + rg / 100.0))
+                p1_v = max(0.0, prepped[1]["base_val"] * (1.0 + rg / 100.0))
+                l_lbl = cls._fmt_num(p0_v, prepped[0]["currency"])
+                r_lbl = cls._fmt_num(p1_v, prepped[1]["currency"])
+                lb = odraw.textbbox((0, 0), l_lbl, font=f_axis)
+                odraw.text((plot_left - (lb[2] - lb[0]) - 10 * S, gy - 8 * S), l_lbl, font=f_axis, fill=(125, 211, 252, 235))
+                odraw.text((plot_right + 10 * S, gy - 8 * S), r_lbl, font=f_axis, fill=(252, 211, 77, 235))
+            else:
+                l_lbl = f"{rg:+.1f}%" if use_pct_rebase else f"{rg:+.2f}"
+                lb = odraw.textbbox((0, 0), l_lbl, font=f_axis)
+                odraw.text((plot_left - (lb[2] - lb[0]) - 10 * S, gy - 8 * S), l_lbl, font=f_axis, fill=(186, 200, 218, 230))
+
+        # X-Axis Calendar Ticks
+        tick_count = 6
+        y_xtick = price_bot + 7 * S
+        for t_i in range(tick_count):
+            t_ord = int(round(min_ord + (t_i / (tick_count - 1)) * ord_span))
+            tx = ord_to_x(t_ord)
+            if 0 < t_i < tick_count - 1:
+                odraw.line([(tx, plot_top), (tx, price_bot)], fill=(51, 65, 85, 60), width=1 * S)
+            dlbl = datetime.fromordinal(t_ord).strftime("%Y-%m-%d" if ord_span <= 120 else "%Y-%m")
+            db = odraw.textbbox((0, 0), dlbl, font=f_axis)
+            dw = db[2] - db[0]
+            dx = max(plot_left, min(plot_right - dw, tx - dw // 2))
+            odraw.text((dx, y_xtick), dlbl, font=f_axis, fill=(148, 163, 184, 230))
+
+        # 0.00% Common Origin Baseline (line first; pill badge rendered on top of curves below)
+        y_zero = val_to_y(0.0)
+        if plot_top + 4 * S <= y_zero <= price_bot - 4 * S:
+            for sx in range(plot_left + 4 * S, plot_right - 8 * S, 14 * S):
+                odraw.line([(sx, y_zero), (min(plot_right - 4 * S, sx + 8 * S), y_zero)], fill=(226, 232, 240, 175), width=2 * S)
+
+        # Draw All Series Curves
+        end_markers: List[Dict[str, Any]] = []
+        for s in prepped:
+            col = s["color"]
+            pts_xy = [(ord_to_x(p[0]), val_to_y(p[3])) for p in s["rel_pts"]]
+            if len(pts_xy) >= 2:
+                odraw.line(pts_xy, fill=col + (46,), width=7 * S, joint="curve")
+                odraw.line(pts_xy, fill=col + (250,), width=3 * S, joint="curve")
+            sx0, sy0 = pts_xy[0]
+            ex, ey = pts_xy[-1]
+            odraw.ellipse([sx0 - 4 * S, sy0 - 4 * S, sx0 + 4 * S, sy0 + 4 * S], fill=(248, 250, 252, 240), outline=col + (255,), width=2 * S)
+            odraw.ellipse([ex - 5 * S, ey - 5 * S, ex + 5 * S, ey + 5 * S], fill=col + (255,), outline=(248, 250, 252, 255), width=2 * S)
+            end_markers.append({"s": s, "ex": ex, "ey": ey, "adj_y": float(ey)})
+
+        # Render 0% origin tag in a crisp pill so curves never strike through text
+        if plot_top + 12 * S <= y_zero <= price_bot - 12 * S:
+            z_lbl = "0% 起点"
+            zb = odraw.textbbox((0, 0), z_lbl, font=f_card_sub)
+            zw = (zb[2] - zb[0]) + 10 * S
+            zh = 17 * S
+            zx = plot_left + 16 * S
+            zy = max(plot_top + 6 * S, y_zero - zh - 5 * S)
+            odraw.rounded_rectangle([zx, zy, zx + zw, zy + zh], radius=4 * S, fill=(15, 23, 42, 225), outline=(148, 163, 184, 140), width=1 * S)
+            odraw.text((zx + 5 * S, zy + 1 * S), z_lbl, font=f_card_sub, fill=(226, 232, 240, 235))
+
+        # 1D Repulsion Anti-Overlap for Endpoint Callout Pills
+        end_markers.sort(key=lambda m: m["adj_y"])
+        min_gap = 28 * S
+        y_lo = plot_top + 16 * S
+        y_hi = price_bot - 16 * S
+        for k in range(len(end_markers)):
+            if k == 0:
+                end_markers[k]["adj_y"] = max(float(y_lo), end_markers[k]["adj_y"])
+            else:
+                end_markers[k]["adj_y"] = max(end_markers[k]["adj_y"], end_markers[k - 1]["adj_y"] + min_gap)
+        if end_markers[-1]["adj_y"] > y_hi:
+            end_markers[-1]["adj_y"] = float(y_hi)
+            for k in range(len(end_markers) - 2, -1, -1):
+                end_markers[k]["adj_y"] = min(end_markers[k]["adj_y"], end_markers[k + 1]["adj_y"] - min_gap)
+
+        for m in end_markers:
+            s = m["s"]
+            col = s["color"]
+            ex, ey = m["ex"], m["ey"]
+            ay = int(round(m["adj_y"]))
+            rv = s["ret_val"]
+            rv_txt = f"{rv:+.2f}%" if use_pct_rebase else f"{rv:+.2f}"
+            if is_dual_axis:
+                # Dedicated right-inner lane [ex + 8*S, plot_right - 5*S]: never overlaps curves or right axis ticks
+                pill_txt = rv_txt
+                tb = odraw.textbbox((0, 0), pill_txt, font=f_pin)
+                pw_p = (tb[2] - tb[0]) + 12 * S
+                ph_p = 22 * S
+                px1 = min(plot_right - pw_p - 5 * S, ex + 9 * S)
+                py1 = ay - ph_p // 2
+                odraw.line([(ex + 5 * S, ey), (px1, ay)], fill=col + (180,), width=1 * S)
+                odraw.rounded_rectangle([px1, py1, px1 + pw_p, py1 + ph_p], radius=6 * S, fill=(15, 23, 42, 238), outline=col + (210,), width=1 * S)
+                odraw.text((px1 + 6 * S, py1 + 2 * S), pill_txt, font=f_pin, fill=col + (255,))
+            else:
+                sn = s["short_name"][:6]
+                pill_txt = f"{sn} {rv_txt}"
+                tb = odraw.textbbox((0, 0), pill_txt, font=f_pin)
+                pw_p = min(154 * S, (tb[2] - tb[0]) + 14 * S)
+                ph_p = 22 * S
+                px1 = plot_right + 10 * S
+                py1 = ay - ph_p // 2
+                odraw.line([(ex + 4 * S, ey), (px1, ay)], fill=col + (175,), width=1 * S)
+                odraw.rounded_rectangle([px1, py1, px1 + pw_p, py1 + ph_p], radius=6 * S, fill=(15, 23, 42, 238), outline=col + (210,), width=1 * S)
+                odraw.text((px1 + 7 * S, py1 + 2 * S), pill_txt, font=f_pin, fill=col + (255,))
+
+        # Footer attribution
+        wm = "Buffett Terminal Multi-Asset Rebase Engine · https://buffett.lmlu.de  |  Real-Data Script Render (Zero-AI)"
+        wb = odraw.textbbox((0, 0), wm, font=f_card_sub)
+        odraw.text((W - pad_x - (wb[2] - wb[0]), H - 34 * S), wm, font=f_card_sub, fill=(100, 116, 139, 220))
+
+        final_rgba = Image.alpha_composite(bg_img, overlay)
+        resample_mode = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+        final_rgb = final_rgba.convert("RGB").resize((W // S, H // S), resample=resample_mode)
+        final_rgb.save(out_path, "PNG", optimize=True)
+
+        series_stats = []
+        for i, s in enumerate(prepped):
+            bt = s["raw"].get("buffett") or {}
+            item_stat: Dict[str, Any] = {
+                "symbol": s["symbol"],
+                "name": s["name"],
+                "currency": s["currency"],
+                "axis": ("left_price" if i == 0 else "right_price") if is_dual_axis else "rebased_pct",
+                "anchor_date": anchor_date_str,
+                "end_date": s["last_date"],
+                "start_value": round(s["base_val"], 4),
+                "latest_value": round(s["last_val"], 4),
+                "period_change_pct": round(s["ret_val"], 2),
+                "period_high": round(s["high_val"], 4),
+                "period_low": round(s["low_val"], 4),
+                "max_drawdown_pct": round(s["max_dd_pct"], 2),
+                "source": s["raw"].get("source", ""),
+            }
+            if bt and bt.get("has_analysis"):
+                item_stat["buffett_terminal"] = {
+                    "investment_decision": bt.get("investment_decision"),
+                    "buy_zone": [bt.get("buy_zone_lower"), bt.get("buy_zone_upper")],
+                    "margin_to_upper_pct": bt.get("margin_to_upper_pct"),
+                }
+            series_stats.append(item_stat)
+
+        return {
+            "alignment_mode": alignment_mode,
+            "period_label": period_label,
+            "date_range": f"{anchor_date_str} ~ {end_date_str}",
+            "leader": {"name": leader["name"], "symbol": leader["symbol"], "period_change_pct": round(leader["ret_val"], 2)},
+            "laggard": {"name": laggard["name"], "symbol": laggard["symbol"], "period_change_pct": round(laggard["ret_val"], 2)},
+            "spread_pct": round(spread_val, 2),
+            "series_stats": series_stats,
+        }
+
 
 class FinancialChartPlugin(BasePlugin):
     name = "generate_financial_chart"
     description = (
         "通过本机真实金融/宏观经济数据脚本直接绘制高清走势图（非AI生图）并发送到微信聊天中。"
+        "支持单标的走势图与 2~5 支多标的同图叠加对比走势图（自动按共同起点 0% 归一化对齐，双标的使用等比例锁定左右双价格轴，股价 1 与 1000 也可同图精准对比）。"
         "融合 https://buffett.lmlu.de/ 巴菲特安全边际估值击球区数据，支持全球股票（美股/韩股如海力士000660.KS/日股/港股/A股）、"
         "大盘指数、黄金原油大宗商品、汇率、美债收益率、加密货币以及中国/美国 CPI、PPI、PMI、M2、GDP 等宏观经济指标的多周期（1月~10年）价格图表。"
     )
@@ -1102,7 +1557,12 @@ class FinancialChartPlugin(BasePlugin):
         "properties": {
             "symbol": {
                 "type": "string",
-                "description": "股票、资产或宏观经济指标名称/代码，例如：'海力士'、'000660.KS'、'AAPL'、'NVDA'、'茅台'、'泡泡玛特'、'黄金'、'原油'、'10年期美债'、'比特币'、'中国CPI'、'美国CPI'、'制造业PMI'",
+                "description": "单支股票/指数/宏观指标名称或代码（如 '海力士'、'000660.KS'、'NVDA'、'黄金'、'中国CPI'）；多支同图对比也可用英文逗号分隔传入（如 '上证指数,纳指'）",
+            },
+            "symbols": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "多支股票/指数/资产同图对比列表（2~5支），例如 ['上证指数', '纳指'] 或 ['NVDA', 'TSM', '000660.KS']；系统会自动按共同起点归一化并对标双轴同图绘制",
             },
             "period": {
                 "type": "string",
@@ -1110,7 +1570,7 @@ class FinancialChartPlugin(BasePlugin):
                 "default": "1y",
             },
         },
-        "required": ["symbol"],
+        "required": [],
     }
 
     _PERIOD_EXTRACT_RE = re.compile(
@@ -1123,7 +1583,17 @@ class FinancialChartPlugin(BasePlugin):
     _DEICTIC_SYM_RE = re.compile(
         r'^(?:对应的?|相对应的?|它的?|这个|这只|这支|该|该股|该标的|该指数|'
         r'上面(?:那个|那只|这只|这个|说的|提到的|的)?|刚才(?:那个|那只|说的|提到的|聊的|的)?|'
-        r'前面(?:那个|说的|的)?|同上|相关|上述|大a|大A|a股|A股)?$'
+        r'前面(?:那个|说的|的)?|同上|相关|上述)?$'
+    )
+
+    _MULTI_FOLLOWUP_RE = re.compile(
+        r'(?:(?:两|俩|二|三|四|五|几)[个支只条]?(?:标的|股票|指数)?(?:一起|一块|放一[起张个]|合[在并]?一[起张个]|画在一[起张个]|同图)|'
+        r'(?:他俩|它俩|它们|这俩|那俩|二者|两者|双方).{0,10}(?:图|画|对比|走势|一起)|'
+        r'(?:放|合|画|叠|塞)[在到]?同一?[个张幅]图|同图(?:对比|走势|展示|绘制)?|(?:和|与|跟|同).{1,12}(?:放同一?[个张]图|一起画|同图对比))'
+    )
+
+    _MULTI_SPLIT_RE = re.compile(
+        r'(?:\s+(?:vs\.?|VS\.?|versus|pk|PK)\s+|(?<![A-Za-z])(?:vs\.?|VS\.?|pk|PK)(?![A-Za-z])|[、,，/／&＆]|(?:和|与|跟|对比|对标|相比|叠加))'
     )
 
     _PAREN_TICKER_RE = re.compile(
@@ -1139,6 +1609,40 @@ class FinancialChartPlugin(BasePlugin):
         return t
 
     @classmethod
+    def _canonical_symbol_key(cls, raw_sym: str) -> str:
+        """Map synonyms (e.g. '大A' / '上证指数' / 'sh000001' / '000001.SS') to a single canonical key."""
+        s = (raw_sym or "").strip()
+        s_low = s.lower()
+        if s_low in MACRO_ALIASES:
+            m = MACRO_ALIASES[s_low]
+            return f"macro:{m.get('report') or m.get('indicator')}:{m.get('country', 'CN')}"
+        if s_low in GLOBAL_ASSET_ALIASES:
+            return f"yf:{GLOBAL_ASSET_ALIASES[s_low][0].upper()}"
+        if s in NAME_TO_CODE:
+            c = NAME_TO_CODE[s]
+            c_up = c.upper()
+            remap = {
+                "SH000001": "000001.SS", "SH000300": "000300.SS", "SH000905": "000905.SS",
+                "SH000852": "000852.SS", "SH000688": "000688.SS", "SZ399001": "399001.SZ",
+                "SZ399006": "399006.SZ", "HKHSI": "^HSI", "HKHSTECH": "3033.HK",
+                "USIXIC": "^IXIC", "USDJI": "^DJI", "SPY": "^GSPC",
+            }
+            if c_up in remap:
+                return f"yf:{remap[c_up]}"
+            if re.fullmatch(r'\d{6}', c):
+                suf = ".SS" if c.startswith(("60", "68")) else (".SZ" if c.startswith(("00", "30")) else ".BJ")
+                return f"yf:{c}{suf}"
+            if re.fullmatch(r'\d{5}', c):
+                hk_i = int(c)
+                return f"yf:{hk_i:04d}.HK" if hk_i < 10000 else f"yf:{hk_i}.HK"
+            return f"yf:{c_up.replace('.', '-')}"
+        if re.fullmatch(r'(?:sh|sz|bj)\d{6}', s_low):
+            code6 = s_low[2:]
+            suf = ".SS" if s_low.startswith("sh") else (".SZ" if s_low.startswith("sz") else ".BJ")
+            return f"yf:{code6}{suf}"
+        return f"raw:{s_low}"
+
+    @classmethod
     def is_chart_generation_request(cls, text: str) -> bool:
         """Return True if the message asks the bot to generate/send a financial or macro data chart."""
         t = cls._clean_query_mentions(text)
@@ -1149,17 +1653,18 @@ class FinancialChartPlugin(BasePlugin):
         if re.search(
             r'(?:这张|这个|上面这[个张]?|我的这[个张]?|图里|图上|截图中|截图里).{0,8}(?:走势图|k线图|K线图|图|截图|照片)',
             t,
-        ) and not re.search(r'(?:给我|发给我|重画|画一|生成)', t):
+        ) and not re.search(r'(?:给我|发给我|重画|画一|生成|放同一|一起画|同图)', t):
             return False
         if any(w in t for w in ["重制", "P图", "p图", "把图里", "把照片", "壁纸", "表情包", "头像", "长啥样", "照片"]):
             return False
 
         explicit_chart_word = bool(re.search(
-            r'(?:走势图|股价图|价格图|行情图|k线图|K线图|折线图|曲线图|估值图|分时图)',
+            r'(?:走势图|股价图|价格图|行情图|k线图|K线图|折线图|曲线图|估值图|分时图|对比图)',
             t,
         ))
-        has_chart_noun = explicit_chart_word or bool(re.search(
-            r'(?:给我|发给我|发一?[张个幅下]?|来一?[张个幅]?|画一?[张个幅下]?|看一?[下张]?|生成一?[张个幅]?|拉一?[张个下]?|贴一?[张个下]?|补一?[张个下]?).{0,22}(?:图|图表|曲线)',
+        multi_followup_cue = bool(cls._MULTI_FOLLOWUP_RE.search(t))
+        has_chart_noun = explicit_chart_word or multi_followup_cue or bool(re.search(
+            r'(?:给我|发给我|发一?[张个幅下]?|来一?[张个幅]?|画一?[张个幅下]?|绘制一?[张个幅下]?|对比一?[下张]?|看一?[下张]?|生成一?[张个幅]?|拉一?[张个下]?|贴一?[张个下]?|补一?[张个下]?).{0,26}(?:图|图表|曲线)',
             t,
         ))
         if not has_chart_noun:
@@ -1168,12 +1673,13 @@ class FinancialChartPlugin(BasePlugin):
         fin_cues = [
             "股价", "股票", "走势", "行情", "k线", "K线", "价格", "市值", "估值", "买点", "击球区",
             "金价", "黄金", "白银", "原油", "油价", "汇率", "人民币", "日元", "美元", "美债", "收益率",
-            "指数", "纳指", "标普", "道指", "恒指", "上证", "沪深", "创业板", "科创", "比特币", "以太坊",
+            "指数", "纳指", "标普", "道指", "恒指", "上证", "沪深", "创业板", "科创", "大a", "a股", "比特币", "以太坊",
             "cpi", "ppi", "pmi", "gdp", "m2", "通胀", "失业率", "利率",
         ]
         t_low = t.lower()
         has_fin_cue = (
             explicit_chart_word
+            or multi_followup_cue
             or any(fc.lower() in t_low for fc in fin_cues)
             or any(ak in t_low for ak in GLOBAL_ASSET_ALIASES)
             or any(mk in t_low for mk in MACRO_ALIASES)
@@ -1183,10 +1689,10 @@ class FinancialChartPlugin(BasePlugin):
         return has_fin_cue
 
     @classmethod
-    def _find_alias_in_text(cls, text_snippet: str) -> Optional[str]:
-        """Find the earliest non-shadowed known macro/global/stock alias in text_snippet."""
+    def _find_all_aliases_in_text(cls, text_snippet: str) -> List[str]:
+        """Find all non-shadowed known macro/global/stock aliases in left-to-right order, deduplicated canonically."""
         if not text_snippet:
-            return None
+            return []
         s_low = text_snippet.lower()
         spans: List[Tuple[int, int, str]] = []
 
@@ -1196,21 +1702,23 @@ class FinancialChartPlugin(BasePlugin):
                     continue
                 needle = k.lower() if is_lower else k
                 if needle.isascii():
-                    m = re.search(r'(?<![a-z0-9])' + re.escape(needle) + r'(?![a-z0-9])', target_str)
-                    if m:
+                    for m in re.finditer(r'(?<![a-z0-9])' + re.escape(needle) + r'(?![a-z0-9])', target_str):
                         spans.append((m.start(), m.end(), k))
                 else:
-                    idx = target_str.find(needle)
-                    if idx >= 0:
+                    start_pos = 0
+                    while True:
+                        idx = target_str.find(needle, start_pos)
+                        if idx < 0:
+                            break
                         spans.append((idx, idx + len(needle), k))
+                        start_pos = idx + len(needle)
 
         _collect(MACRO_ALIASES.keys(), s_low, True)
         _collect(GLOBAL_ASSET_ALIASES.keys(), s_low, True)
         _collect(NAME_TO_CODE.keys(), text_snippet, False)
         if not spans:
-            return None
+            return []
 
-        # Discard spans completely covered by a strictly longer span
         filtered: List[Tuple[int, int, str]] = []
         for s1, e1, k1 in spans:
             shadowed = any(
@@ -1220,38 +1728,94 @@ class FinancialChartPlugin(BasePlugin):
             if not shadowed:
                 filtered.append((s1, e1, k1))
         filtered.sort(key=lambda item: (item[0], -(item[1] - item[0])))
-        return filtered[0][2]
+
+        out: List[str] = []
+        seen_canon = set()
+        used_ranges: List[Tuple[int, int]] = []
+        for s1, e1, k1 in filtered:
+            if any(not (e1 <= us or s1 >= ue) for us, ue in used_ranges):
+                continue
+            ck = cls._canonical_symbol_key(k1)
+            if ck not in seen_canon:
+                seen_canon.add(ck)
+                out.append(k1)
+                used_ranges.append((s1, e1))
+        return out
+
+    @classmethod
+    def _find_alias_in_text(cls, text_snippet: str) -> Optional[str]:
+        all_found = cls._find_all_aliases_in_text(text_snippet)
+        return all_found[0] if all_found else None
 
     @classmethod
     def _strip_to_symbol_candidate(cls, sym_text: str) -> str:
-        sym_clean = re.sub(
-            r'^(?:请|麻烦|帮我|劳驾|能不能|可以)?(?:把|将)?'
-            r'(?:给我|发给我|发一下|发下|发个|发|来一下|来个|来|画一下|画个|画|绘制|生成|看下|看看|查下|查一下|拉一下|贴一下|补一下)?'
+        s = re.sub(
+            r'[，,。；;\s]*(?:放[在到]?同一?[个张幅]图[里上中]?|合[在并到]?一[张个幅]图[里上中]?|'
+            r'画[在到]?一[起张个](?:图[里上中]?)?|放一起(?:对比)?|同图(?:对比|展示|绘制|走势)?|一[起块]画).*$',
+            '',
+            sym_text or '',
+        ).strip()
+        s = re.sub(
+            r'^(?:请|麻烦|帮我|劳驾|能不能|可以)?(?:把|将|用)?'
+            r'(?:给我|发给我|发一下|发下|发个|发|来一下|来个|来|画一下|画个|画|绘制一下|绘制|'
+            r'对比一下|对比下|对比|比较一下|比较|叠加一下|叠加|生成一下|生成|看下|看看|查下|查一下|拉一下|贴一下|补一下)?'
             r'(?:一[张个幅份])?',
             '',
-            sym_text,
+            s,
         ).strip()
-        sym_clean = re.sub(
+        s = re.sub(
             r'(?:最近|近|过去)?(?:的)?(?:历史|实时|最新)?(?:巴菲特)?'
-            r'(?:估值|安全边际|股价|股票|收盘价|价格|行情|走势|k线|K线|折线|曲线|数据)?(?:的)?'
-            r'(?:走势图|股价图|价格图|行情图|k线图|K线图|折线图|曲线图|估值图|分时图|图表|图片|图)'
+            r'(?:估值|安全边际|股价|股票|收盘价|价格|行情|走势|k线|K线|折线|曲线|数据|对比)?(?:的)?'
+            r'(?:走势图|股价图|价格图|行情图|k线图|K线图|折线图|曲线图|估值图|分时图|对比图|图表|图片|图)?'
             r'(?:发出来|发群里|发一下|发下|发给我|给我看下|给我看看|画出来|生成出来|拉出来)?[吗呢吧呀啊呗！!？?。～~]*$',
             '',
-            sym_clean,
+            s,
         ).strip()
-        return sym_clean.strip("的 　,，:：")
+        s = re.sub(r'^(?:以及|还有|再加|加上)\s*', '', s).strip()
+        return s.strip("的 　,，:：")
 
     @classmethod
-    def _resolve_from_history(
+    def _extract_multi_symbols(cls, sym_text: str, full_t: str) -> List[str]:
+        """Extract 2~5 distinct target symbols when query asks to compare multiple assets on one chart."""
+        core = cls._strip_to_symbol_candidate(sym_text)
+        results: List[str] = []
+        seen_canon = set()
+
+        if cls._MULTI_SPLIT_RE.search(core):
+            raw_parts = cls._MULTI_SPLIT_RE.split(core)
+            for p in raw_parts:
+                pc = cls._strip_to_symbol_candidate(p)
+                if not pc or cls._DEICTIC_SYM_RE.match(pc):
+                    continue
+                known = cls._find_alias_in_text(pc)
+                cand = known if known else (pc if 1 <= len(pc) <= 18 else "")
+                if not cand:
+                    continue
+                ck = cls._canonical_symbol_key(cand)
+                if ck not in seen_canon:
+                    seen_canon.add(ck)
+                    results.append(cand)
+            if len(results) >= 2:
+                return results[:5]
+
+        # Fallback: scan known aliases directly if explicit comparison/conjunction cue exists
+        if re.search(r'(?:和|与|跟|同|vs|VS|pk|PK|对比|对标|相比|叠加|同一|同图|一起|[、,，/／&＆])', full_t):
+            all_aliases = cls._find_all_aliases_in_text(sym_text)
+            if len(all_aliases) < 2:
+                all_aliases = cls._find_all_aliases_in_text(full_t)
+            if len(all_aliases) >= 2:
+                return all_aliases[:5]
+        return []
+
+    @classmethod
+    def _build_history_candidates(
         cls,
         current_clean: str,
         recent_history: Optional[List[Dict[str, Any]]] = None,
         quote_info: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[Optional[str], Optional[str]]:
-        """Resolve deictic symbol & recent period from quoted message or recent chat history."""
+    ) -> List[Tuple[str, bool]]:
         now = time.time()
         candidates: List[Tuple[str, bool]] = []
-
         if isinstance(quote_info, dict) and quote_info.get("has_quote"):
             qc = cls._clean_query_mentions(str(quote_info.get("quoted_content") or ""))
             if qc and qc != current_clean:
@@ -1268,11 +1832,20 @@ class FinancialChartPlugin(BasePlugin):
             hc = cls._clean_query_mentions(raw_hc)
             if not hc or hc == current_clean:
                 continue
-            # Skip earlier hallucinated/deictic chart messages that lack concrete entities
             if is_bot and any(p in hc for p in ["这次真发了", "发不了图"]):
                 continue
             candidates.append((hc, is_bot))
+        return candidates
 
+    @classmethod
+    def _resolve_from_history(
+        cls,
+        current_clean: str,
+        recent_history: Optional[List[Dict[str, Any]]] = None,
+        quote_info: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[str], Optional[str]]:
+        """Resolve single deictic symbol & recent period from quoted message or recent chat history."""
+        candidates = cls._build_history_candidates(current_clean, recent_history=recent_history, quote_info=quote_info)
         resolved_sym: Optional[str] = None
         for hc, is_bot in candidates:
             probe = hc[:180] if is_bot else hc
@@ -1301,13 +1874,70 @@ class FinancialChartPlugin(BasePlugin):
         return resolved_sym, resolved_per
 
     @classmethod
+    def _resolve_multi_from_history(
+        cls,
+        current_clean: str,
+        seed_symbols: List[str],
+        recent_history: Optional[List[Dict[str, Any]]] = None,
+        quote_info: Optional[Dict[str, Any]] = None,
+        desired_count: int = 2,
+    ) -> Tuple[List[str], Optional[str]]:
+        """Collect 2~5 distinct canonical symbols from recent context when user asks to plot them together."""
+        candidates = cls._build_history_candidates(current_clean, recent_history=recent_history, quote_info=quote_info)
+        collected: List[str] = []
+        seen_canon = set()
+
+        for s0 in seed_symbols:
+            ck0 = cls._canonical_symbol_key(s0)
+            if ck0 not in seen_canon:
+                seen_canon.add(ck0)
+                collected.append(s0)
+
+        hist_found: List[str] = []
+        for hc, is_bot in candidates:
+            probe = hc[:240] if is_bot else hc
+            for al in cls._find_all_aliases_in_text(probe):
+                ck = cls._canonical_symbol_key(al)
+                if ck not in seen_canon:
+                    seen_canon.add(ck)
+                    hist_found.append(al)
+                    if len(collected) + len(hist_found) >= desired_count:
+                        break
+            if len(collected) + len(hist_found) >= desired_count:
+                break
+            for m_tk in cls._PAREN_TICKER_RE.finditer(probe):
+                tk = m_tk.group(1)
+                ck = cls._canonical_symbol_key(tk)
+                if ck not in seen_canon:
+                    seen_canon.add(ck)
+                    hist_found.append(tk)
+                    if len(collected) + len(hist_found) >= desired_count:
+                        break
+            if len(collected) + len(hist_found) >= desired_count:
+                break
+
+        # Put older context symbols first, followed by newly added seed symbol (chronological order)
+        hist_found.reverse()
+        merged = (hist_found + collected)[:max(2, min(5, desired_count))]
+
+        resolved_per: Optional[str] = None
+        for hc, is_bot in candidates[:5]:
+            probe_p = hc[:120] if is_bot else hc
+            mp = cls._PERIOD_EXTRACT_RE.search(probe_p)
+            if mp:
+                resolved_per = mp.group(1).strip()
+                break
+
+        return merged, resolved_per
+
+    @classmethod
     def extract_chart_intent(
         cls,
         text: str,
         recent_history: Optional[List[Dict[str, Any]]] = None,
         quote_info: Optional[Dict[str, Any]] = None,
-    ) -> Optional[Dict[str, str]]:
-        """Detect if user asks for a stock/asset/macro data chart image and extract {symbol, period}."""
+    ) -> Optional[Dict[str, Any]]:
+        """Detect if user asks for a single or multi-asset comparison chart and extract {symbol|symbols, period}."""
         if not cls.is_chart_generation_request(text):
             return None
         t = cls._clean_query_mentions(text)
@@ -1319,10 +1949,36 @@ class FinancialChartPlugin(BasePlugin):
         if m_per:
             period = m_per.group(1).strip()
 
-        # Extract clean target symbol
         sym_text = t.replace(m_per.group(0), " ") if m_per else t
 
-        # 1. Position-aware priority match against macro, global aliases, and NAME_TO_CODE
+        # 0. Multi-asset comparison in a single message (e.g. "绘制一下大A和纳指今年的走势图，放在同一个图")
+        multi_syms = cls._extract_multi_symbols(sym_text, t)
+        if len(multi_syms) >= 2:
+            if not has_explicit_period and (recent_history or quote_info):
+                _, ctx_per = cls._resolve_from_history(t, recent_history=recent_history, quote_info=quote_info)
+                if ctx_per:
+                    period = ctx_per
+            return {"symbols": multi_syms, "period": period}
+
+        # 0.5 Multi-asset follow-up (e.g. "两个一起画你是不是不行？" / "跟纳指放同一张图对比")
+        if cls._MULTI_FOLLOWUP_RE.search(t):
+            desired = 3 if "三" in t else (4 if "四" in t else (5 if "五" in t else 2))
+            seed_one = cls._find_all_aliases_in_text(sym_text)[:1]
+            ctx_multi, ctx_per = cls._resolve_multi_from_history(
+                t,
+                seed_symbols=seed_one,
+                recent_history=recent_history,
+                quote_info=quote_info,
+                desired_count=desired,
+            )
+            if len(ctx_multi) >= 2:
+                final_per = period if has_explicit_period else (ctx_per or "1y")
+                return {"symbols": ctx_multi, "period": final_per}
+            # If user asked "两个一起画" without 2 financial symbols in history, do not emit bogus single symbol
+            if not seed_one:
+                return None
+
+        # 1. Single-asset position-aware priority match against macro, global aliases, and NAME_TO_CODE
         known = cls._find_alias_in_text(sym_text) or cls._find_alias_in_text(t)
         if known:
             return {"symbol": known, "period": period}
@@ -1340,18 +1996,118 @@ class FinancialChartPlugin(BasePlugin):
             return {"symbol": sym_clean, "period": period}
         return None
 
-    def execute(self, symbol: str = "", period: str = "1y", **kwargs) -> dict:
-        sym = (symbol or kwargs.get("query") or kwargs.get("ticker") or "").strip()
+    def execute(
+        self,
+        symbol: str = "",
+        period: str = "1y",
+        symbols: Optional[List[str]] = None,
+        **kwargs,
+    ) -> dict:
         per = (period or kwargs.get("range") or "1y").strip()
-        if not sym:
-            return {"error": "请提供股票代码、资产名称或宏观经济指标"}
+        raw_list: List[str] = []
+        if isinstance(symbols, list):
+            for item in symbols:
+                if item and str(item).strip():
+                    raw_list.append(str(item).strip())
+        elif isinstance(symbols, str) and symbols.strip():
+            raw_list.extend([x.strip() for x in re.split(r'[,，、;；]+', symbols) if x.strip()])
+
+        sym_single = (symbol or kwargs.get("query") or kwargs.get("ticker") or "").strip()
+        if sym_single:
+            if re.search(r'[,，、]|\s+vs\.?\s+', sym_single, flags=re.IGNORECASE):
+                for part in re.split(r'[,，、]|\s+vs\.?\s+', sym_single, flags=re.IGNORECASE):
+                    if part.strip():
+                        raw_list.append(part.strip())
+            elif not raw_list:
+                raw_list.append(sym_single)
+
+        # Deduplicate input list preserving order
+        sym_list: List[str] = []
+        seen_in = set()
+        for s_item in raw_list:
+            ck = self._canonical_symbol_key(s_item)
+            if ck not in seen_in:
+                seen_in.add(ck)
+                sym_list.append(s_item)
+        sym_list = sym_list[:5]
+
+        if not sym_list:
+            return {"error": "请提供至少一个股票代码、资产名称或宏观经济指标"}
 
         cleanup_temp_charts()
+        tmp_dir = "/tmp" if os.path.isdir("/tmp") else os.environ.get("TEMP", ".")
+
+        # Multi-Asset Same-Chart Comparison Path (2~5 symbols)
+        if len(sym_list) >= 2:
+            with ThreadPoolExecutor(max_workers=min(5, len(sym_list))) as pool:
+                fetched_list = list(pool.map(lambda q_sym: MarketChartDataEngine.resolve_and_fetch(q_sym, per), sym_list))
+
+            valid_series: List[Dict[str, Any]] = []
+            seen_resolved = set()
+            failed_items: List[str] = []
+            for req_s, f_res in zip(sym_list, fetched_list):
+                if isinstance(f_res, dict) and not f_res.get("error") and f_res.get("bars"):
+                    rk = f"{f_res.get('symbol')}::{f_res.get('name')}"
+                    if rk not in seen_resolved:
+                        seen_resolved.add(rk)
+                        valid_series.append(f_res)
+                else:
+                    err_msg = f_res.get("error") if isinstance(f_res, dict) else "未知错误"
+                    failed_items.append(f"{req_s}: {err_msg}")
+
+            if len(valid_series) < 2:
+                if len(valid_series) == 1 and not failed_items:
+                    # Two synonyms resolved to the exact same asset -> fall through to single chart
+                    sym_list = [valid_series[0]["symbol"]]
+                else:
+                    return {
+                        "error": f"多标的同图对比需要至少2个有效数据序列（当前成功 {len(valid_series)} 个）；失败详情: {'; '.join(failed_items)}"
+                    }
+            else:
+                tag_slug = "_vs_".join(
+                    re.sub(r'[^A-Za-z0-9]', '', str(v.get("symbol", "S")))[:6] or "S"
+                    for v in valid_series[:4]
+                )
+                out_png = os.path.join(tmp_dir, f"wechat_search_chart_cmp_{tag_slug}_{int(time.time() * 1000)}.png")
+                period_lbl = valid_series[0].get("period_label") or parse_period_spec(per)[3]
+                try:
+                    comp_meta = BuffettChartRenderer.render_comparison(valid_series, period_lbl, out_png)
+                except Exception as ce:
+                    return {"error": f"本机绘制多标的对比走势图异常: {ce}"}
+
+                sender_fn = get_image_sender()
+                sent_ok = False
+                if sender_fn:
+                    res_send = sender_fn(out_png)
+                    sent_ok = res_send[0] if isinstance(res_send, tuple) else bool(res_send)
+
+                names_joined = " vs ".join(str(v.get("name") or v.get("symbol")) for v in valid_series)
+                syms_joined = " vs ".join(str(v.get("symbol")) for v in valid_series)
+                out_summary: Dict[str, Any] = {
+                    "status": "success",
+                    "type": "financial_comparison_chart",
+                    "alignment_mode": comp_meta["alignment_mode"],
+                    "image_sent_to_wechat": sent_ok,
+                    "image_path": out_png,
+                    "symbol": syms_joined,
+                    "name": names_joined,
+                    "period": comp_meta["period_label"],
+                    "common_date_range": comp_meta["date_range"],
+                    "leader": comp_meta["leader"],
+                    "laggard": comp_meta["laggard"],
+                    "spread_pct": comp_meta["spread_pct"],
+                    "series": comp_meta["series_stats"],
+                }
+                if failed_items:
+                    out_summary["partial_warnings"] = failed_items
+                return out_summary
+
+        # Single-Asset Chart Path
+        sym = sym_list[0]
         chart_data = MarketChartDataEngine.resolve_and_fetch(sym, per)
         if "error" in chart_data:
             return chart_data
 
-        tmp_dir = "/tmp" if os.path.isdir("/tmp") else os.environ.get("TEMP", ".")
         safe_sym = re.sub(r'[^A-Za-z0-9_\u4e00-\u9fa5]', '_', str(chart_data.get("symbol", "chart")))[:24]
         out_png = os.path.join(tmp_dir, f"wechat_search_chart_{safe_sym}_{int(time.time() * 1000)}.png")
 
