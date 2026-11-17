@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import deque
@@ -2567,45 +2568,208 @@ def apply_political_euphemisms(text: str) -> str:
     return out
 
 
-def clean_bot_reply(text):
+# 高危红线词（即使替换姓名，微信大模型风控仍极易整段静默吞消息或触发账号限制，命中后微信仅发便签柜链接）
+_HIGH_RISK_POLITICAL_RE = re.compile(
+    r'八九六四|六四事件|六四运动|六四风波|八九民运|8964|天安门清场|天安门事件|八十年代末那场风波|'
+    r'白纸运动|白纸革命|22年底线下风波|乌鲁木齐中路|四通桥|彭立发|彭载舟|北三环桥头风波|'
+    r'习包子|庆丰帝|总加速师|习维尼|习特勒|毛腊肉|'
+    r'废除任期|取消任期限制|修宪连任|终身制|无限连任|定于一尊|'
+    r'一党专政|中共独裁|专制独裁|煽动颠覆|寻衅滋事罪|秦城监狱|妄议中央|文字狱|防火长城|网络防火墙|'
+    r'法轮功|活摘器官|再教育营|新疆集中营'
+)
+
+# 模型已主动使用避讳代称的特征词（用于识别大模型已按 Prompt 避讳的敏感政治回复，同样同步贴入 box）
+_EUPHEMISM_OUTPUT_MARKERS_RE = re.compile(
+    r'现任一号位|当今最高层|初代刘公|第三代江公|第四代胡公|过渡期华公|'
+    r'80年代胡公|80年代赵公|80年代李公|80年代杨公|90年代李相|上届李相|本届李相|'
+    r'现人大赵公|现政协王公|中枢蔡公|常务丁相|纪检李公|前任王公|上届人大栗公|上届政协汪公|'
+    r'前常务张相|前人大张公|前政协俞公|前宣传刘公|前人大吴公|前政协贾公|前宣传李公|'
+    r'前纪检贺公|前纪检吴公|前政法罗公|前常务黄相|前政协李公|90年代乔公|元老宋公|前常务姚相|'
+    r'军委张公|军委何公|现财经何公|前财经刘公|前副相胡公|前副相孙公|副相张公|副相刘公|'
+    r'公安王公|政法陈公|统战石公|宣传李公|中组李公|沪上陈公|京城尹公|渝州袁公|岭南黄公|'
+    r'林氏元帅|特殊时期江氏|特殊时期四人集团|十年特殊时期|'
+    r'昔日渝州薄某|昔日政法周某|昔日中办令某|昔日军中徐某|昔日军中郭某|昔日渝州孙某|'
+    r'前外长秦某|前防长李某|前防长魏某|前军委苗某'
+)
+
+_CONTEXTUAL_EUPHEMISM_RE = re.compile(
+    r'(?=[\s\S]*(?:教员|邓公|周公|朱相|温相|朱老总|董老|庆龄先生))'
+    r'(?=[\s\S]*(?:任期|总理|主席|元首|国务院|常委|接班|退居二线|宪法|建国|中央|执政|总书记))'
+)
+
+_DOMESTIC_POLITICAL_TOPIC_RE = re.compile(
+    r'文化大革命|四人帮|(?:政治局常委|中央政治局|中南海|党政军|国家主席|国务院总理|中共中央总书记)'
+    r'[\s\S]{0,60}(?:接班|换届|派系|团派|太子党|罢免|落马|双规|权力)'
+)
+
+_box_sync_lock = threading.Lock()
+_box_cached_token = ""
+_box_token_ts = 0.0
+_box_auth_cooldown_until = 0.0
+
+
+def detect_political_sensitivity(query_text: str, raw_clean_text: str):
+    """检测回复是否涉及国内政治敏感人物或事件。
+    返回: (is_sensitive: bool, is_high_risk: bool, reason: str)
+    """
+    if not raw_clean_text:
+        return False, False, ""
+    combined = f"{query_text or ''}\n{raw_clean_text}"
+    if _HIGH_RISK_POLITICAL_RE.search(combined):
+        return True, True, "high_risk_redline"
+    if apply_political_euphemisms(raw_clean_text) != raw_clean_text:
+        return True, False, "leader_or_phrase_replaced"
+    if _EUPHEMISM_OUTPUT_MARKERS_RE.search(raw_clean_text) or _CONTEXTUAL_EUPHEMISM_RE.search(raw_clean_text):
+        return True, False, "llm_euphemism_used"
+    if _DOMESTIC_POLITICAL_TOPIC_RE.search(raw_clean_text):
+        return True, False, "domestic_political_topic"
+    return False, False, ""
+
+
+def post_sensitive_reply_to_box(sender: str, question: str, reply_text: str, cfg: dict):
+    """将敏感回复完整原文直接贴入 FileCodeBox 固定通道 (默认 https://box.lmlu.de/?code=666)。"""
+    global _box_cached_token, _box_token_ts, _box_auth_cooldown_until
+    if not reply_text or not cfg.get("box_sync_sensitive", True):
+        return None
+
+    base_url = str(cfg.get("box_base_url") or "https://box.lmlu.de").strip().rstrip("/")
+    code = str(cfg.get("box_channel_code") or "666").strip()
+    guest_pwd = str(cfg.get("box_guest_password") or "").strip()
+    if not base_url or not code:
+        return None
+
+    share_url = f"{base_url}/?code={urllib.parse.quote(code)}"
+    ua_headers = {
+        "User-Agent": "Mozilla/5.0 (X11; Linux aarch64) WeChatVisionBot/1.0",
+        "Accept": "application/json",
+    }
+
+    def _ensure_box_token(force_refresh: bool = False) -> str:
+        global _box_cached_token, _box_token_ts, _box_auth_cooldown_until
+        now_t = time.time()
+        with _box_sync_lock:
+            if now_t < _box_auth_cooldown_until:
+                return ""
+            if not force_refresh and _box_cached_token and (now_t - _box_token_ts < 7 * 86400):
+                return _box_cached_token
+
+            # Check if guest gate is enabled
+            try:
+                st_req = urllib.request.Request(f"{base_url}/api/guest/status", headers=ua_headers)
+                with urllib.request.urlopen(st_req, timeout=6) as r:
+                    st_data = json.loads(r.read().decode("utf-8", errors="ignore"))
+                if not st_data.get("gate_enabled", True):
+                    _box_cached_token = ""
+                    _box_token_ts = now_t
+                    return ""
+                if st_data.get("ip_locked"):
+                    _box_auth_cooldown_until = now_t + 960
+                    log_msg("⚠️ FileCodeBox 当前 IP 处于锁定冷却状态，暂停自动贴入")
+                    return ""
+            except Exception as se:
+                log_msg(f"查询 FileCodeBox 状态异常: {se}")
+                return _box_cached_token
+
+            if not guest_pwd:
+                log_msg("⚠️ FileCodeBox 开启了访客门禁，但 config.json 未配置 box_guest_password")
+                return ""
+
+            try:
+                v_body = json.dumps({"password": guest_pwd}).encode("utf-8")
+                v_hdrs = dict(ua_headers)
+                v_hdrs["Content-Type"] = "application/json"
+                v_req = urllib.request.Request(f"{base_url}/api/guest/verify", data=v_body, headers=v_hdrs, method="POST")
+                with urllib.request.urlopen(v_req, timeout=6) as vr:
+                    v_data = json.loads(vr.read().decode("utf-8", errors="ignore"))
+                tok = str(v_data.get("token") or "")
+                if tok:
+                    _box_cached_token = tok
+                    _box_token_ts = now_t
+                    return tok
+            except urllib.error.HTTPError as he:
+                if he.code in (401, 429):
+                    # 立即熔断 30 分钟，绝不连续重试触发 5 次锁 IP
+                    _box_auth_cooldown_until = now_t + 1800
+                    log_msg(f"⚠️ FileCodeBox 访客密码校验未通过 (HTTP {he.code})，已熔断冷却 30 分钟防止锁 IP")
+                else:
+                    log_msg(f"FileCodeBox 访客认证 HTTP 异常: {he.code}")
+            except Exception as ve:
+                log_msg(f"FileCodeBox 访客认证异常: {ve}")
+            return ""
+
+    safe_sender = re.sub(r'[<>\"\'`$\\\r\n]', '', str(sender or "群友")).strip()[:20] or "群友"
+    clean_q = strip_bot_mentions(question or "").strip() or (question or "").strip()
+    short_q = re.sub(r'[<>\"\'`$\\\r\n]', '', clean_q)[:24] or "敏感提问"
+    now_bj = datetime.now(TZ_BJ)
+    note_title = f"回复 {safe_sender}｜{short_q} ({now_bj.strftime('%m-%d %H:%M')})"
+    safe_body = reply_text.replace("${", "$ {")
+    note_body = (
+        f"【提问】@{safe_sender}：{clean_q}\n"
+        f"【时间】{now_bj.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"────────────────────\n"
+        f"{safe_body}"
+    )
+
+    payload_bytes = json.dumps({"title": note_title, "text": note_body}, ensure_ascii=False).encode("utf-8")
+    post_url = f"{base_url}/api/channel/{urllib.parse.quote(code)}/text"
+
+    for attempt_idx in range(2):
+        tok = _ensure_box_token(force_refresh=(attempt_idx > 0))
+        req_hdrs = dict(ua_headers)
+        req_hdrs["Content-Type"] = "application/json"
+        if tok:
+            req_hdrs["X-Guest-Token"] = tok
+        try:
+            req = urllib.request.Request(post_url, data=payload_bytes, headers=req_hdrs, method="POST")
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+            if resp_data.get("ok"):
+                log_msg(f"📦【敏感回复入柜】已自动贴入 {share_url} (id={resp_data.get('id')}, title='{note_title}')")
+                return share_url
+        except urllib.error.HTTPError as he:
+            if he.code == 403 and attempt_idx == 0:
+                continue
+            log_msg(f"贴入 FileCodeBox 失败 (HTTP {he.code})")
+            break
+        except Exception as pe:
+            log_msg(f"贴入 FileCodeBox 异常: {pe}")
+            break
+
+    return None
+
+
+def _strip_cot_and_tool_blocks(text: str) -> str:
     if not text:
         return ""
-
-    # 0. Strip <think>...</think> blocks or leaked internal CoT / pseudo-tool monologues (e.g. "公办 func... Execute search. Use tools... ）")
     text = re.sub(r'<think>[\s\S]*?</think>', '', text, flags=re.IGNORECASE)
     if any(k in text for k in ["Execute search", "Use tools", "Let's search", "Let's call", "tool_calls", "web_search("]):
-        # If leaked CoT ends with ） or ) followed by Chinese text, strip the leaked prefix
         m_cot = re.search(r'(?:Execute search|Use tools|Let\'s search|Let\'s call)[\s\S]*?[）\)]\s*(?=[\u4e00-\u9fa5])', text)
         if m_cot:
             text = text[m_cot.end():].strip()
-
-    # 1. Strip raw tool search directives and JSON query blocks
     text = re.sub(r'\$web_search(?::\d+)?\s*\{[^}]*\}', '', text)
     text = re.sub(r'```(?:json)?\s*\{\s*"query"[\s\S]*?\}\s*```', '', text)
+    return text
 
-    # 1.5 第一遍政治敏感人物避讳（在 Markdown 星号清洗前先转化 某*某 等打码写法，防止被误当斜体截断）
-    text = apply_political_euphemisms(text)
+
+def clean_bot_reply_format(text: str) -> str:
+    """仅执行 CoT、LaTeX 与 Markdown 纯文本清洗，保留未避讳的原始用词供 FileCodeBox 存档。"""
+    if not text:
+        return ""
+    text = _strip_cot_and_tool_blocks(text)
 
     # 2. LaTeX math blocks and inline math delimiters
-    # Display formulas: $$ formula $$ or \[ formula \]
     text = re.sub(r'\$\$([\s\S]*?)\$\$', r'\1', text)
     text = re.sub(r'\\\[([\s\S]*?)\\\]', r'\1', text)
-    # Inline formulas: $ formula $ or \( formula \)
     text = re.sub(r'\$([^\$\n]+?)\$', r'\1', text)
     text = re.sub(r'\\\(([\s\S]*?)\\\)', r'\1', text)
 
     # 3. Common LaTeX command transformations to clean plain text
-    # Fractions: \frac{a}{b} -> a/b
     text = re.sub(r'\\frac\{([^{}]+)\}\{([^{}]+)\}', r'\1/\2', text)
-    # Square roots: \sqrt{a} -> √(a)
     text = re.sub(r'\\sqrt\{([^{}]+)\}', r'√(\1)', text)
-    # Text styles in formulas: \text{...}, \mathrm{...}, \mathbf{...}, \boldsymbol{...}
     text = re.sub(r'\\(?:text|mathrm|mathbf|boldsymbol|operatorname|textbf|textit)\{([^{}]+)\}', r'\1', text)
-    # Exponents and subscripts: x^{2} -> x^2, x_{1} -> x_1
     text = re.sub(r'\^\{([^{}]+)\}', r'^\1', text)
     text = re.sub(r'_\{([^{}]+)\}', r'_\1', text)
 
-    # Common math symbols to unicode / readable text
     math_syms = {
         r'\\times\b': '×',
         r'\\div\b': '÷',
@@ -2643,29 +2807,19 @@ def clean_bot_reply(text):
     for pat, rep in math_syms.items():
         text = re.sub(pat, rep, text)
 
-    # Clean leftover backslashes before common escaped punctuation
     text = re.sub(r'\\([%$&_#~])', r'\1', text)
 
     # 4. Markdown formatting to plain text
-    # Strip code block fences like ```python or ``` but preserve code text
     text = re.sub(r'```[a-zA-Z0-9_\-+]*\n?', '', text)
-    # Bold & Italic: **bold**, *italic*, __bold__
     text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)
     text = re.sub(r'__(.+?)__', r'\1', text)
     text = re.sub(r'\*([^\*\n]+?)\*', r'\1', text)
-    # Strikethrough: ~~text~~
     text = re.sub(r'~~(.+?)~~', r'\1', text)
-    # Inline code: `code`
     text = re.sub(r'`([^`\n]+?)`', r'\1', text)
-    # Markdown links: [title](url) -> title (url)
     text = re.sub(r'\[([^\]]+)\]\((https?://[^\)]+)\)', r'\1 (\2)', text)
-    # Headers: # Header -> Header
     text = re.sub(r'^[ \t]*#{1,6}\s*', '', text, flags=re.MULTILINE)
-    # Blockquotes: > quote -> quote
     text = re.sub(r'^[ \t]*>\s*', '', text, flags=re.MULTILINE)
-    # Bullet lists: - item or * item -> • item
     text = re.sub(r'^[ \t]*[-*]\s+', '• ', text, flags=re.MULTILINE)
-    # Horizontal rules
     text = re.sub(r'^[ \t]*[-*_]{3,}\s*$', '', text, flags=re.MULTILINE)
 
     # 5. Clean empty lines and search residual lines
@@ -2680,8 +2834,18 @@ def clean_bot_reply(text):
             continue
         cleaned_lines.append(l)
 
-    # 6. 终态兜底避讳校验（覆盖剥离 **粗体** 或 `代码框` 后浮现的姓名）
-    return apply_political_euphemisms("\n".join(cleaned_lines)).strip()
+    return "\n".join(cleaned_lines).strip()
+
+
+def clean_bot_reply(text):
+    if not text:
+        return ""
+    text = _strip_cot_and_tool_blocks(text)
+    # 第一遍政治敏感人物避讳（在 Markdown 星号清洗前先转化 某*某 等打码写法，防止被误当斜体截断）
+    text = apply_political_euphemisms(text)
+    text = clean_bot_reply_format(text)
+    # 终态兜底避讳校验（覆盖剥离 **粗体** 或 `代码框` 后浮现的姓名）
+    return apply_political_euphemisms(text).strip()
 
 
 def strip_bot_mentions(text: str) -> str:
@@ -2863,7 +3027,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
 
     for ct in candidate_texts:
         for u in extract_urls(ct):
-            if is_valid_mp_url(u) and u not in found_urls:
+            if is_valid_mp_url(u) and "box.lmlu.de" not in u.lower() and u not in found_urls:
                 found_urls.append(u)
 
     # 2. 文章卡片识别与微信内存真实链接扫描 (公众号文章/新闻卡片/分享链接)
@@ -3152,8 +3316,22 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 continue
 
             content_text = (msg.get("content") or "").strip()
+            raw_clean = clean_bot_reply_format(content_text)
             final_reply = clean_bot_reply(content_text)
             if final_reply:
+                is_sens, is_high_risk, sens_reason = detect_political_sensitivity(content, raw_clean)
+                if is_sens:
+                    box_link = post_sensitive_reply_to_box(sender, content, raw_clean, cfg)
+                    if box_link:
+                        if is_high_risk:
+                            log_msg(f"🛡️【高敏防吞拦截】触发原因={sens_reason}，微信仅发送便签柜链接")
+                            final_reply = f"这题直接发容易被夹，完整回答已贴到便签柜：{box_link}"
+                        else:
+                            log_msg(f"🛡️【政治避讳+入柜】触发原因={sens_reason}，微信发送避讳版并附便签链接")
+                            if box_link not in final_reply:
+                                final_reply = f"{final_reply}\n\n📎 完整便签：{box_link}"
+                    elif is_high_risk:
+                        final_reply = "这题涉及敏感词直接发会被夹，便签柜暂时连接超时，稍后再试下。"
                 break
             # 如果 OpenAI (gpt-6.1-sol) 返回空内容，自动切换 Gemini 4 Argon 兜底
             if provider in ("openai", "gpt"):
