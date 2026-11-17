@@ -2406,6 +2406,167 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         }]
 
 
+_LEADER_TITLE_SUFFIX_RE = (
+    r'(?:总书记|国家主席|名誉主席|中央主席|副主席|国务院总理|代总理|副总理|总理|'
+    r'委员长|副委员长|军委主席|军委副主席|主席|书记|常委|元帅|同志)?'
+)
+_REDUNDANT_EUPHEMISM_TITLE_RE = re.compile(
+    r'(现任一号位|当今最高层|教员|邓公|第三代江公|第四代胡公|初代刘公|过渡期华公|'
+    r'80年代胡公|80年代赵公|80年代李公|80年代杨公|周公|90年代李相|朱相|温相|上届李相|本届李相)'
+    r'(?:总书记|国家主席|名誉主席|中央主席|国务院总理|副总理|总理|委员长|军委主席|主席|同志)+'
+)
+
+
+def _compile_leader_rule(name: str, absorb_title: bool = True, prefix_guard: str = "", suffix_guard: str = ""):
+    if len(name) == 3:
+        sep = r'[\s·•.\-*＊_]{0,2}'
+        c0, c1, c2 = name[0], name[1], name[2]
+        body = (
+            re.escape(c0)
+            + sep
+            + r'(?:' + re.escape(c1) + r'|[*＊xX×〇○])'
+            + sep
+            + re.escape(c2)
+        )
+    else:
+        sep = r'[·•.\-*＊_]{0,1}'
+        body = sep.join(re.escape(ch) for ch in name)
+    pat = r'(?<!@)' + prefix_guard + body + suffix_guard
+    if absorb_title:
+        pat += _LEADER_TITLE_SUFFIX_RE
+    return re.compile(pat)
+
+
+# 国内重要领导人与敏感政治词避讳映射表（优先长词与特定称谓，防止微信静默吞消息与风控）
+_POLITICAL_PHRASE_RULES = [
+    # 高危网络贬称/黑话强行脱敏（防止外网搜索摘要污染或群友诱导封号）
+    (re.compile(r'习包子|庆丰帝|总加速师|习维尼|习特勒'), '现任一号位'),
+    (re.compile(r'毛腊肉'), '教员'),
+    # 常见特定姓氏+职务简称避讳
+    (re.compile(r'(?<!@)习(?:总书记|国家主席|主席|大大|总)(?![理裁])'), '现任一号位'),
+    (re.compile(r'(?<!@)毛(?:主席|委员|润之)'), '教员'),
+    (re.compile(r'(?<!@)邓(?:公|小平同志)|(?<![@邓])小平同志'), '邓公'),
+    (re.compile(r'(?<!@)江(?:总书记|主席)(?!西|苏|南|北|湖|河|山)'), '第三代江公'),
+    (re.compile(r'(?<!@)胡(?:总书记|锦涛同志)'), '第四代胡公'),
+    (re.compile(r'(?<!@)周总理'), '周公'),
+    (re.compile(r'(?<!@)朱总理'), '朱相'),
+    (re.compile(r'(?<!@)温总理'), '温相'),
+    (re.compile(r'(?<![@李])克强总理'), '上届李相'),
+    (re.compile(r'(?<![@刘])少奇同志'), '初代刘公'),
+    (re.compile(r'(?<![@胡])耀邦同志'), '80年代胡公'),
+    # 国内高危敏感政治历史事件避讳代称
+    (re.compile(r'八九六四|六四事件|六四运动|六四风波|八九民运|8964|天安门清场|天安门事件'), '八十年代末那场风波'),
+    (re.compile(r'文化大革命'), '十年特殊时期'),
+    (re.compile(r'白纸运动|白纸革命'), '22年底线下风波'),
+    (re.compile(r'四通桥事件|四通桥横幅|彭立发|彭载舟'), '北三环桥头风波'),
+    (re.compile(r'四人帮'), '特殊时期四人集团'),
+]
+
+_LEADER_NAME_RULES = [
+    # 历代核心与最高层、国家元首/副元首
+    (_compile_leader_rule("习近平"), "现任一号位"),
+    (_compile_leader_rule("毛泽东"), "教员"),
+    (_compile_leader_rule("邓小平"), "邓公"),
+    (_compile_leader_rule("江泽民"), "第三代江公"),
+    (_compile_leader_rule("胡锦涛"), "第四代胡公"),
+    (_compile_leader_rule("刘少奇"), "初代刘公"),
+    (_compile_leader_rule("华国锋"), "过渡期华公"),
+    (_compile_leader_rule("胡耀邦"), "80年代胡公"),
+    (_compile_leader_rule("赵紫阳"), "80年代赵公"),
+    (_compile_leader_rule("李先念"), "80年代李公"),
+    (_compile_leader_rule("杨尚昆"), "80年代杨公"),
+    (_compile_leader_rule("董必武", absorb_title=False), "董老"),
+    (_compile_leader_rule("宋庆龄"), "庆龄先生"),
+    (_compile_leader_rule("朱德", suffix_guard=r'(?![行高])'), "朱老总"),
+    (_compile_leader_rule("彭丽媛", absorb_title=False), "第一夫人"),
+    # 历任国务院总理
+    (_compile_leader_rule("周恩来"), "周公"),
+    (_compile_leader_rule("李鹏"), "90年代李相"),
+    (_compile_leader_rule("朱镕基"), "朱相"),
+    (_compile_leader_rule("温家宝"), "温相"),
+    (_compile_leader_rule("李克强"), "上届李相"),
+    (_compile_leader_rule("李强", prefix_guard=r'(?<!行)', suffix_guard=r'(?![烈制行迫化大硬劲壮盛弱项度盗求占])'), "本届李相"),
+    # 现届及近届政治局常委、核心高层
+    (_compile_leader_rule("赵乐际"), "现人大赵公"),
+    (_compile_leader_rule("王沪宁"), "现政协王公"),
+    (_compile_leader_rule("蔡奇", suffix_guard=r'(?![迹怪异妙葩])'), "中枢蔡公"),
+    (_compile_leader_rule("丁薛祥"), "常务丁相"),
+    (_compile_leader_rule("李希", prefix_guard=r'(?<![行桃])', suffix_guard=r'(?![望冀罕腊])'), "纪检李公"),
+    (_compile_leader_rule("韩正", prefix_guard=r'(?<![中日南北美朝驻访抵赴])', suffix_guard=r'(?![式常在义面确当直宗统风规好巧])'), "韩公"),
+    (_compile_leader_rule("王岐山"), "前任王公"),
+    (_compile_leader_rule("栗战书"), "上届人大栗公"),
+    (_compile_leader_rule("汪洋", prefix_guard=r'(?<!一片)(?<!浩瀚)(?<!茫茫)', suffix_guard=r'(?![大海恣肆浩瀚般似])'), "上届政协汪公"),
+    (_compile_leader_rule("张高丽"), "前常务张相"),
+    (_compile_leader_rule("张德江"), "前人大张公"),
+    (_compile_leader_rule("俞正声"), "前政协俞公"),
+    (_compile_leader_rule("刘云山"), "前宣传刘公"),
+    (_compile_leader_rule("吴邦国"), "前人大吴公"),
+    (_compile_leader_rule("贾庆林"), "前政协贾公"),
+    (_compile_leader_rule("曾庆红"), "曾公"),
+    (_compile_leader_rule("李长春"), "前宣传李公"),
+    (_compile_leader_rule("贺国强"), "前纪检贺公"),
+    (_compile_leader_rule("吴官正"), "前纪检吴公"),
+    (_compile_leader_rule("罗干", suffix_guard=r'(?![预涉部活净])'), "前政法罗公"),
+    (_compile_leader_rule("黄菊", suffix_guard=r'(?![花酒])'), "前常务黄相"),
+    (_compile_leader_rule("李瑞环"), "前政协李公"),
+    (_compile_leader_rule("乔石", suffix_guard=r'(?![头块油灰碑])'), "90年代乔公"),
+    (_compile_leader_rule("宋平", prefix_guard=r'(?<![北南唐元明辽金])', suffix_guard=r'(?![民定原均安常凡静稳衡台等淡])'), "元老宋公"),
+    (_compile_leader_rule("姚依林"), "前常务姚相"),
+    (_compile_leader_rule("张又侠"), "军委张公"),
+    (_compile_leader_rule("何卫东"), "军委何公"),
+    (_compile_leader_rule("何立峰"), "现财经何公"),
+    (_compile_leader_rule("刘鹤"), "前财经刘公"),
+    (_compile_leader_rule("胡春华"), "前副相胡公"),
+    (_compile_leader_rule("孙春兰"), "前副相孙公"),
+    (_compile_leader_rule("张国清"), "副相张公"),
+    (_compile_leader_rule("刘国中"), "副相刘公"),
+    (_compile_leader_rule("王小洪"), "公安王公"),
+    (_compile_leader_rule("陈文清"), "政法陈公"),
+    (_compile_leader_rule("石泰峰"), "统战石公"),
+    (_compile_leader_rule("李书磊"), "宣传李公"),
+    (_compile_leader_rule("李干杰"), "中组李公"),
+    (_compile_leader_rule("陈吉宁"), "沪上陈公"),
+    (_compile_leader_rule("尹力", suffix_guard=r'(?![量气度争挺])'), "京城尹公"),
+    (_compile_leader_rule("袁家军"), "渝州袁公"),
+    (_compile_leader_rule("黄坤明"), "岭南黄公"),
+    (_compile_leader_rule("马兴瑞"), "马公"),
+    # 敏感历史与落马焦点人物避讳
+    (_compile_leader_rule("林彪", prefix_guard=r'(?<![森竹树丛山密])', suffix_guard=r'(?![形悍壮])'), "林氏元帅"),
+    (_compile_leader_rule("江青", prefix_guard=r'(?<![长珠湘赣闽黑嫩松春])', suffix_guard=r'(?![山春年蛙草石衣铜天白绿])'), "特殊时期江氏"),
+    (_compile_leader_rule("薄熙来"), "昔日渝州薄某"),
+    (_compile_leader_rule("周永康"), "昔日政法周某"),
+    (_compile_leader_rule("令计划", prefix_guard=r'(?<![下命指法])'), "昔日中办令某"),
+    (_compile_leader_rule("徐才厚"), "昔日军中徐某"),
+    (_compile_leader_rule("郭伯雄"), "昔日军中郭某"),
+    (_compile_leader_rule("孙政才"), "昔日渝州孙某"),
+    (_compile_leader_rule("秦刚", prefix_guard=r'(?<![先大强暴秦晋])', suffix_guard=r'(?![刚开始好才柔毅强健直])'), "前外长秦某"),
+    (_compile_leader_rule("李尚福"), "前防长李某"),
+    (_compile_leader_rule("魏凤和"), "前防长魏某"),
+    (_compile_leader_rule("苗华", prefix_guard=r'(?<![树禾花豆育疫火])', suffix_guard=r'(?![丽夏裔美])'), "前军委苗某"),
+]
+
+
+def apply_political_euphemisms(text: str) -> str:
+    """对国内重要领导人全名及高敏政治词汇执行‘避讳’隐晦替代，防止微信静默吞消息或风控。"""
+    if not text:
+        return ""
+    # 保护 URL 不被正则误触
+    urls = []
+    def _stash_url(m):
+        urls.append(m.group(0))
+        return f"\x00URL{len(urls) - 1}\x00"
+
+    out = re.sub(r'https?://[^\s\)\]\u4e00-\u9fff]+', _stash_url, text)
+    for pat, rep in _POLITICAL_PHRASE_RULES:
+        out = pat.sub(rep, out)
+    for pat, rep in _LEADER_NAME_RULES:
+        out = pat.sub(rep, out)
+    out = _REDUNDANT_EUPHEMISM_TITLE_RE.sub(r'\1', out)
+    if urls:
+        out = re.sub(r'\x00URL(\d+)\x00', lambda m: urls[int(m.group(1))], out)
+    return out
+
+
 def clean_bot_reply(text):
     if not text:
         return ""
@@ -2421,6 +2582,9 @@ def clean_bot_reply(text):
     # 1. Strip raw tool search directives and JSON query blocks
     text = re.sub(r'\$web_search(?::\d+)?\s*\{[^}]*\}', '', text)
     text = re.sub(r'```(?:json)?\s*\{\s*"query"[\s\S]*?\}\s*```', '', text)
+
+    # 1.5 第一遍政治敏感人物避讳（在 Markdown 星号清洗前先转化 某*某 等打码写法，防止被误当斜体截断）
+    text = apply_political_euphemisms(text)
 
     # 2. LaTeX math blocks and inline math delimiters
     # Display formulas: $$ formula $$ or \[ formula \]
@@ -2516,7 +2680,8 @@ def clean_bot_reply(text):
             continue
         cleaned_lines.append(l)
 
-    return "\n".join(cleaned_lines).strip()
+    # 6. 终态兜底避讳校验（覆盖剥离 **粗体** 或 `代码框` 后浮现的姓名）
+    return apply_political_euphemisms("\n".join(cleaned_lines)).strip()
 
 
 def strip_bot_mentions(text: str) -> str:
@@ -2542,7 +2707,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         matched, fast_reply = plugin_manager.match_fast_path(content)
         if matched and fast_reply:
             log_msg(f"命中 Fast-Path 快速直通插件: '{content}' -> 直接返回预置数据")
-            return fast_reply
+            return clean_bot_reply(fast_reply)
 
     sys_prompt = cfg.get("system_prompt", "")
     route_info = TaskModelRouter.route(content, quote_info=quote_info, image_info=image_info, file_info=file_info, card_info=card_info)
@@ -2568,7 +2733,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
 
     history_str = ""
     if recent_history:
-        lines = [f"[{h['time']}] {h['sender']}: {h['content']}" for h in recent_history]
+        lines = [
+            f"[{h['time']}] {h['sender']}: {apply_political_euphemisms(h['content']) if h.get('sender') == 'bot' else h['content']}"
+            for h in recent_history
+        ]
         history_str = "【群聊最近上下文记录（供参考理解语境、代词与话题连贯性）】：\n" + "\n".join(lines) + "\n\n"
 
     # Dynamic scene intent detection for length & style control
@@ -2637,6 +2805,11 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"- 严禁使用任何星号粗体（如 **文字**）、斜体（*文字*）、反引号代码框（`文字`）或 # 标题符！\n"
         f"- 严禁使用 LaTeX 数学公式符号（如 $...$ 或 $$...$$）；\n"
         f"- 必须输出如同普通人在微信打字一样的纯文本（Plain Text）。列项时可直接使用数字编号（如 1. 2.）或圆点符号（• ），重点内容直接写出，切勿加粗或带语法标记。\n"
+        f"【国内政治敏感过滤与人物避讳铁律（最高优先级·防微信吞消息）】：\n"
+        f"- 你的回复直接发送到国内微信群，微信服务端对国内重要领导人全名及政治敏感词有严格的静默吞消息（仅发送者可见）风控。\n"
+        f"- 凡涉及中国现当代重要党政军领导人（历代核心、国家元首、国务院总理、政治局常委及焦点政治人物等），首选采取【避讳】方式，严禁直接写出真实全名，改用自然、克制、群友一眼能懂的隐晦替代词称呼（例如：教员、初代刘公、邓公、第三代江公、第四代胡公、现任一号位/当今最高层；总理类如周公、过渡期华公、80年代赵公、90年代李相、朱相、温相、上届李相、本届李相；其他人物用‘时期/部门+姓氏+公/相/某’代称）。\n"
+        f"- 严禁使用星号打码（如某*某）、加点拆字（如某·某·某）或任何外网戏谑/贬损外号，这类写法同样会触发微信拦截甚至账号风控。\n"
+        f"- 若涉及国内敏感政治事件或外媒报道摘要，一律用隐晦时期代称（如‘十年特殊时期’、‘八十年代末那场风波’）平实客观概括，绝不原样复述外网敏感词句。\n"
         f"【场景与回答规范】：\n"
         f"{scene_guidance}\n"
         f"- 结合最近聊天记录，准确理解群友话语中的代词（如‘这句话’、‘刚才说的’、‘他’、‘那个’等）以及话题脉络，保持连贯记忆。\n"
@@ -2818,7 +2991,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 user_query += (
                     f"\n\n【系统已预先通过 Google (Serper API) 检索到该分享文章《{card_title}》的权威报道摘要】：\n"
                     f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
-                    f"【核心要求】：请直接结合上述检索到的真实事件细节进行全面、客观、深入的分析评价，无需再次调用搜索工具！\n"
+                    f"【核心要求】：请直接结合上述检索到的真实事件细节进行全面、客观、深入的分析评价，无需再次调用搜索工具！（若涉及国内重要领导人或敏感政治表述，务必遵守【避讳铁律】改用隐晦替代词称呼，严禁直呼全名）\n"
                 )
                 tools = None
         if tools is not None:
@@ -2881,7 +3054,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
                     log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
                     user_query += (
-                        f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具）】：\n"
+                        f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具；若资料涉及国内重要领导人全名或敏感政治词，输出时务必按【避讳铁律】使用隐晦替代词称呼）】：\n"
                         f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
                     )
                     tools = None
@@ -2969,7 +3142,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 # 直接将工具返回结果组装为干净的单轮 user 上下文交由第 2 轮直接整理输出：
                 synth_query = (
                     user_query
-                    + "\n\n【系统已通过实时工具/Google (Serper API) 检索到的参考资料（请直接据此整理、判断并输出最终纯中文回答，严禁输出任何思考过程或工具调用指令）】：\n"
+                    + "\n\n【系统已通过实时工具/Google (Serper API) 检索到的参考资料（请直接据此整理、判断并输出最终纯中文回答，严禁输出任何思考过程或工具调用指令；若涉及国内重要领导人全名或敏感政治词，务必按【避讳铁律】改用隐晦替代词称呼）】：\n"
                     + "\n".join(collected_tool_outputs)
                 )
                 messages = [
