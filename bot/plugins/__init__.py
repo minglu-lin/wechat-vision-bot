@@ -20,6 +20,7 @@ from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
 from .map_service import FoodSearchPlugin, LocalPlaceSearchPlugin, TransitRoutePlugin
 from .image_tools import GenerateImagePlugin, SearchImagePlugin, SendWebpageImagePlugin, register_image_sender
+from .market_chart import FinancialChartPlugin
 
 
 class PluginManager:
@@ -48,6 +49,7 @@ class PluginManager:
         self.register(GenerateImagePlugin())
         self.register(SearchImagePlugin())
         self.register(SendWebpageImagePlugin())
+        self.register(FinancialChartPlugin())
 
 
     def get_openai_tools(self) -> List[dict]:

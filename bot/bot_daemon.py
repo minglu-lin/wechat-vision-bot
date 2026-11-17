@@ -34,12 +34,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
     from plugins import plugin_manager, register_image_sender
     from plugins.stock import StockQuantPlugin
+    from plugins.market_chart import FinancialChartPlugin
     from plugins.image_tools import set_last_webpage_info
     from plugins.base import safe_http_get_bytes, atomic_write_json
 except Exception as _pie:
     plugin_manager = None
     register_image_sender = None
     StockQuantPlugin = None
+    FinancialChartPlugin = None
     set_last_webpage_info = None
     safe_http_get_bytes = None
     atomic_write_json = None
@@ -2964,6 +2966,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"  • 查美食推荐 (search_local_food)：城市与商圈特色餐饮、招牌好店、人均预算与口碑\n"
         f"  • 查地铁与公交路线 (get_transit_route)：城市公共交通与地铁换乘方案、几号线、换乘站点、用时与票价\n"
         f"  • 汇率与加密货币 (get_exchange_rate, get_crypto_price)：实时法币汇率与主流数字货币行情\n"
+        f"  • 全球股票与宏观经济真实数据制图 (generate_financial_chart)：结合 https://buffett.lmlu.de/ 巴菲特价值投资终端与全球行情接口，由本机脚本从真实历史数据直接绘制高清走势图（非AI生图）并发送至微信！支持全球股票（美股/韩股如海力士000660.KS/日股/港股/A股）、指数、黄金原油、汇率、美债收益率、加密货币及中/美 CPI、PPI、PMI、M2、GDP 等指标（支持1月~10年任意跨度）。凡群友要求发走势图、股价图、价格曲线图或经济数据图表时，必须优先调用 generate_financial_chart，绝对严禁调用 AI 绘画瞎画假图，也严禁说发不了走势图！\n"
         f"  • 查IP归属地 (lookup_ip)：公网IP与域名物理位置、ISP运营商\n"
         f"  • 科学计算 (calculate)：数学公式、求幂、函数计算\n"
         f"  • 随机决策与掷骰子 (decision_and_roll)：多选项决策、掷骰子、抛硬币\n"
@@ -3192,15 +3195,37 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 f"- 核心要求：请使用 web_search 检索该文章的真实事件细节后再进行分析评价。\n"
             )
     elif not fetched_any_article:
+        # 3.4 针对经济/股票/大宗商品/汇率/国债等价格走势图请求：本机脚本拉取真实历史数据与 buffett.lmlu.de 估值直接绘图发送（非AI生图）
+        chart_handled = False
+        chart_intent = None
+        if FinancialChartPlugin and not (image_info and image_info.get("has_image")):
+            try:
+                chart_intent = FinancialChartPlugin.extract_chart_intent(content)
+            except Exception:
+                chart_intent = None
+
+        if chart_intent and plugin_manager:
+            log_msg(f"【前置数据制图引擎】检测到金融/经济走势图诉求: {chart_intent}，正在拉取真实数据并本机渲染图表...")
+            chart_res = plugin_manager.execute_tool("generate_financial_chart", chart_intent)
+            if isinstance(chart_res, dict) and not chart_res.get("error"):
+                log_msg(f"【前置数据制图引擎】成功渲染并发送 {chart_res.get('name')} ({chart_res.get('symbol')}) 走势图！")
+                user_query += (
+                    f"\n\n【系统已通过本机真实数据脚本绘制并将高清走势图直接发送到了微信群聊窗口中】（零AI生图，数据100%真实）：\n"
+                    f"{json.dumps(chart_res, ensure_ascii=False, indent=2)}\n"
+                    f"【回答要求】：走势图图片已经发在群里了！请直接结合上方真实统计指标（起止价格、区间涨跌幅、最高/最低极值点时间，以及若包含 buffett_terminal 字段则一并点出 https://buffett.lmlu.de 巴菲特安全边际击球区与估值结论），用 2~4 句精炼自然的文字做简要解读，严禁说‘发不了图’或‘去某某网站看’！\n"
+                )
+                tools = None
+                chart_handled = True
+
         # 3.5 针对股票量化诊断与技术面分析：调用 StockQuantPlugin 极速拉取盘口及日K指标，由 AI 专业操盘手一轮直出！
         stock_sym = None
-        if StockQuantPlugin:
+        if StockQuantPlugin and not chart_handled:
             try:
                 stock_sym = StockQuantPlugin.extract_stock_intent(content)
             except Exception:
                 stock_sym = None
 
-        stock_handled = False
+        stock_handled = chart_handled
         if stock_sym and plugin_manager:
             log_msg(f"【前置股票量化引擎】检测到股票/指数技术面分析诉求: 目标标的='{stock_sym}'，正在极速拉取盘口与日K量化指标...")
             stock_res = plugin_manager.execute_tool("analyze_stock", {"symbol": stock_sym})

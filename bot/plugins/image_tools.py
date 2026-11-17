@@ -33,6 +33,10 @@ def register_image_sender(sender_fn):
     _IMAGE_SENDER = sender_fn
 
 
+def get_image_sender():
+    return _IMAGE_SENDER
+
+
 # Global recent webpage cache for image extraction
 _LAST_WEBPAGE_INFO = {
     "url": "",
