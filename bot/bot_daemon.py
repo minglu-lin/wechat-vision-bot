@@ -2225,11 +2225,11 @@ def call_routed_llm(provider: str, model_name: str, messages: list, tools: list 
 class TaskModelRouter:
     """
     智能多模型分流路由引擎
-    1. Gemini 3.1 Flash Lite (gemini-3.1-flash-lite): X11 微信窗口后台截屏视觉 OCR 感知、消息边界与多模态元素精准提取（自动降级备选 Gemini 3.8 Flash）
+    1. Gemini 3.1 Flash Lite (gemini-3.1-flash-lite): X11 微信窗口后台截屏视觉 OCR 感知、消息边界与多模态元素精准提取（自动降级备选 Gemini 4 Hydrogen）
     2. 主力回答问题五五分流 (50% / 50% 负载均衡):
        - OpenAI GPT-6.1 Sol (gpt-6.1-sol): 承担 50% 主力问答及全部深度思考推理任务
        - Gemini 4 Argon (gemini-4-argon): 承担 50% 主力问答、长文阅读与工具查询
-    3. Gemini 3.8 Flash (gemini-3.8-flash): 群聊附图/截图等多模态读图、快速容灾降级
+    3. Gemini 4 Hydrogen (gemini-4-hydrogen): 高速多模态理解、显式指定与快速容灾降级通道
     4. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
     5. Kimi (kimi-for-coding-highspeed): 充裕额度备用容灾通道
     """
@@ -2249,7 +2249,7 @@ class TaskModelRouter:
         r'(?:看下?|看一看|识别|分析|提取|读|读一读|读下?|解释|说明)(?:这张?|这个?|上面这个?|附件)?(?:图|照片|图片|截图)',
         r'(?:图里|照片里|截图里|图片里)(?:写了什么|有什么|是啥|报错|文字|内容|排名|数据|表格|信息)',
         r'(?:能读|读这个|看这个|查这个|解析这个).*(?:图|照片|图片)',
-        r'(?:gemini\s*3\.?8|flash)',
+        r'(?:gemini[-\s]*4?[-\s]*hydro(?:gen)?|4[-\s]*hydro(?:gen)?)',
     ]
 
     @classmethod
@@ -2272,13 +2272,13 @@ class TaskModelRouter:
             any(kw in c for kw in ["文章", "链接", "公众号", "推文", "卡片", "新闻", "研报"])
         )
 
-        # 1. 仅当用户显式点名要求使用 Gemini 3.8 Flash 时才走轻量 Flash；常规读图/看图交由下方主力旗舰多模态模型 (gpt-6.1-sol / gemini-4-argon) 精读并联动工具！
-        if re.search(r'(?:gemini\s*3\.?8|\bflash\b)', c):
-            log_msg("【模型分流路由】用户显式指定 -> 分流至 Gemini 3.8 Flash")
+        # 1. 当用户显式点名要求使用 Gemini 4 Hydrogen (Hydro) 时分流至 gemini-4-hydrogen；常规读图/看图交由下方主力旗舰多模态模型 (gpt-6.1-sol / gemini-4-argon) 精读并联动工具！
+        if re.search(r'(?:gemini[-\s]*4?[-\s]*hydro(?:gen)?|4[-\s]*hydro(?:gen)?|(?<![a-z])hydro(?:gen)?\s*模型|(?:用|切|换|走|指定)\s*hydro(?:gen)?(?![a-z]))', c):
+            log_msg("【模型分流路由】用户显式指定 -> 分流至 Gemini 4 Hydrogen")
             return {
                 "provider": "gemini",
-                "model": "gemini-3.8-flash",
-                "reason": "显式指定 (Gemini 3.8 Flash)",
+                "model": "gemini-4-hydrogen",
+                "reason": "显式指定 (Gemini 4 Hydrogen)",
                 "reasoning_effort": None,
             }
 
@@ -2318,11 +2318,11 @@ class TaskModelRouter:
                 }
 
         if time.time() < _argon_cooldown_until:
-            log_msg("【模型分流路由】Gemini 4 Argon 处于超时熔断冷却期 -> 自动平滑切至 Gemini 3.8 Flash")
+            log_msg("【模型分流路由】Gemini 4 Argon 处于超时熔断冷却期 -> 自动平滑切至 Gemini 4 Hydrogen")
             return {
                 "provider": "gemini",
-                "model": "gemini-3.8-flash",
-                "reason": "Argon 熔断冷却期分流 (Gemini 3.8 Flash)",
+                "model": "gemini-4-hydrogen",
+                "reason": "Argon 熔断冷却期分流 (Gemini 4 Hydrogen)",
                 "reasoning_effort": None,
             }
 
@@ -2474,17 +2474,17 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
         vision_models = [
             ("openai", ocr_model, "low"),
             ("gemini", "gemini-3.1-flash-lite", None),
-            ("gemini", "gemini-3.8-flash", "low"),
+            ("gemini", "gemini-4-hydrogen", "low"),
         ]
     else:
         vision_models = [
             ("gemini", ocr_model, None),
-            ("gemini", "gemini-3.8-flash", "low"),
+            ("gemini", "gemini-4-hydrogen", "low"),
         ]
 
     for v_attempt, (v_provider, v_model, v_effort) in enumerate(vision_models):
         try:
-            v_timeout = 30 if v_provider in ("openai", "gpt") else 15
+            v_timeout = 30 if v_provider in ("openai", "gpt") else (22 if v_model == "gemini-4-hydrogen" else 15)
             v_temp = None if (v_provider in ("openai", "gpt") and any(v_model.lower().startswith(p) for p in ["gpt-6", "o1", "o3", "o4"])) else 0.1
             v_format = {"type": "json_object"} if v_provider in ("openai", "gpt") else None
             res = call_routed_llm(
@@ -3099,8 +3099,8 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             route_reason = "重试切换 Gemini 4 Argon 兜底"
             route_effort = None
         elif target_model == "gemini-4-argon":
-            target_model = "gemini-3.8-flash"
-            route_reason = "重试降级至 Gemini 3.8 Flash 快速响应"
+            target_model = "gemini-4-hydrogen"
+            route_reason = "重试降级至 Gemini 4 Hydrogen 快速响应"
             route_effort = None
 
     plugin_tools = plugin_manager.get_openai_tools() if plugin_manager else []
@@ -3439,7 +3439,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             if isinstance(chart_res, dict) and not chart_res.get("error"):
                 log_msg(f"【前置数据制图引擎】成功渲染并发送 {chart_res.get('name')} ({chart_res.get('symbol')}) 走势图！")
                 image_info = None
-                if target_model == "gemini-3.8-flash" and force_provider != "gemini":
+                if target_model == "gemini-4-hydrogen" and "显式指定" not in str(route_reason) and force_provider != "gemini":
                     rerouted = TaskModelRouter.route(content, quote_info=quote_info, image_info=None, file_info=file_info, card_info=card_info)
                     provider = rerouted["provider"]
                     target_model = rerouted["model"]
@@ -3628,7 +3628,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             # 支持最多 2 轮渐进式工具调用（如 第1轮 web_search -> 第2轮 read_webpage 深读表格 -> 第3轮总结输出）
             active_tools = tools if (tools and tool_rounds_used < 2 and loop_idx < 2) else None
             log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮 (tools={'开' if active_tools else '关-强制总结'})...")
-            req_timeout = 45 if provider in ("openai", "gpt") else (38 if target_model == "gemini-4-argon" else 32)
+            req_timeout = 45 if provider in ("openai", "gpt") else (38 if target_model == "gemini-4-argon" else 35)
             res = call_routed_llm(provider, target_model, messages, tools=active_tools, timeout=req_timeout, reasoning_effort=route_effort)
             if target_model == "gemini-4-argon":
                 _argon_fail_streak = 0
@@ -3732,10 +3732,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
-            # 如果 Gemini 4 Argon 返回空内容，自动切换 Gemini 3.8 Flash 兜底
+            # 如果 Gemini 4 Argon 返回空内容，自动切换 Gemini 4 Hydrogen 兜底
             elif target_model == "gemini-4-argon":
-                log_msg("Gemini 4 Argon 返回空内容，自动切换备用 Gemini 3.8 Flash 直接生成回答...")
-                target_model = "gemini-3.8-flash"
+                log_msg("Gemini 4 Argon 返回空内容，自动切换备用 Gemini 4 Hydrogen 直接生成回答...")
+                target_model = "gemini-4-hydrogen"
                 route_reason = "Argon 空返回容灾降级"
                 fallback_query = user_query
                 if collected_tool_outputs:
@@ -3746,11 +3746,11 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
-            # 如果 Kimi 返回空内容，自动切 Gemini 兜底
+            # 如果 Kimi 返回空内容，自动切 Gemini 4 Hydrogen 兜底
             elif provider == "kimi":
-                log_msg("Kimi 返回空内容，自动切换备用 Gemini 3.8 Flash 直接生成回答...")
+                log_msg("Kimi 返回空内容，自动切换备用 Gemini 4 Hydrogen 直接生成回答...")
                 provider = "gemini"
-                target_model = "gemini-3.8-flash"
+                target_model = "gemini-4-hydrogen"
                 route_reason = "Kimi 空返回容灾降级"
                 fallback_query = user_query
                 if collected_tool_outputs:
@@ -3781,14 +3781,14 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
-            # 如果 Gemini 4 Argon 异常，记录连续失败熔断并降级至 Gemini 3.8 Flash
+            # 如果 Gemini 4 Argon 异常，记录连续失败熔断并降级至 Gemini 4 Hydrogen
             elif target_model == "gemini-4-argon":
                 _argon_fail_streak += 1
                 if _argon_fail_streak >= 2:
                     _argon_cooldown_until = time.time() + 600
                     log_msg(f"⚠️ Gemini 4 Argon 连续失败 {_argon_fail_streak} 次，触发 10 分钟熔断冷却保护！")
-                log_msg("Gemini 4 Argon 异常，重置上下文并降级至 Gemini 3.8 Flash 继续重试...")
-                target_model = "gemini-3.8-flash"
+                log_msg("Gemini 4 Argon 异常，重置上下文并降级至 Gemini 4 Hydrogen 继续重试...")
+                target_model = "gemini-4-hydrogen"
                 route_reason = "Argon 异常容灾降级"
                 fallback_query = user_query
                 if collected_tool_outputs:
@@ -3799,7 +3799,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
-            # 如果 Gemini 3.8 Flash 发生异常，尝试切换 Kimi 兜底
+            # 如果 Gemini 4 Hydrogen 发生异常，尝试切换 Kimi 兜底
             elif provider == "gemini":
                 log_msg("Gemini 服务异常，尝试切换备用 Kimi 进行快速容灾重试...")
                 provider = "kimi"
@@ -3814,11 +3814,11 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     {"role": "user", "content": _build_user_payload(fallback_query, provider)},
                 ]
                 continue
-            # 如果 Kimi 超时或出错，无缝切换 Gemini 3.8 Flash 兜底
+            # 如果 Kimi 超时或出错，无缝切换 Gemini 4 Hydrogen 兜底
             elif provider == "kimi":
-                log_msg("Kimi 服务调用异常，重置干净上下文并自动切换备用 Gemini 3.8 Flash 进行快速容灾重试...")
+                log_msg("Kimi 服务调用异常，重置干净上下文并自动切换备用 Gemini 4 Hydrogen 进行快速容灾重试...")
                 provider = "gemini"
-                target_model = "gemini-3.8-flash"
+                target_model = "gemini-4-hydrogen"
                 route_reason = "Kimi 异常容灾降级"
                 fallback_query = user_query
                 if collected_tool_outputs:
