@@ -15,7 +15,7 @@ from .base import BasePlugin
 from .weather import WeatherPlugin
 from .finance import ExchangeRatePlugin, CryptoPlugin
 from .stock import StockQuantPlugin
-from .network import NetworkPlugin, WebSearchPlugin
+from .network import NetworkPlugin, ReadWebpagePlugin, WebSearchPlugin
 from .calculator import CalculatorPlugin
 from .utilities import UtilitiesPlugin
 from .map_service import FoodSearchPlugin, LocalPlaceSearchPlugin, TransitRoutePlugin
@@ -41,6 +41,7 @@ class PluginManager:
         self.register(CryptoPlugin())
         self.register(NetworkPlugin())
         self.register(WebSearchPlugin())
+        self.register(ReadWebpagePlugin())
         self.register(CalculatorPlugin())
         self.register(UtilitiesPlugin())
         self.register(LocalPlaceSearchPlugin())

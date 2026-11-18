@@ -249,12 +249,15 @@ class GenerateImagePlugin(BasePlugin):
                 return {"error": f"AI 绘画服务请求异常: {e}"}
 
         # Dispatch send if sender hook is registered
+        sent_ok = False
         if _IMAGE_SENDER:
-            _IMAGE_SENDER(local_png)
+            res_s = _IMAGE_SENDER(local_png)
+            sent_ok = res_s[0] if isinstance(res_s, tuple) else bool(res_s)
 
         return {
             "status": "success",
             "type": "image",
+            "image_sent_to_wechat": sent_ok,
             "prompt": p,
             "is_remix": is_remix,
             "image_path": local_png,
@@ -348,11 +351,14 @@ class SearchImagePlugin(BasePlugin):
                                     im = Image.open(io.BytesIO(data))
                                     if im.width >= 100 and im.height >= 100:
                                         im.convert("RGB").save(local_png, "PNG")
+                                        sent_ok = False
                                         if _IMAGE_SENDER:
-                                            _IMAGE_SENDER(local_png)
+                                            res_s = _IMAGE_SENDER(local_png)
+                                            sent_ok = res_s[0] if isinstance(res_s, tuple) else bool(res_s)
                                         return {
                                             "status": "success",
                                             "type": "image",
+                                            "image_sent_to_wechat": sent_ok,
                                             "keywords": kw,
                                             "title": img_item.get("title", ""),
                                             "source": img_item.get("link", ""),
@@ -388,11 +394,14 @@ class SearchImagePlugin(BasePlugin):
                             im = Image.open(io.BytesIO(data))
                             if im.width >= 100 and im.height >= 100:
                                 im.convert("RGB").save(local_png, "PNG")
+                                sent_ok = False
                                 if _IMAGE_SENDER:
-                                    _IMAGE_SENDER(local_png)
+                                    res_s = _IMAGE_SENDER(local_png)
+                                    sent_ok = res_s[0] if isinstance(res_s, tuple) else bool(res_s)
                                 return {
                                     "status": "success",
                                     "type": "image",
+                                    "image_sent_to_wechat": sent_ok,
                                     "keywords": kw,
                                     "image_path": local_png,
                                     "message": f"已成功检索并发送‘{kw}’的图片",
@@ -509,12 +518,15 @@ class SendWebpageImagePlugin(BasePlugin):
         if not downloaded:
             return {"error": "网页图片下载失败或源地址拒绝访问"}
 
+        sent_ok = False
         if _IMAGE_SENDER:
-            _IMAGE_SENDER(local_png)
+            res_s = _IMAGE_SENDER(local_png)
+            sent_ok = res_s[0] if isinstance(res_s, tuple) else bool(res_s)
 
         return {
             "status": "success",
             "type": "webpage_image",
+            "image_sent_to_wechat": sent_ok,
             "url": target_url,
             "image_url": chosen_url,
             "image_path": local_png,

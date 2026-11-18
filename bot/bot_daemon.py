@@ -69,6 +69,7 @@ _login_lock = threading.Lock()
 _login_failures = {}  # client_ip -> list[float]
 _argon_fail_streak = 0
 _argon_cooldown_until = 0.0
+_openai_cooldown_until = 0.0
 recent_logs = []
 last_send_ts = 0.0
 last_reply_text = ""
@@ -1428,13 +1429,14 @@ def check_and_dismiss_logout_modal(img=None):
                     pass
 
             wins = find_wechat_windows(d)
+            main_id = wins[0]["id"] if wins else None
             modal_win = None
             viewer_win = None
             for w in wins:
                 if 180 < w["width"] < 450 and 100 < w["height"] < 300:
                     modal_win = w
                     break
-                elif w["width"] > 1000 and w["height"] > 600 and (w["name"] or "").strip().lower() not in ("wechat", "微信"):
+                elif w["id"] != main_id and w["width"] >= 420 and w["height"] >= 420 and (w["name"] or "").strip().lower() not in ("wechat", "微信"):
                     viewer_win = w
                     break
 
@@ -1768,12 +1770,98 @@ if register_image_sender:
     register_image_sender(x11_send_image)
 
 
-def extract_image_via_clipboard(px, py, save_path="/tmp/wechat_last_photo.png"):
+def capture_hd_image_from_viewer(screen_pos, save_path: str) -> bool:
     """
-    安全模式：杜绝在图片气泡上模拟鼠标点击（防止触发微信内置图片查看器 813x640 弹窗遮挡聊天界面）。
-    图片持久化由聊天窗口高保真气泡切片直接安全完成。
+    按需高分辨率预览图提取（仅在群友显式要求读图且气泡缩略图尺寸偏小时在消费者线程受控执行）：
+    点击图片气泡打开微信内置预览窗口，截取高清原图区域后，在 finally 中立即销毁预览窗（严禁按 Escape）。
     """
-    return False
+    if not screen_pos or len(screen_pos) != 2 or not save_path:
+        return False
+    _, wins_before = capture_screen_pil()
+    if not wins_before:
+        return False
+    main_w = wins_before[0]
+    cx, cy = int(screen_pos[0]), int(screen_pos[1])
+    if not (
+        main_w["x"] + int(main_w["width"] * 0.30) <= cx <= main_w["x"] + main_w["width"] - 20
+        and main_w["y"] + 55 <= cy <= main_w["y"] + main_w["height"] - 130
+    ):
+        return False
+
+    orig_area = 0
+    if os.path.exists(save_path):
+        try:
+            with Image.open(save_path) as old_im:
+                orig_area = old_im.width * old_im.height
+        except Exception:
+            orig_area = 0
+
+    before_ids = {w["id"] for w in wins_before}
+    upgraded = False
+    try:
+        x11_click(cx, cy)
+        viewer_w = None
+        for _ in range(4):
+            time.sleep(0.22)
+            d_chk = display.Display(":99")
+            try:
+                cur_wins = find_wechat_windows(d_chk)
+            finally:
+                d_chk.close()
+            for w_cand in cur_wins:
+                if w_cand["id"] not in before_ids and w_cand["width"] >= 320 and w_cand["height"] >= 320:
+                    viewer_w = w_cand
+                    break
+            if viewer_w:
+                break
+
+        if viewer_w:
+            time.sleep(0.25)
+            full_screen, _ = capture_screen_pil()
+            vx1 = max(0, viewer_w["x"] + 6)
+            vy1 = max(0, viewer_w["y"] + 38)
+            vx2 = min(full_screen.width, viewer_w["x"] + viewer_w["width"] - 6)
+            vy2 = min(full_screen.height, viewer_w["y"] + viewer_w["height"] - 48)
+            if vx2 - vx1 >= 180 and vy2 - vy1 >= 180:
+                hd_crop = full_screen.crop((vx1, vy1, vx2, vy2))
+                l_stat = ImageStat.Stat(hd_crop.convert("L"))
+                if l_stat.stddev[0] > 8.0 and (hd_crop.width * hd_crop.height > max(orig_area * 1.35, 35000)):
+                    hd_crop.save(save_path, format="PNG")
+                    try:
+                        shutil.copyfile(save_path, "/tmp/wechat_last_photo.png")
+                    except Exception:
+                        pass
+                    log_msg(f"🔍【高清读图增强】已从预览窗安全提取高分辨率截图: {hd_crop.width}x{hd_crop.height} -> {save_path}")
+                    upgraded = True
+    except Exception as ve:
+        log_msg(f"按需提取高清预览窗异常: {ve}")
+    finally:
+        try:
+            d_close = display.Display(":99")
+            try:
+                for w_rem in find_wechat_windows(d_close):
+                    if w_rem["id"] != main_w["id"] and (w_rem["id"] not in before_ids or (w_rem["width"] >= 320 and w_rem["height"] >= 320)):
+                        if not (180 < w_rem["width"] < 450 and 100 < w_rem["height"] < 300):
+                            close_x = w_rem["x"] + w_rem["width"] - 22
+                            close_y = w_rem["y"] + 18
+                            xtest.fake_input(d_close, X.MotionNotify, x=close_x, y=close_y)
+                            d_close.sync()
+                            time.sleep(0.03)
+                            xtest.fake_input(d_close, X.ButtonPress, 1)
+                            xtest.fake_input(d_close, X.ButtonRelease, 1)
+                            d_close.sync()
+                            time.sleep(0.06)
+                            try:
+                                w_rem["win"].destroy()
+                                d_close.sync()
+                            except Exception:
+                                pass
+            finally:
+                d_close.close()
+            check_and_dismiss_logout_modal()
+        except Exception:
+            pass
+    return upgraded
 
 
 def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
@@ -1833,6 +1921,7 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
             "image_path": local_path,
             "image_type": img_info.get("image_type", "图片"),
             "ocr_and_detail": img_info.get("ocr_and_detail", ""),
+            "_screen_pos": img_info.get("_screen_pos"),
         }
         recent_image_records.append(record)
         return local_path
@@ -1841,8 +1930,9 @@ def save_incoming_image(sender, img_info, chat_img, msg_ts=None):
 
 def find_image_for_query(query_text="", quote_info=None, session_key="", max_age_sec=3600, asker=""):
     """
-    根据微信‘引用’或语义提问精准溯源本地图片记录：
-    1. 引用溯源：若引用了某人且引用内容包含 [图片] 或图，精准对齐该人发送的历史本地图片
+    根据微信‘引用’、同人连发（先图后文）或语义提问精准溯源本地图片记录：
+    1. 引用溯源：若引用了某人且引用内容包含 [图片] 或截图，精准对齐该人发送的历史本地图片
+    1.5 同发送者连发自动对齐：微信无法在图片气泡内直接 @bot，用户常先发一张截图紧接着发 ‘@Albot 分析这个股票的异动’/‘帮我看看’（不含‘图’字）！
     2. 语义问图：若提问显式涉及读图、看图、分析图，优先对齐提问者本人近期发图，再对齐会话最近实质图片
     （若用户是在要求本机绘制/生成金融价格走势图，直接返回 None，严禁误绑群聊旧图片！）
     """
@@ -1850,6 +1940,12 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
         return None
 
     now = time.time()
+    c = (query_text or "").lower()
+    clean_q = strip_bot_mentions(query_text or "").strip()
+
+    def _is_sticker(r):
+        return ("表情" in str(r.get("image_type", ""))) or ("表情包" in str(r.get("ocr_and_detail", "")))
+
     # 1. 微信引用优先精准匹配
     if quote_info and quote_info.get("has_quote"):
         q_sender = str(quote_info.get("quoted_sender", "")).strip()
@@ -1859,7 +1955,6 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
             return None
         is_quote_img = any(kw in q_content for kw in ["[图片]", "照片", "截图", "chart", "image"]) or not q_content
         if is_quote_img:
-            # 从最近的图片记录倒序查找匹配的 sender
             for rec in reversed(recent_image_records):
                 if now - rec["ts"] > max_age_sec:
                     break
@@ -1869,8 +1964,32 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
                         log_msg(f"【本地图片精准引用命中】对齐引用 [{q_sender}: {q_content[:20]}] -> 本地图片: {rec['image_path']}")
                         return rec
 
+    asker_norm = normalize_dedup_sender(asker) if asker and not is_unknown_placeholder_sender(asker) else ""
+
+    # 1.5 同发送者紧邻连发（<= 120秒内刚发完实质截图，紧接着发‘@Albot 分析这个股票的异动’/‘这是啥’/‘翻译一下’等不含‘图’字的追问）
+    if asker_norm and not (quote_info and quote_info.get("has_quote")):
+        non_img_gen_kws = ["画一张", "画个", "生成一张", "搜一张", "找一张", "壁纸", "http://", "https://", "《"]
+        strong_deictic_cues = [
+            "这个", "这张", "这只", "这支", "这道", "这题", "上面", "刚才", "翻译", "识别", "提取", "报错", "这是啥", "这是什么",
+        ]
+        immediate_burst_cues = [
+            "分析", "异动", "看看", "看下", "解释", "怎么回事", "怎么看", "是啥", "是什么", "真的假的", "真假", "评价", "算一下",
+        ]
+        has_strong_deictic = (len(clean_q) == 0) or any(dc in clean_q for dc in strong_deictic_cues)
+        has_burst_cue = len(clean_q) <= 18 and any(bc in clean_q for bc in immediate_burst_cues)
+        if not any(nk in c for nk in non_img_gen_kws) and (has_strong_deictic or has_burst_cue):
+            max_split_age = 120 if has_strong_deictic else 15
+            for rec in reversed(recent_image_records):
+                if now - rec["ts"] > max_split_age:
+                    break
+                rec_sender = str(rec.get("sender", ""))
+                rec_norm = normalize_dedup_sender(rec_sender)
+                if rec_norm and (rec_norm == asker_norm or asker_norm in rec_norm or rec_norm in asker_norm):
+                    if not _is_sticker(rec) and os.path.exists(rec["image_path"]):
+                        log_msg(f"【同人先图后文连发命中】对齐 {rec_sender} {int(now - rec['ts'])}s 前刚发的图片 -> {rec['image_path']}")
+                        return rec
+
     # 2. 语义问图匹配最近本地图片（必须显式指向已上传图片，严禁裸词‘走势图’/‘图片’劫持生图与制图请求）
-    c = (query_text or "").lower()
     img_kws = [
         "看图", "读图", "这张图", "这个图", "这张照片", "这个照片", "新闻图",
         "上面这个图", "上面这张图", "看下这个图", "看下这张图", "我的这个图", "我的这张图",
@@ -1878,7 +1997,6 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
         "这张走势图", "这个走势图", "这张k线图", "这个k线图",
     ]
     if any(kw in c for kw in img_kws):
-        asker_norm = normalize_dedup_sender(asker) if asker and not is_unknown_placeholder_sender(asker) else ""
         # 2a. 优先匹配提问者本人 180 秒内发出的图片（防止同批次排序或群友表情包截胡）
         if asker_norm:
             for rec in reversed(recent_image_records):
@@ -1902,9 +2020,6 @@ def find_image_for_query(query_text="", quote_info=None, session_key="", max_age
 
         if candidates:
             newest = candidates[0]
-            def _is_sticker(r):
-                return ("表情" in str(r.get("image_type", ""))) or ("表情包" in str(r.get("ocr_and_detail", "")))
-
             if "表情" not in c and _is_sticker(newest):
                 for cand in candidates[1:]:
                     if newest["ts"] - cand["ts"] > 180:
@@ -1931,6 +2046,16 @@ def cleanup_old_images(max_days=7):
                         os.remove(fpath)
                     except Exception:
                         pass
+        # 同时清理 /tmp 下超过 24 小时的临时生图/搜图/制图缓存文件，防止磁盘膨胀
+        if os.path.isdir("/tmp"):
+            for fn in os.listdir("/tmp"):
+                if fn.startswith(("wechat_ai_gen_", "wechat_search_", "wechat_wp_")) and fn.endswith(".png"):
+                    fp = os.path.join("/tmp", fn)
+                    if os.path.isfile(fp) and (now - os.path.getmtime(fp) > 86400):
+                        try:
+                            os.remove(fp)
+                        except Exception:
+                            pass
     except Exception as e:
         log_msg(f"清理旧图片异常: {e}")
 
@@ -2147,19 +2272,19 @@ class TaskModelRouter:
             any(kw in c for kw in ["文章", "链接", "公众号", "推文", "卡片", "新闻", "研报"])
         )
 
-        # 1. 多模态/附图解析诉求 -> 分流给 Gemini 3.8 Flash (3.8 视觉解析场景保持不变)
-        if (has_img or any(re.search(p, c) for p in cls.MULTIMODAL_IMAGE_PATTERNS)) and not is_article_task:
-            log_msg(f"【模型分流路由】多模态视觉图文理解 -> 分流至 Gemini 3.8 Flash")
+        # 1. 仅当用户显式点名要求使用 Gemini 3.8 Flash 时才走轻量 Flash；常规读图/看图交由下方主力旗舰多模态模型 (gpt-6.1-sol / gemini-4-argon) 精读并联动工具！
+        if re.search(r'(?:gemini\s*3\.?8|\bflash\b)', c):
+            log_msg("【模型分流路由】用户显式指定 -> 分流至 Gemini 3.8 Flash")
             return {
                 "provider": "gemini",
                 "model": "gemini-3.8-flash",
-                "reason": "多模态视觉图文解析 (Gemini 3.8 Flash)",
+                "reason": "显式指定 (Gemini 3.8 Flash)",
                 "reasoning_effort": None,
             }
 
         # 显式指定 Gemini 4 Argon
         if re.search(r'(?:gemini\s*4|argon|4-argon)', c):
-            log_msg(f"【模型分流路由】用户显式指定 -> 分流至 Gemini 4 Argon")
+            log_msg("【模型分流路由】用户显式指定 -> 分流至 Gemini 4 Argon")
             return {
                 "provider": "gemini",
                 "model": "gemini-4-argon",
@@ -2167,8 +2292,10 @@ class TaskModelRouter:
                 "reasoning_effort": None,
             }
 
+        openai_available = has_openai_key and (time.time() >= _openai_cooldown_until)
+
         # 2. 思考问题：复杂编程/算法/数学证明/深度推理/复杂代码分析 -> 采用 GPT-6.1 Sol 模型
-        if has_openai_key and ((has_code_file and any(kw in c for kw in ["debug", "排查", "报错", "重构", "优化", "实现", "分析", "为什么", "bug"])) or any(re.search(p, c) for p in cls.DEEP_REASONING_PATTERNS)):
+        if openai_available and ((has_code_file and any(kw in c for kw in ["debug", "排查", "报错", "重构", "优化", "实现", "分析", "为什么", "bug"])) or any(re.search(p, c) for p in cls.DEEP_REASONING_PATTERNS)):
             log_msg(f"【模型分流路由】深度思考/高难度编程/数理逻辑推理 -> 分流至 OpenAI {gpt_think_model} (effort=medium)")
             return {
                 "provider": "openai",
@@ -2177,15 +2304,16 @@ class TaskModelRouter:
                 "reasoning_effort": "medium",
             }
 
-        # 3. 主力回答问题：五五分流 (50% OpenAI gpt-6.1-sol / 50% Gemini 4 Argon，含 Argon 连续超时熔断保护)
-        if has_openai_key:
+        # 3. 主力回答与高精度多模态图文理解：五五分流 (50% OpenAI gpt-6.1-sol / 50% Gemini 4 Argon，均具备旗舰视觉+工具联动能力)
+        if openai_available:
             cls._rr_counter = (cls._rr_counter + 1) % 2
-            if cls._rr_counter == 1:
-                log_msg(f"【模型分流路由】主力问答五五分流 [50% GPT] -> 分流至 OpenAI {gpt_think_model} (effort=low)")
+            if cls._rr_counter == 1 or time.time() < _argon_cooldown_until:
+                tag_mode = "多模态图文+工具联动" if has_img else "主力问答五五分流"
+                log_msg(f"【模型分流路由】{tag_mode} [GPT] -> 分流至 OpenAI {gpt_think_model} (effort=low)")
                 return {
                     "provider": "openai",
                     "model": gpt_think_model,
-                    "reason": f"主力问答五五分流 ({gpt_think_model})",
+                    "reason": f"{tag_mode} ({gpt_think_model})",
                     "reasoning_effort": "low",
                 }
 
@@ -2404,13 +2532,16 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
                         try:
                             ymin, xmin, ymax, xmax = box
                             cw, ch = chat_img.size
-                            crop_box = (
-                                max(0, int(xmin * cw / 1000)),
-                                max(0, int(ymin * ch / 1000)),
-                                min(cw, int(xmax * cw / 1000)),
-                                min(ch, int(ymax * ch / 1000))
-                            )
-                            if (crop_box[2] - crop_box[0] >= 70) and (crop_box[3] - crop_box[1] >= 70):
+                            raw_w = int(xmax * cw / 1000) - int(xmin * cw / 1000)
+                            raw_h = int(ymax * ch / 1000) - int(ymin * ch / 1000)
+                            if raw_w >= 70 and raw_h >= 70:
+                                # 向外留出 5px 安全边距，防止视觉模型 box_2d 偏紧裁掉截图右侧边缘数字或顶栏标题
+                                crop_box = (
+                                    max(0, int(xmin * cw / 1000) - 4),
+                                    max(0, int(ymin * ch / 1000) - 4),
+                                    min(cw, int(xmax * cw / 1000) + 6),
+                                    min(ch, int(ymax * ch / 1000) + 4),
+                                )
                                 ref_img["_crop_box"] = list(crop_box)
                                 if xmin >= 380 and xmax >= 820 and not is_explicit_bot_invocation(m.get("content", "")):
                                     # 紧贴右侧自身头像发出的大图/走势图气泡，强制归属 bot 防止回声误认为群友发图
@@ -2428,19 +2559,26 @@ def parse_recent_messages_with_vision(chat_img, bot_names, last_replied_user="",
                             log_msg(f"计算图片坐标失败: {ce}")
 
                 file_att = m.get("file_attachment")
+                art_card = m.get("article_card") or {}
                 if file_att and file_att.get("has_file"):
                     fn = file_att.get("file_name", "").strip()
-                    if not m.get("content") or m.get("content").strip() == "":
-                        m["content"] = f"[发送文件: {fn}]" if fn else "[发送文件]"
-                    box = file_att.get("box_2d")
-                    if isinstance(box, list) and len(box) == 4 and chat_box:
-                        try:
-                            ymin, xmin, ymax, xmax = box
-                            screen_cx = chat_box[0] + int(((xmin + xmax) / 2) * (chat_box[2] - chat_box[0]) / 1000)
-                            screen_cy = chat_box[1] + int(((ymin + ymax) / 2) * (chat_box[3] - chat_box[1]) / 1000)
-                            file_att["_screen_pos"] = [screen_cx, screen_cy]
-                        except Exception as ce:
-                            log_msg(f"计算文件卡片坐标失败: {ce}")
+                    fn_ext = os.path.splitext(fn)[1].lower()
+                    # 微信分享图文卡片常被 OCR 误标为无扩展名文件（如 'Astra6.2初体验'），严格校验合法文件扩展名且非文章卡片
+                    if bool(art_card.get("is_card")) or not re.fullmatch(r'\.[a-z0-9]{1,8}', fn_ext):
+                        file_att["has_file"] = False
+                        file_att["file_name"] = ""
+                    else:
+                        if not m.get("content") or m.get("content").strip() == "":
+                            m["content"] = f"[发送文件: {fn}]" if fn else "[发送文件]"
+                        box = file_att.get("box_2d")
+                        if isinstance(box, list) and len(box) == 4 and chat_box:
+                            try:
+                                ymin, xmin, ymax, xmax = box
+                                screen_cx = chat_box[0] + int(((xmin + xmax) / 2) * (chat_box[2] - chat_box[0]) / 1000)
+                                screen_cy = chat_box[1] + int(((ymin + ymax) / 2) * (chat_box[3] - chat_box[1]) / 1000)
+                                file_att["_screen_pos"] = [screen_cx, screen_cy]
+                            except Exception as ce:
+                                log_msg(f"计算文件卡片坐标失败: {ce}")
             if isinstance(msgs, list):
                 return msgs
             elif "content" in data:
@@ -3031,16 +3169,19 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         f"  • 网页图片提取与发送 (send_webpage_image)：从网页链接（HTTP/HTTPS/微信公众号文章）中提取真实正文照片、合影、配图并直接发送到微信聊天中！当群友询问'把网页里的图发出来'、'这个网页也有照片啊'、'你就不能发出来图片吗'、'发下照片'时，必须立即调用 send_webpage_image！\n"
         f"- 当群友提出绘画、作图、生图、重制照片、改图等诉求时，请优先调用 generate_ai_image；当群友要求找真实照片、看图、要某类表情包或壁纸时，调用 search_image；当群友要求发送网页/文章内的照片时，调用 send_webpage_image。\n"
         f"- 仅当本轮已实际调用制图/生图/搜图/网页发图工具且返回 image_sent_to_wechat=true（或下方明确注入了【系统已通过本机真实数据脚本绘制并将高清走势图直接发送到了微信群聊窗口中】）时，才可自然告知对方‘图已发’并用一两句话简要解读；若本轮上下文未包含上述真实发图成功回执，绝对严禁模仿历史聊天记录谎称‘图已发’、‘走势图发群里了’或‘这次真发了’！若尚未发图且工具可用，请直接调用对应发图工具。\n"
-        f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用联网搜索工具获取最新真实数据。\n"
+        f"  • 全网双语搜索与网页深读 (web_search, read_webpage)：\n"
+        f"    - web_search 支持单条 query 或并发多条 queries（查科技/AI模型如 GPT-6.2 Astra 官方定价、海外美股异动时，务必传入英文一手关键词获取官方准确数据！）。\n"
+        f"    - 当搜索摘要因字数截断未能完整展示价格表、参数表或原文细节时，请立即调用 read_webpage(url=...) 直接读取搜索结果中的官方文档或权威报道全文！\n"
+        f"【时效性与事实搜索指引】：如果对方询问了需要时效性、实时事实、新发布产品/API定价、当天股市/行情、最新新闻、具体人物或资料查询等，请务必使用 web_search / read_webpage 获取最新一手真实数据。\n"
         f"【链接与新闻文章卡片深度阅读指引（核心能力）】：\n"
         f"- 如果提问附带或关联了网页链接（HTTP/HTTPS），系统已自动下载抓取了网页标题与完整正文，请紧密结合提取出的正文内容进行回答；\n"
         f"- 如果群聊中分享了微信文章卡片、新闻卡片、或群友要求对刚刚分享的文章评价、总结、分析或查证真假：绝对不能只凭标题凭空推测！若下方已提供系统预检索资料，请直接基于该资料分析判断；若尚未提供且当前开启了工具权限，请使用标准函数调用 web_search 获取完整事实细节，绝对严禁在回复正文中输出 [~web_search(...)~] 或 $web_search 等任何内部指令文本！\n"
         f"【文档与附件文件深度解析指引（核心能力）】：\n"
         f"- 如果提问附带或关联了用户上传的附件文件（纯文本代码、PDF长论文/研报/合同、Excel结构化表格、Word文档等），系统已在下方将文件正文和结构化表格完整提取并注入到上下文中；\n"
         f"- 你必须仔细研读文件内容，全面、准确、专业地结合用户提问进行解答、数据汇总、提炼或代码分析。严禁说‘无法读取文件’或‘请发送文件’，因为文件内容已经完整呈现给你！\n"
-        f"【微信引用与群聊图片处理指引】：\n"
+        f"【微信引用与群聊高清图片精读指引】：\n"
         f"- 如果群友在本次提问中使用了微信‘引用’，请特别针对被引用的历史内容进行针对性答复；\n"
-        f"- 如果提问附带或关联了群聊中刚刚发送的图片/截图（如搜索结果截图、代码报错、报表、照片等），系统已通过视觉模型提取了图片中的文字、关键词、搜索列表和画面详情，请务必紧密结合图片中的实际文字与证据进行回答，万不可无视图片细节！\n"
+        f"- 如果本轮附带了图片输入（image_url），你已经直接收到了该图片的真实视觉画面！请务必亲自逐字精读原图顶栏标题、股票代码、价格涨幅、小字备注与画面细节（切勿只看粗略缩略图预扫摘要就说‘只收到占位描述’）；若需要分析图中股票异动、核实图中新闻真伪或查询图中事物，请先从图中识别出准确名称/代码，再直接调用 analyze_stock 或 web_search 深度联查！\n"
         f"【排版与格式铁律（严禁Markdown/LaTeX）】：微信无法解析渲染 Markdown 或 LaTeX 格式！\n"
         f"- 严禁使用任何星号粗体（如 **文字**）、斜体（*文字*）、反引号代码框（`文字`）或 # 标题符！\n"
         f"- 严禁使用 LaTeX 数学公式符号（如 $...$ 或 $$...$$）；\n"
@@ -3078,8 +3219,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
     if image_info and image_info.get("has_image"):
         img_type = image_info.get("image_type", "图片")
         img_ocr = str(image_info.get("ocr_and_detail", "")).strip()
-        if img_ocr:
-            user_query += f"\n【群聊中关联/引用的图片识别详情（视觉OCR与画面解析）】：\n- 图片类别：{img_type}\n- 图片画面与文字详情：{img_ocr}"
+        user_query += (
+            f"\n【本轮已为你挂载群友发送的原图视觉画面（请直接精读附带的图像本身获取完整细节）】：\n"
+            f"- 预扫类别：{img_type}" + (f"（粗略预扫备注：{img_ocr}，仅供参考，具体文字与代码请以原图视觉画面为准！）" if img_ocr else "")
+        )
 
     if file_info and file_info.get("file_content"):
         f_name = file_info.get("file_name", "未知文件")
@@ -3201,21 +3344,47 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                         break
             break
 
-    # 3. 针对收集到的文章标题，深入微信内存检索真实 URL
+    # 3. 针对收集到的文章标题，深入微信内存检索真实 URL（带标题相关性强校验，杜绝将引用普通短句误绑到相邻公众号链接！）
+    url_to_source_kw = {}
     if not found_urls:
         for kw in card_keywords:
-            if not kw or len(kw.strip()) < 2:
+            kw_s = (kw or "").strip()
+            if len(kw_s) < 4:
                 continue
-            mem_url = find_article_link_in_memory(kw)
+            mem_url = find_article_link_in_memory(kw_s)
             if mem_url and is_valid_mp_url(mem_url):
-                log_msg(f"微信内存成功解析出真实文章链接 (关键词: '{kw}'): {mem_url}")
+                log_msg(f"微信内存初步命中候选文章链接 (关键词: '{kw_s}'): {mem_url}")
                 found_urls.append(mem_url)
+                url_to_source_kw[mem_url] = kw_s
                 break
+
+    def _is_fetched_article_relevant(src_kw: str, f_res: dict) -> bool:
+        if not src_kw:
+            return True
+        hay = (str(f_res.get("title") or "") + " " + str(f_res.get("body") or "")[:300]).lower()
+        k_low = src_kw.lower()
+        # Extract meaningful ASCII words (>=2 chars) and CJK bigrams
+        en_toks = [t for t in re.findall(r'[a-z0-9\.]{2,}', k_low) if not t.isdigit()]
+        if en_toks and any(t in hay for t in en_toks):
+            return True
+        cjk_chars = "".join(re.findall(r'[\u4e00-\u9fa5]+', k_low))
+        if len(cjk_chars) >= 2:
+            bigrams = [cjk_chars[i:i + 2] for i in range(len(cjk_chars) - 1)]
+            hits = sum(1 for bg in bigrams if bg in hay)
+            if hits >= max(1, min(2, len(bigrams))):
+                return True
+        return False
 
     fetched_any_article = False
     for u in found_urls[:2]:
         fetch_res = fetch_url_content(u)
         if fetch_res.get("success"):
+            src_kw = url_to_source_kw.get(u, "")
+            if src_kw and not _is_fetched_article_relevant(src_kw, fetch_res):
+                log_msg(f"⚠️【内存链接校验拦截】抓取文章《{fetch_res.get('title', '')[:25]}》与检索词 '{src_kw}' 无关，丢弃误匹配链接！")
+                if src_kw in card_keywords and not (isinstance(card_info, dict) and card_info.get("title")):
+                    card_keywords.remove(src_kw)
+                continue
             fetched_any_article = True
             img_count = len(fetch_res.get("images", []))
             img_hint = f"- 该网页内包含真实正文照片/合影/配图: 共 {img_count} 张\n" if img_count > 0 else ""
@@ -3324,18 +3493,28 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 tools = None
                 stock_handled = True
 
-        # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”）：先调用 Serper 搜索 API，再交给 AI 整理判断输出！
-        # （注意：若为制图/生图/搜图请求且尚未完成发图，必须保留 tools 权限以便模型调用发图工具，严禁被前置文本搜索置空 tools！）
+        # 4. 针对搜索类/事实核查/人物事迹/新闻热点/国内外百科问题（含引用后的“展开说说/细说”与“让你联网查”重试指令）：
+        #    注意：1) 若为制图/生图/搜图或带附图识别任务，不跑盲目文本预搜，保留 tools 交由多模态模型先看图/调发图工具；
+        #          2) 预检索后绝不强行置空 tools，允许模型在摘要截断时自主补调 read_webpage(url) 或英文 web_search！
         clean_q_for_img_tool = strip_bot_mentions(content)
+        has_attached_img = bool(image_info and image_info.get("has_image"))
         needs_img_tool = is_chart_req or any(
             kw in clean_q_for_img_tool
             for kw in ["发一张", "来一张", "画一张", "生成一张", "搜一张", "找一张", "把网页里的图", "发下照片"]
         )
-        if not stock_handled and not needs_img_tool:
+        if not stock_handled and not needs_img_tool and not has_attached_img:
             clean_q = strip_bot_mentions(content)
+            meta_search_re = re.compile(
+                r'^(?:让你|叫你|请你|麻烦你|帮我)?(?:去)?(?:联网|上网|全网|去网上|去外网|去官网|用谷歌|google)?'
+                r'(?:重新|再|好好|仔细|去)?(?:查一下|查一查|查查|查|搜一下|搜一搜|搜搜|搜|检索)[呀啊吧嘛呢！!？?。]*$',
+                flags=re.IGNORECASE,
+            )
+            is_meta_search_cmd = bool(meta_search_re.match(clean_q)) or (
+                len(clean_q) <= 14 and any(p in clean_q for p in ["让你联网", "联网查", "联网搜", "重新查", "重新搜", "再去查", "再去搜"])
+            )
             search_intent_kws = [
                 "谁", "什么事", "事迹", "是谁", "什么人", "哪位", "新闻", "最新", "最近", "怎么回事", "出了什么",
-                "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "行情", "汇率", "百科", "历史", "事件",
+                "为什么", "为啥", "哪家", "哪里", "多少钱", "价格", "定价", "对比", "行情", "汇率", "百科", "历史", "事件",
                 "真假", "真的吗", "搜", "查", "名人", "教授", "大学", "博士", "法院", "判决", "公司",
                 "发生", "结局", "评测", "推荐", "区别", "哪年", "什么时候", "什么梗", "来历", "出处", "死", "去世"
             ]
@@ -3344,43 +3523,47 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             quoted_text_clean = str((quote_info or {}).get("quoted_content", "")).strip()
             is_expand_with_quote = bool(quoted_text_clean and any(kw in clean_q for kw in expand_followup_kws))
             has_deictic = any(dp in clean_q for dp in deictic_pronouns)
-            if plugin_manager and ((len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
+            if plugin_manager and (is_meta_search_cmd or (len(clean_q) >= 4 and any(kw in clean_q for kw in search_intent_kws)) or is_expand_with_quote):
                 search_query_str = clean_q
                 context_topic = ""
                 if quoted_text_clean:
-                    context_topic = re.split(r'[。！？\n]', quoted_text_clean)[0][:45].strip()
-                elif has_deictic and len(clean_q) <= 24 and recent_history:
-                    # 指代句缺少实体主语时（如“这个消息真的假的查一下”），从最近上下文提取主题，绝不裸搜纯代词
-                    for h in reversed(recent_history[-5:]):
-                        hc = str(h.get("content") or "").strip()
-                        if not hc or is_trivial_or_reaction(hc):
+                    context_topic = re.split(r'[。！？\n]', quoted_text_clean)[0][:55].strip()
+                elif (is_meta_search_cmd or (has_deictic and len(clean_q) <= 24)) and recent_history:
+                    # 元指令（如“让你联网查”）或指代短句缺少实体主语时，从最近上下文回溯真实用户提问主题，绝不裸搜“让你联网查”！
+                    for h in reversed(recent_history[-8:]):
+                        if is_meta_search_cmd and h.get("is_bot"):
+                            continue
+                        hc = strip_bot_mentions(str(h.get("content") or "")).strip()
+                        if not hc or hc == clean_q or is_trivial_or_reaction(hc) or meta_search_re.match(hc):
                             continue
                         h_ts = float(h.get("ts") or 0.0)
-                        if h_ts > 0 and (time.time() - h_ts > 600):
+                        if h_ts > 0 and (time.time() - h_ts > 900):
                             break
                         mh = re.search(r'《(.*?)》', hc)
                         if mh:
-                            context_topic = mh.group(1).strip()[:50]
+                            context_topic = mh.group(1).strip()[:55]
                             break
                         hc_clean = re.sub(r'^\[(?:附图|引用|分享文章卡片|文件)[^\]]*\]\s*', '', hc).strip()
-                        if len(hc_clean) >= 4:
-                            context_topic = re.split(r'[。！？\n]', hc_clean)[0][:45].strip()
+                        if len(hc_clean) >= 3:
+                            context_topic = re.split(r'[。！？\n]', hc_clean)[0][:55].strip()
                             break
-                if (is_expand_with_quote or (has_deictic and len(clean_q) <= 24)) and context_topic:
+
+                if is_meta_search_cmd:
+                    search_query_str = context_topic
+                elif (is_expand_with_quote or (has_deictic and len(clean_q) <= 24)) and context_topic:
                     search_query_str = f"{context_topic} {clean_q}".strip()
 
-                # 若短句全是代词且无上下文主语（如空上下文下的“这个消息真的假的查一下”），跳过盲目前置搜索，保留 tools 交由大模型自主生成精准关键词搜索
-                skip_blind_deictic = bool(has_deictic and len(clean_q) <= 18 and not context_topic)
-                if not skip_blind_deictic:
-                    log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用 Serper Google 搜索 API: '{search_query_str}'")
+                skip_blind = bool((is_meta_search_cmd and not search_query_str) or (has_deictic and len(clean_q) <= 18 and not context_topic))
+                if not skip_blind and search_query_str:
+                    log_msg(f"【前置联网搜索】命中搜索/事实核查类任务，先调用双语 Serper 搜索 API: '{search_query_str}'")
                     pre_res = plugin_manager.execute_tool("web_search", {"query": search_query_str})
                     if isinstance(pre_res, dict) and pre_res.get("count", 0) > 0:
-                        log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条国内外结果)，交由 AI 整理判断一轮直出！")
+                        log_msg(f"【前置联网搜索】Serper 检索成功 (返回 {pre_res.get('count')} 条中英双语结果)，注入上下文并保留深读工具权限！")
                         user_query += (
-                            f"\n\n【系统已预先调用 Google (Serper API) 检索到的国内外实时资料（请据此整理、判断并直接输出回答，无需再调工具；若资料涉及国内重要领导人全名或敏感政治词，输出时务必按【避讳铁律】使用隐晦替代词称呼）】：\n"
+                            f"\n\n【后台工具已为你预先通过 Google (Serper API) 实时联网检索到的中英双语资料（注：这是你自己后台联网查到的结果，并非群友提供，严禁说‘你贴的资料’或‘目前这份资料’！）】：\n"
                             f"{json.dumps(pre_res.get('results', []), ensure_ascii=False, indent=2)}\n"
+                            f"【检索后作答准则】：若上方摘要已包含准确完整的核心数据（如具体定价、事实结论），请直接整理输出最终回答；若摘要被截断缺少关键价格表/参数细节（或群友明确要求重新深查），请立即调用 read_webpage 读取上方权威官方链接原文，或用精准英文词补调一次 web_search！（若涉及国内重要领导人全名或敏感政治词，输出时务必遵守【避讳铁律】）\n"
                         )
-                        tools = None
 
     img_b64 = None
     if image_info and image_info.get("has_image"):
@@ -3404,8 +3587,21 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             img_data = image_info["_img_bytes"]
         if img_data and len(img_data) > 500:
             try:
+                # 若图片为小尺寸聊天气泡缩略图 (<340px)，自动执行 2x Lanczos 超分与轻度锐化，显著提升小字号股票代码/聊天截图识别率
+                try:
+                    with Image.open(io.BytesIO(img_data)) as pil_in:
+                        iw, ih = pil_in.size
+                        if min(iw, ih) < 340 and max(iw, ih) < 1200:
+                            resamp = getattr(getattr(Image, "Resampling", Image), "LANCZOS")
+                            up_im = pil_in.convert("RGB").resize((iw * 2, ih * 2), resample=resamp)
+                            up_im = up_im.filter(ImageFilter.UnsharpMask(radius=1.1, percent=125, threshold=2))
+                            up_buf = io.BytesIO()
+                            up_im.save(up_buf, format="PNG")
+                            img_data = up_buf.getvalue()
+                except Exception:
+                    pass
                 img_b64 = base64.b64encode(img_data).decode("ascii")
-                log_msg(f"已加载本地持久化图片 ({len(img_data)} 字节) 准备作为视觉多模态输入送入 {target_model}")
+                log_msg(f"已加载高清增强图片 ({len(img_data)} 字节) 准备作为视觉多模态输入送入 {target_model}")
             except Exception as e:
                 log_msg(f"编码图片多模态 payload 异常: {e}")
 
@@ -3422,17 +3618,17 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
         {"role": "user", "content": _build_user_payload(user_query, provider)},
     ]
 
-    global _argon_fail_streak, _argon_cooldown_until
+    global _argon_fail_streak, _argon_cooldown_until, _openai_cooldown_until
     final_reply = ""
     collected_tool_outputs = []
-    tool_round_executed = False
+    tool_rounds_used = 0
     pseudo_search_executed = False
     for loop_idx in range(4):
         try:
-            # 最多允许在尚未执行过工具时触发 1 轮工具调用；工具返回或已进入后期轮次时强制 tools=None 直接作答
-            active_tools = tools if (tools and not tool_round_executed and not collected_tool_outputs and loop_idx < 2) else None
+            # 支持最多 2 轮渐进式工具调用（如 第1轮 web_search -> 第2轮 read_webpage 深读表格 -> 第3轮总结输出）
+            active_tools = tools if (tools and tool_rounds_used < 2 and loop_idx < 2) else None
             log_msg(f"模型调用 [服务商={provider}, 模型={target_model}, 策略={route_reason}] 第 {loop_idx+1} 轮 (tools={'开' if active_tools else '关-强制总结'})...")
-            req_timeout = 45 if provider in ("openai", "gpt") else (24 if target_model == "gemini-4-argon" else 32)
+            req_timeout = 45 if provider in ("openai", "gpt") else (38 if target_model == "gemini-4-argon" else 32)
             res = call_routed_llm(provider, target_model, messages, tools=active_tools, timeout=req_timeout, reasoning_effort=route_effort)
             if target_model == "gemini-4-argon":
                 _argon_fail_streak = 0
@@ -3440,9 +3636,9 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             msg = choice["message"]
 
             if active_tools and (choice.get("finish_reason") == "tool_calls" or msg.get("tool_calls")) and msg.get("tool_calls"):
-                tool_round_executed = True
+                tool_rounds_used += 1
                 log_msg(f"模型 ({target_model}) 触发工具调用 (第 {loop_idx+1} 轮): 共 {len(msg['tool_calls'])} 个工具")
-                for tc in msg["tool_calls"][:2]:
+                for tc in msg["tool_calls"][:3]:
                     fn_name = tc["function"]["name"]
                     fn_args = tc["function"].get("arguments", "{}")
                     if fn_name in ("generate_ai_image", "generate_image") and image_info and image_info.get("local_path") and os.path.exists(image_info["local_path"]):
@@ -3459,14 +3655,20 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                     else:
                         tool_res = {"error": "Plugin manager not loaded"}
                     res_str = json.dumps(tool_res, ensure_ascii=False) if isinstance(tool_res, (dict, list)) else str(tool_res)
-                    log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:120]}")
+                    log_msg(f"API 插件返回结果 ({fn_name}): {res_str[:140]}")
                     collected_tool_outputs.append(f"[{fn_name}({fn_args})]: {res_str}")
-                # 重要修复：第 2 轮禁用 tools 时，切勿在 messages 中保留 assistant.tool_calls 与 role='tool'，
-                # 否则在缺少 tools 定义时会发生模板解析错乱并把内部思考过程泄露进正文！
-                # 直接将工具返回结果组装为干净的单轮 user 上下文交由第 2 轮直接整理输出：
+                    if fn_name in ("generate_financial_chart", "generate_ai_image", "search_image", "send_webpage_image"):
+                        # 发图类工具执行完毕后直接进入总结轮，防止连发两张重复图片
+                        tools = None
+                can_chain_more = bool(tools and tool_rounds_used < 2 and (loop_idx + 1) < 2)
+                next_hint = (
+                    "若下方资料已足够回答群友问题，请直接用纯中文输出最终答案；仅当某条关键网页的摘要被截断确需读取完整表格/正文时，可再调用一次 read_webpage(url)，严禁重复搜索相同词！"
+                    if can_chain_more
+                    else "请直接据此整理、判断并输出最终纯中文回答，严禁输出任何思考过程或工具调用指令！"
+                )
                 synth_query = (
                     user_query
-                    + "\n\n【系统已通过实时工具/Google (Serper API) 检索到的参考资料（请直接据此整理、判断并输出最终纯中文回答，严禁输出任何思考过程或工具调用指令；若涉及国内重要领导人全名或敏感政治词，务必按【避讳铁律】改用隐晦替代词称呼）】：\n"
+                    + f"\n\n【你刚刚调用后台实时工具抓取到的最新资料（注：这是你自己联网查到的结果，并非群友发送，严禁说‘你贴的价目表/资料’！{next_hint} 若涉及国内重要领导人全名或敏感政治词，务必按【避讳铁律】改用隐晦替代词称呼）】：\n"
                     + "\n".join(collected_tool_outputs)
                 )
                 messages = [
@@ -3480,7 +3682,7 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
             pseudo_queries = _extract_pseudo_web_search_queries(content_text)
             if pseudo_queries and plugin_manager and not pseudo_search_executed and loop_idx < 3:
                 pseudo_search_executed = True
-                tool_round_executed = True
+                tool_rounds_used = 2
                 log_msg(f"🔄 拦截到模型 ({target_model}) 文本态伪搜索指令 {pseudo_queries}，自动转为真实 Serper 检索并重生成回答...")
                 for pq in pseudo_queries:
                     tool_res = plugin_manager.execute_tool("web_search", {"query": pq})
@@ -3561,8 +3763,10 @@ def generate_reply_with_search(sender, content, cfg, recent_history=None, quote_
                 continue
         except Exception as e:
             log_msg(f"模型 [{provider}/{target_model}] 请求异常 (第 {loop_idx+1} 轮): {e}")
-            # 容灾自动分流降级：如果 OpenAI (gpt-6.1-sol) 异常，无缝切换至 Gemini 4 Argon
+            # 容灾自动分流降级：如果 OpenAI (gpt-6.1-sol) 异常，记录短时 429 冷却并无缝切换至 Gemini 4 Argon
             if provider in ("openai", "gpt"):
+                if any(code_s in str(e) for code_s in ("429", "401", "402", "403")):
+                    _openai_cooldown_until = time.time() + 90
                 log_msg(f"OpenAI ({target_model}) 异常，重置上下文并切换至 Gemini 4 Argon 继续重试...")
                 provider = "gemini"
                 target_model = "gemini-4-argon"
@@ -4339,7 +4543,8 @@ def monitor_loop():
                                             c_src = card_info.get("source", "").strip()
                                             c_url = card_info.get("url", "").strip()
                                             card_prefix = f"[分享文章卡片: 《{c_title}》" + (f" 来源: {c_src}" if c_src else "") + (f" 链接: {c_url}" if c_url else "") + "]"
-                                            rec_c = card_prefix + (" " + rec_c if rec_c and rec_c != c_title else "")
+                                            clean_tail = re.sub(r'^\[(?:发送文件|分享卡片|分享文章卡片)[:：][^\]]*\]\s*', '', rec_c).strip()
+                                            rec_c = card_prefix + (" " + clean_tail if clean_tail and clean_tail != c_title else "")
                                         if has_q and q_info.get("quoted_content"):
                                             rec_c = f"[引用 {q_info.get('quoted_sender')}: {str(q_info.get('quoted_content'))[:35]}] " + rec_c
                                         saved_img_path = msg_item.get("_pre_saved_img_path")
@@ -4459,6 +4664,8 @@ def monitor_loop():
                                                         "image_type": matched_rec.get("image_type", "图片"),
                                                         "ocr_and_detail": matched_rec.get("ocr_and_detail", ""),
                                                         "sender": matched_rec.get("sender", ""),
+                                                        "_screen_pos": matched_rec.get("_screen_pos"),
+                                                        "ts": matched_rec.get("ts", 0.0),
                                                     }
 
                                             # 2. 若不是引用或者引用未匹配到，且当前消息本身是真实附图（且非微缩缩略图）
@@ -4478,6 +4685,8 @@ def monitor_loop():
                                                         "image_type": matched_rec.get("image_type", "图片"),
                                                         "ocr_and_detail": matched_rec.get("ocr_and_detail", ""),
                                                         "sender": matched_rec.get("sender", ""),
+                                                        "_screen_pos": matched_rec.get("_screen_pos"),
+                                                        "ts": matched_rec.get("ts", 0.0),
                                                     }
                                                 elif session_key in last_received_images and not (FinancialChartPlugin and FinancialChartPlugin.is_chart_generation_request(c)):
                                                     recent_img = last_received_images[session_key]
@@ -4575,6 +4784,17 @@ def monitor_loop():
                         if isinstance(t_img, dict) and t_img.get("has_image"):
                             try:
                                 if t_img.get("local_path") and os.path.exists(t_img["local_path"]):
+                                    # 若刚发送 (<25s) 的非表情包截图气泡宽度或高度 <230px（如细长手机看盘截图 100x254），按需从预览窗安全提取高清大图
+                                    img_tp_str = str(t_img.get("image_type", "")) + str(t_img.get("ocr_and_detail", ""))
+                                    img_age = time.time() - float(t_img.get("ts") or 0.0)
+                                    if t_img.get("_screen_pos") and 0 <= img_age <= 25 and "表情" not in img_tp_str:
+                                        try:
+                                            with Image.open(t_img["local_path"]) as chk_im:
+                                                need_hd = min(chk_im.width, chk_im.height) < 230
+                                        except Exception:
+                                            need_hd = False
+                                        if need_hd:
+                                            capture_hd_image_from_viewer(t_img["_screen_pos"], t_img["local_path"])
                                     try:
                                         shutil.copyfile(t_img["local_path"], "/tmp/wechat_last_photo.png")
                                     except Exception:
