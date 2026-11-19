@@ -2230,7 +2230,7 @@ class TaskModelRouter:
        - OpenAI GPT-6.1 Sol (gpt-6.1-sol): 承担 50% 主力问答及全部深度思考推理任务
        - Gemini 4 Argon (gemini-4-argon): 承担 50% 主力问答、长文阅读与工具查询
     3. Gemini 4 Hydrogen (gemini-4-hydrogen): 高速多模态理解、显式指定与快速容灾降级通道
-    4. Nano Banana Pro (gemini-3-pro-image): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件独占)
+    4. GPT-6.2 Astra (gpt-6.2-astra): 绘画/AI生图/垫图重制改图 (由 generate_ai_image 插件通过 OpenAI Responses API 独占，Gemini 3 Pro Image 兜底)
     5. Kimi (kimi-for-coding-highspeed): 充裕额度备用容灾通道
     """
 

@@ -2,7 +2,7 @@
   "api_key": "AQ.Ab8... / sk-kimi-... / your-api-key",
   "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
   "model": "gemini-4-argon",
-  "image_model": "gemini-3-pro-image",
+  "image_model": "gpt-6.2-astra",
   "openai_api_key": "sk-proj-... / your-openai-key",
   "openai_base_url": "https://api.openai.com/v1/chat/completions",
   "gpt_think_model": "gpt-6.1-sol",

@@ -4,9 +4,9 @@
 Image Tools Plugin: AI Image Generation, Photo Remixing (img2img) & Web Image Search
 Supports:
 1. generate_ai_image:
-   - Text-to-Image (文生图) & Image-to-Image (垫图重制/改图/风格迁移) using Gemini 2.5 Flash Image
-   - High-fidelity 4K output, zero watermarks
-   - Seamless fallback to Pollinations.ai if Gemini API unavailable
+   - Text-to-Image (文生图) & Image-to-Image (垫图重制/改图/风格迁移) using OpenAI GPT-6.2 Astra (/v1/responses image_generation)
+   - High-fidelity output, zero watermarks
+   - Seamless fallback to Gemini (gemini-3-pro-image / gemini-2.5-flash-image) and Pollinations.ai if primary API unavailable
 2. search_image: Live photo, wallpaper & meme search via Bing Async Image API
 Images are downloaded and dispatched directly to WeChat chat via X11 clipboard.
 """
@@ -20,6 +20,7 @@ import random
 import base64
 import io
 import time
+import tempfile
 from PIL import Image
 from .base import BasePlugin, safe_http_get_bytes
 
@@ -116,6 +117,127 @@ def _get_config():
 
 
 
+def _resolve_openai_responses_url(cfg: dict) -> str:
+    base_url = (cfg.get("openai_base_url") or "https://api.openai.com/v1/chat/completions").strip()
+    if base_url.endswith("/responses"):
+        return base_url
+    if "/chat/completions" in base_url:
+        return base_url.replace("/chat/completions", "/responses")
+    return base_url.rstrip("/") + "/responses"
+
+
+def _encode_ref_image_b64(ref_path: str, max_side: int = 1536) -> str:
+    with Image.open(ref_path) as im:
+        im = im.convert("RGB")
+        if max(im.width, im.height) > max_side:
+            im.thumbnail((max_side, max_side), Image.LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _generate_via_openai_responses(
+    openai_key: str,
+    responses_url: str,
+    model_name: str,
+    prompt: str,
+    aspect_ratio: str = "1:1",
+    ref_b64: str = "",
+    timeout: int = 65,
+):
+    """Generate or remix an image using OpenAI Responses API (e.g. gpt-6.2-astra + image_generation tool)."""
+    size_map = {
+        "16:9": "1536x1024",
+        "9:16": "1024x1536",
+        "1:1": "1024x1024",
+    }
+    target_size = size_map.get(aspect_ratio, "1024x1024")
+    if ref_b64:
+        input_payload = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    {"type": "input_image", "image_url": f"data:image/png;base64,{ref_b64}"},
+                ],
+            }
+        ]
+    else:
+        input_payload = prompt
+
+    payload = {
+        "model": model_name,
+        "reasoning": {"effort": "low"},
+        "input": input_payload,
+        "tools": [
+            {
+                "type": "image_generation",
+                "size": target_size,
+                "quality": "medium",
+            }
+        ],
+        "tool_choice": {"type": "image_generation"},
+    }
+    req = urllib.request.Request(
+        responses_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "WeChatBot/2.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        res = json.loads(r.read().decode("utf-8"))
+
+    for item in res.get("output", []):
+        if item.get("type") == "image_generation_call" and item.get("result"):
+            return base64.b64decode(item["result"])
+    return None
+
+
+def _generate_via_openai_images_api(
+    openai_key: str,
+    responses_url: str,
+    model_name: str,
+    prompt: str,
+    aspect_ratio: str = "1:1",
+    timeout: int = 60,
+):
+    """Generate an image using OpenAI /v1/images/generations for dedicated gpt-image-* models."""
+    size_map = {
+        "16:9": "1536x1024",
+        "9:16": "1024x1536",
+        "1:1": "1024x1024",
+    }
+    images_url = responses_url.replace("/responses", "/images/generations")
+    payload = {
+        "model": model_name,
+        "prompt": prompt,
+        "size": size_map.get(aspect_ratio, "1024x1024"),
+        "quality": "medium",
+    }
+    req = urllib.request.Request(
+        images_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {openai_key}",
+            "Content-Type": "application/json",
+            "User-Agent": "WeChatBot/2.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        res = json.loads(r.read().decode("utf-8"))
+
+    data_items = res.get("data") or []
+    if data_items and data_items[0].get("b64_json"):
+        return base64.b64decode(data_items[0]["b64_json"])
+    if data_items and data_items[0].get("url"):
+        raw, _, _ = safe_http_get_bytes(data_items[0]["url"], headers={"User-Agent": "WeChatBot/2.0"}, timeout=20, max_bytes=16 * 1024 * 1024)
+        return raw
+    return None
+
+
 class GenerateImagePlugin(BasePlugin):
     name = "generate_ai_image"
     description = "根据自然语言提示词使用 AI 绘画模型生成并直接向群聊发送高清图片。支持从零文本生图，以及以群聊中的照片/图片作为垫图进行【图片重制/改图/风格迁移/局部变换】"
@@ -152,7 +274,8 @@ class GenerateImagePlugin(BasePlugin):
             return {"error": "未提供生图提示词"}
 
         seed = random.randint(1000, 9999999)
-        local_png = f"/tmp/wechat_ai_gen_{seed}.png"
+        tmp_dir = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()
+        local_png = os.path.join(tmp_dir, f"wechat_ai_gen_{seed}.png")
 
         # Check if user intent is image remixing (图生图)
         is_remix = use_ref_image or any(k in p for k in ["重制", "改图", "修改", "换成", "变成", "参考", "仿照", "垫图", "照片里", "图里", "里面的人"])
@@ -187,35 +310,81 @@ class GenerateImagePlugin(BasePlugin):
                             pass
 
         cfg = _get_config()
+        openai_key = cfg.get("openai_api_key") or cfg.get("gpt_api_key") or os.environ.get("OPENAI_API_KEY", "")
         api_key = cfg.get("api_key") or cfg.get("gemini_api_key") or os.environ.get("GEMINI_API_KEY", "")
-        img_model = cfg.get("image_model") or "gemini-3-pro-image"
-        gemini_success = False
+        img_model = (cfg.get("image_model") or "gpt-6.2-astra").strip()
+        gen_success = False
+        used_model = ""
+        ref_b64 = ""
 
-        # 1. Primary Engine: Nano Banana Pro (Gemini 3 Pro Image / gemini-3-pro-image)
-        if api_key and (api_key.startswith("AQ.") or api_key.startswith("AIza")):
-            models_to_try = [img_model]
-            if "gemini-3-pro-image" not in models_to_try:
-                models_to_try.append("gemini-3-pro-image")
-            if "gemini-2.5-flash-image" not in models_to_try:
-                models_to_try.append("gemini-2.5-flash-image")
+        if is_remix and ref_path and os.path.exists(ref_path):
+            try:
+                ref_b64 = _encode_ref_image_b64(ref_path)
+            except Exception:
+                ref_b64 = ""
+
+        is_openai_primary = any(img_model.lower().startswith(p) for p in ("gpt-", "chatgpt-", "o1", "o3", "o4"))
+
+        def _try_openai():
+            nonlocal gen_success, used_model
+            if gen_success or not openai_key:
+                return
+            responses_url = _resolve_openai_responses_url(cfg)
+            target_openai_model = img_model if is_openai_primary else "gpt-6.2-astra"
+            try:
+                if target_openai_model.lower().startswith("gpt-image-") and not ref_b64:
+                    raw = _generate_via_openai_images_api(
+                        openai_key,
+                        responses_url,
+                        target_openai_model,
+                        p,
+                        aspect_ratio=aspect_ratio,
+                        timeout=60,
+                    )
+                else:
+                    # gpt-6.2-astra (and img2img remixes) run via /v1/responses + image_generation tool
+                    resp_model = "gpt-6.2-astra" if target_openai_model.lower().startswith("gpt-image-") else target_openai_model
+                    raw = _generate_via_openai_responses(
+                        openai_key,
+                        responses_url,
+                        resp_model,
+                        p,
+                        aspect_ratio=aspect_ratio,
+                        ref_b64=ref_b64,
+                        timeout=65,
+                    )
+                if raw:
+                    Image.open(io.BytesIO(raw)).convert("RGB").save(local_png, "PNG")
+                    gen_success = True
+                    used_model = target_openai_model
+            except Exception:
+                pass
+
+        def _try_gemini():
+            nonlocal gen_success, used_model
+            if gen_success or not (api_key and (api_key.startswith("AQ.") or api_key.startswith("AIza"))):
+                return
+            models_to_try = []
+            if not is_openai_primary and img_model:
+                models_to_try.append(img_model)
+            for fallback_m in ("gemini-3-pro-image", "gemini-2.5-flash-image"):
+                if fallback_m not in models_to_try:
+                    models_to_try.append(fallback_m)
 
             for target_model in models_to_try:
-                if gemini_success:
+                if gen_success:
                     break
                 try:
                     url = f"https://generativelanguage.googleapis.com/v1beta/models/{target_model}:generateContent?key={api_key}"
                     parts = [{"text": p}]
-
-                    if is_remix and ref_path and os.path.exists(ref_path):
-                        with open(ref_path, "rb") as rf:
-                            b64_data = base64.b64encode(rf.read()).decode("utf-8")
-                        parts.append({"inlineData": {"mimeType": "image/png", "data": b64_data}})
+                    if ref_b64:
+                        parts.append({"inlineData": {"mimeType": "image/png", "data": ref_b64}})
 
                     payload = {"contents": [{"parts": parts}]}
                     req = urllib.request.Request(
                         url,
                         data=json.dumps(payload).encode("utf-8"),
-                        headers={"Content-Type": "application/json"}
+                        headers={"Content-Type": "application/json"},
                     )
                     with urllib.request.urlopen(req, timeout=40) as r:
                         res = json.loads(r.read().decode("utf-8"))
@@ -225,13 +394,22 @@ class GenerateImagePlugin(BasePlugin):
                         if "inlineData" in part:
                             raw = base64.b64decode(part["inlineData"]["data"])
                             Image.open(io.BytesIO(raw)).convert("RGB").save(local_png, "PNG")
-                            gemini_success = True
+                            gen_success = True
+                            used_model = target_model
                             break
                 except Exception:
                     continue
 
+        # 1. Primary Engine: OpenAI GPT-6.2 Astra (default) -> Fallback: Gemini Image -> Pollinations
+        if is_openai_primary:
+            _try_openai()
+            _try_gemini()
+        else:
+            _try_gemini()
+            _try_openai()
+
         # 2. Fallback Engine: Pollinations.ai (Flux.1 / SDXL, free fallback)
-        if not gemini_success:
+        if not gen_success:
             if aspect_ratio == "16:9":
                 w, h = 1024, 576
             elif aspect_ratio == "9:16":
@@ -245,6 +423,7 @@ class GenerateImagePlugin(BasePlugin):
             try:
                 raw, _, _ = safe_http_get_bytes(url, headers={"User-Agent": "WeChatBot/2.0"}, timeout=25, max_bytes=12 * 1024 * 1024)
                 Image.open(io.BytesIO(raw)).convert("RGB").save(local_png, "PNG")
+                used_model = "pollinations"
             except Exception as e:
                 return {"error": f"AI 绘画服务请求异常: {e}"}
 
@@ -257,6 +436,7 @@ class GenerateImagePlugin(BasePlugin):
         return {
             "status": "success",
             "type": "image",
+            "model": used_model,
             "image_sent_to_wechat": sent_ok,
             "prompt": p,
             "is_remix": is_remix,
